@@ -1,0 +1,42 @@
+name: HA Voice (GigaAM)
+version: "1.0.0"
+slug: ha_voice
+description: GigaAM STT, speaker enrollment, room diary for Home Assistant Assist
+url: https://github.com/local/ha-voice
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+init: false
+ingress: true
+ingress_port: 8088
+panel_icon: mdi:microphone-message
+panel_title: HA Voice
+ports:
+  10305/tcp: 10305
+  10350/tcp: 10350
+  10500/tcp: 10500
+  8088/tcp: 8088
+ports_description:
+  10305/tcp: Wyoming STT (GigaAM) — optional direct
+  10350/tcp: Wyoming STT через speaker gate (рекомендуется для Assist)
+  10500/tcp: PCM дневник с ESPHome
+  8088/tcp: API / UI
+map:
+  - addon_config:rw
+  - media:rw
+options:
+  stt_model: gigaam-v3-e2e-rnnt
+  stt_quantization: int8
+  stt_device: cpu
+  gate_threshold: 0.55
+  gate_require_match: true
+  diary_vad_rms: 0.012
+schema:
+  stt_model: str
+  stt_quantization: list(int8|fp16|fp32)
+  stt_device: list(cpu|cuda)
+  gate_threshold: float
+  gate_require_match: bool
+  diary_vad_rms: float

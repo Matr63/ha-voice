@@ -1,0 +1,28 @@
+enroll_speaker:
+  name: Enroll speaker
+  description: Добавить/обновить голос (PCM16 mono, base64)
+  fields:
+    name:
+      required: true
+      example: папа
+      selector:
+        text:
+    audio_b64:
+      required: true
+      selector:
+        text:
+    rate:
+      default: 16000
+      selector:
+        number:
+          min: 8000
+          max: 48000
+
+set_diary:
+  name: Set room diary
+  description: Включить/выключить непрерывную расшифровку
+  fields:
+    enabled:
+      required: true
+      selector:
+        boolean:

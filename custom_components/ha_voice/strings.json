@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HA Voice",
+        "description": "Укажите хост API (add-on localhost / IP отдельного сервера) и порт 8088",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Не удалось подключиться к API"
+    },
+    "abort": {
+      "already_configured": "Уже настроено"
+    }
+  }
+}

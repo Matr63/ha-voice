@@ -1,0 +1,11 @@
+{
+  "domain": "ha_voice",
+  "name": "HA Voice (GigaAM diary)",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://local/ha-voice",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://local/ha-voice",
+  "requirements": ["aiohttp"],
+  "version": "1.0.0"
+}

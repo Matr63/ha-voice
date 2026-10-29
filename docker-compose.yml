@@ -1,0 +1,75 @@
+services:
+  stt:
+    build:
+      context: .
+      dockerfile: services/stt/Dockerfile
+    container_name: ha-voice-stt
+    restart: unless-stopped
+    ports:
+      - "${STT_PORT:-10305}:10305"
+    environment:
+      STT_MODEL: ${STT_MODEL:-gigaam-v3-e2e-rnnt}
+      STT_QUANTIZATION: ${STT_QUANTIZATION:-int8}
+      STT_DEVICE: ${STT_DEVICE:-cpu}
+      STT_URI: tcp://0.0.0.0:10305
+      HF_HOME: /data/models
+    volumes:
+      - ${DATA_DIR:-./data}/models:/data/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket;s=socket.create_connection(('127.0.0.1',10305),2);s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  speaker_gate:
+    build:
+      context: .
+      dockerfile: services/speaker_gate/Dockerfile
+    container_name: ha-voice-speaker-gate
+    restart: unless-stopped
+    depends_on:
+      - stt
+    ports:
+      - "${GATE_PORT:-10350}:10350"
+      - "${DIALOGUE_API_PORT:-8088}:8088"
+      - "${DIALOGUE_PCM_PORT:-10500}:10500"
+    environment:
+      GATE_URI: tcp://0.0.0.0:10350
+      GATE_UPSTREAM: ${GATE_UPSTREAM:-tcp://stt:10305}
+      GATE_THRESHOLD: ${GATE_THRESHOLD:-0.55}
+      GATE_REQUIRE_MATCH: ${GATE_REQUIRE_MATCH:-true}
+      SPEAKERS_DIR: /data/speakers
+      API_HOST: 0.0.0.0
+      API_PORT: "8088"
+      DIALOGUE_STT_URI: ${DIALOGUE_STT_URI:-tcp://stt:10305}
+      DIALOGUE_PCM_PORT: ${DIALOGUE_PCM_PORT:-10500}
+      DIALOGUE_SAMPLE_RATE: ${DIALOGUE_SAMPLE_RATE:-16000}
+      DIALOGUE_VAD_RMS: ${DIALOGUE_VAD_RMS:-0.012}
+      DIALOGUE_MIN_SPEECH_MS: ${DIALOGUE_MIN_SPEECH_MS:-400}
+      DIALOGUE_MAX_UTTERANCE_MS: ${DIALOGUE_MAX_UTTERANCE_MS:-15000}
+      DIALOGUE_SILENCE_MS: ${DIALOGUE_SILENCE_MS:-700}
+      DIALOGUES_DIR: /data/dialogues
+      DIALOGUE_DB: /data/dialogues/dialogue.db
+    volumes:
+      - ${DATA_DIR:-./data}/speakers:/data/speakers
+      - ${DATA_DIR:-./data}/dialogues:/data/dialogues
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/api/health',timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  openwakeword:
+    image: rhasspy/wyoming-openwakeword:latest
+    container_name: ha-voice-openwakeword
+    restart: unless-stopped
+    profiles: ["oww"]
+    ports:
+      - "${OWW_PORT:-10400}:10400"
+    command:
+      - --uri
+      - tcp://0.0.0.0:10400
+      - --preload-model
+      - ${OWW_PRELOAD_MODEL:-ok_nabu}

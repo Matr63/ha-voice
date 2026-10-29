@@ -1,0 +1,32 @@
+# Подключите к конфигу Waveshare VA:
+#   packages:
+#     room_diary: !include <path>/ha-voice/esphome/room_diary_package.yaml
+#
+# Подставьте IP машины с ha-voice (add-on или отдельный сервер).
+
+substitutions:
+  ha_voice_host: "192.168.1.50"
+  ha_voice_pcm_port: "10500"
+
+external_components:
+  - source:
+      type: local
+      path: external_components
+    components: [room_diary]
+
+switch:
+  - platform: template
+    name: "Room diary"
+    id: room_diary_enable
+    icon: mdi:notebook-outline
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# Waveshare VA: microphone id = i2s_mics (см. base/core.yaml).
+room_diary:
+  id: room_diary_stream
+  host: ${ha_voice_host}
+  port: ${ha_voice_pcm_port}
+  microphone: i2s_mics
+  enable_switch: room_diary_enable
+  rms_threshold: 500
