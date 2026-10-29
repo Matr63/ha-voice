@@ -1,7 +1,10 @@
 name: HA Voice (GigaAM)
 version: "1.0.0"
 slug: ha_voice
-description: GigaAM STT, speaker enrollment, room diary for Home Assistant Assist
+description: >-
+  GigaAM STT, speaker enrollment, room diary.
+  Первая установка 10–30+ мин (torch) — смотрите Log дополнения, строки [ha-voice N/6].
+  После старта: Wyoming :10350, UI Ingress :8088.
 url: https://github.com/Matr63/ha-voice
 arch:
   - amd64

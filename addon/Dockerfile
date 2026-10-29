@@ -1,7 +1,12 @@
 ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm
 FROM ${BUILD_FROM}
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Build logs appear in: Add-on → Log (or Supervisor → System → Logs)
+# First install can take 10–30+ min (torch + onnx models tooling).
+
+RUN echo "[ha-voice 1/6] apt packages..." \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-dev \
@@ -9,19 +14,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && echo "[ha-voice 1/6] apt done"
 
 WORKDIR /app
 
 COPY app/stt-requirements.txt /app/stt-requirements.txt
 COPY app/gate-requirements.txt /app/gate-requirements.txt
-RUN pip3 install --break-system-packages --no-cache-dir \
-    -r /app/stt-requirements.txt \
-    -r /app/gate-requirements.txt
+
+RUN echo "[ha-voice 2/6] pip: wyoming + onnx-asr (STT)..." \
+ && pip3 install --break-system-packages --no-cache-dir -r /app/stt-requirements.txt \
+ && echo "[ha-voice 2/6] STT deps done"
+
+RUN echo "[ha-voice 3/6] pip: aiohttp/numpy/soundfile..." \
+ && pip3 install --break-system-packages --no-cache-dir \
+      "wyoming>=1.5.3" "numpy>=1.26.0" "aiohttp>=3.9.0" "soundfile>=0.12.1" "scipy>=1.11.0" "webrtcvad>=2.0.10" \
+ && echo "[ha-voice 3/6] light deps done"
+
+RUN echo "[ha-voice 4/6] pip: torch CPU (долго, ~1–2 GB)..." \
+ && pip3 install --break-system-packages --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cpu \
+      "torch>=2.1.0" \
+ && echo "[ha-voice 4/6] torch done"
+
+RUN echo "[ha-voice 5/6] pip: resemblyzer (speaker gate)..." \
+ && pip3 install --break-system-packages --no-cache-dir "resemblyzer>=0.1.4" \
+ && echo "[ha-voice 5/6] resemblyzer done"
 
 COPY app/ /app/
 COPY run.sh /run.sh
-RUN chmod a+x /run.sh
+RUN echo "[ha-voice 6/6] copy app + chmod" \
+ && chmod a+x /run.sh \
+ && echo "[ha-voice] image build complete"
 
 ENV HF_HOME=/data/models
 ENV SPEAKERS_DIR=/data/speakers

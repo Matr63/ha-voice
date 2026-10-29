@@ -13,11 +13,14 @@
 
 ## B. Add-on на HAOS / Supervised
 
-1. **Настройки → Дополнения → Репозитории** → путь к папке `ha-voice` (или git URL с `repository.yaml`).
-2. Установите **HA Voice (GigaAM)**, запустите.
-3. Wyoming Protocol → `127.0.0.1:10350` (или hostname add-on).
-4. Ingress-панель add-on — enrollment и дневник.
-5. Скопируйте `custom_components/ha_voice` в `/config/custom_components/`, host `127.0.0.1` или `local-ha-voice`, порт `8088`.
+1. **Настройки → Дополнения → Репозитории** → `https://github.com/Matr63/ha-voice`.
+2. Установите **HA Voice (GigaAM)** (первая сборка 10–30+ мин из‑за torch).
+3. Лог установки/сборки: откройте карточку дополнения → вкладка **Журнал** / **Log** (строки `[ha-voice 1/6]` … `[ha-voice 6/6]`). Либо **Настройки → Система → Журналы**.
+4. На спиннере в Store прогресс-бара нет — это ограничение Home Assistant.
+5. После установки **Запустить**. Первый старт качает веса GigaAM — снова смотрите **Log** (`waiting STT…`).
+6. Wyoming Protocol → `127.0.0.1:10350`.
+7. Ingress — enrollment и дневник.
+8. Скопируйте `custom_components/ha_voice` в `/config/custom_components/`, host `127.0.0.1`, порт `8088`.
 
 ## C. Waveshare ESP + дневник комнаты
 

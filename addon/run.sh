@@ -1,7 +1,9 @@
 #!/bin/bash
 set -e
 
-OPTIONS=/data/options.json
+echo "[ha-voice] ===== start ====="
+echo "[ha-voice] reading options..."
+
 python3 - <<'PY'
 import json, os
 from pathlib import Path
@@ -28,6 +30,9 @@ lines = [
     f"export DIALOGUE_VAD_RMS={os.environ['DIALOGUE_VAD_RMS']!r}",
 ]
 env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print("[ha-voice] options:", {k: os.environ.get(k) for k in (
+    "STT_MODEL", "STT_QUANTIZATION", "STT_DEVICE", "GATE_THRESHOLD", "GATE_REQUIRE_MATCH"
+)})
 PY
 # shellcheck disable=SC1091
 source /tmp/ha_voice_env
@@ -46,7 +51,8 @@ export DIALOGUES_DIR=/data/dialogues
 export DIALOGUE_DB=/data/dialogues/dialogue.db
 export WEB_ROOT=/app/web
 
-echo "[ha-voice] starting STT model=${STT_MODEL} device=${STT_DEVICE}"
+echo "[ha-voice] STT: loading ${STT_MODEL} (${STT_QUANTIZATION}) on ${STT_DEVICE}"
+echo "[ha-voice] first run may download model weights — watch this log"
 QUANT_ARGS=()
 if [ -n "${STT_QUANTIZATION}" ]; then
   QUANT_ARGS=(--quantization "${STT_QUANTIZATION}")
@@ -58,17 +64,48 @@ python3 /app/stt_server.py \
   "${QUANT_ARGS[@]}" &
 STT_PID=$!
 
-for _ in $(seq 1 180); do
+READY=0
+for i in $(seq 1 300); do
   if python3 -c "import socket;s=socket.create_connection(('127.0.0.1',10305),1);s.close()" 2>/dev/null; then
+    READY=1
+    echo "[ha-voice] STT ready after ${i}s (pid=${STT_PID})"
     break
+  fi
+  if ! kill -0 "$STT_PID" 2>/dev/null; then
+    echo "[ha-voice] ERROR: STT process exited early"
+    wait "$STT_PID" || true
+    exit 1
+  fi
+  if [ $((i % 15)) -eq 0 ]; then
+    echo "[ha-voice] waiting STT… ${i}s / 300s"
+  fi
+  sleep 1
+done
+if [ "$READY" != "1" ]; then
+  echo "[ha-voice] ERROR: STT did not open port 10305 in 300s"
+  kill "$STT_PID" 2>/dev/null || true
+  exit 1
+fi
+
+echo "[ha-voice] starting speaker gate + diary API (Wyoming :10350, UI :8088, PCM :10500)"
+python3 /app/main.py &
+GATE_PID=$!
+
+for i in $(seq 1 60); do
+  if python3 -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/api/health',timeout=1)" 2>/dev/null; then
+    echo "[ha-voice] API ready after ${i}s"
+    break
+  fi
+  if ! kill -0 "$GATE_PID" 2>/dev/null; then
+    echo "[ha-voice] ERROR: gate/API process exited"
+    wait "$GATE_PID" || true
+    exit 1
   fi
   sleep 1
 done
 
-echo "[ha-voice] starting speaker gate + diary API"
-python3 /app/main.py &
-GATE_PID=$!
-
-trap 'kill '"$STT_PID"' '"$GATE_PID"' 2>/dev/null || true' SIGTERM SIGINT
+echo "[ha-voice] ===== running ====="
+trap 'echo "[ha-voice] stopping…"; kill '"$STT_PID"' '"$GATE_PID"' 2>/dev/null || true' SIGTERM SIGINT
 wait -n "$STT_PID" "$GATE_PID"
+echo "[ha-voice] a child exited — shutting down"
 exit $?
