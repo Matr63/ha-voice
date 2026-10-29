@@ -3,9 +3,9 @@
   "name": "HA Voice (GigaAM diary)",
   "codeowners": [],
   "config_flow": true,
-  "documentation": "https://local/ha-voice",
+  "documentation": "https://github.com/Matr63/ha-voice",
   "iot_class": "local_polling",
-  "issue_tracker": "https://local/ha-voice",
+  "issue_tracker": "https://github.com/Matr63/ha-voice/issues",
   "requirements": ["aiohttp"],
   "version": "1.0.0"
 }

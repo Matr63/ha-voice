@@ -3,7 +3,7 @@ import esphome.config_validation as cv
 from esphome.const import CONF_ID, CONF_PORT
 from esphome.components import microphone, switch as switch_comp
 
-CODEOWNERS = ["@local"]
+CODEOWNERS = ["@Matr63"]
 DEPENDENCIES = ["microphone", "network"]
 
 room_diary_ns = cg.esphome_ns.namespace("room_diary")

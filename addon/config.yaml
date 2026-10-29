@@ -2,7 +2,7 @@ name: HA Voice (GigaAM)
 version: "1.0.0"
 slug: ha_voice
 description: GigaAM STT, speaker enrollment, room diary for Home Assistant Assist
-url: https://github.com/local/ha-voice
+url: https://github.com/Matr63/ha-voice
 arch:
   - amd64
   - aarch64

@@ -154,14 +154,14 @@ async def run_gate(
             AsrProgram(
                 name="ha-voice-speaker-gate",
                 description="Speaker-gated STT (rejects unknown / TV)",
-                attribution=Attribution(name="ha-voice", url="https://localhost"),
+                attribution=Attribution(name="ha-voice", url="https://github.com/Matr63/ha-voice"),
                 installed=True,
                 version="1.0.0",
                 models=[
                     AsrModel(
                         name="gated-gigaam",
                         description="GigaAM behind speaker verification",
-                        attribution=Attribution(name="ha-voice", url="https://localhost"),
+                        attribution=Attribution(name="ha-voice", url="https://github.com/Matr63/ha-voice"),
                         installed=True,
                         languages=["ru", "en"],
                         version="1.0.0",
