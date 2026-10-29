@@ -1,8 +1,10 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm
+# BUILD_FROM / BUILD_ARCH передаёт Supervisor; default — для локальной сборки
+ARG BUILD_ARCH=amd64
+ARG BUILD_FROM=ghcr.io/home-assistant/${BUILD_ARCH}-base-debian:bookworm
 FROM ${BUILD_FROM}
 
-# Build logs appear in: Add-on → Log (or Supervisor → System → Logs)
-# First install can take 10–30+ min (torch + onnx models tooling).
+# Лог сборки: Add-on → Log. Первая установка 10–30+ мин (torch).
+# Шаги: [ha-voice 1/6] … [ha-voice 6/6]
 
 RUN echo "[ha-voice 1/6] apt packages..." \
  && apt-get update \
