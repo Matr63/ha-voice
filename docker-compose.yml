@@ -51,9 +51,12 @@ services:
       DIALOGUE_SILENCE_MS: ${DIALOGUE_SILENCE_MS:-700}
       DIALOGUES_DIR: /data/dialogues
       DIALOGUE_DB: /data/dialogues/dialogue.db
+      SETTINGS_FILE: /data/config/settings.json
+      STT_MODEL: ${STT_MODEL:-gigaam-v3-e2e-rnnt}
     volumes:
       - ${DATA_DIR:-./data}/speakers:/data/speakers
       - ${DATA_DIR:-./data}/dialogues:/data/dialogues
+      - ${DATA_DIR:-./data}/config:/data/config
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/api/health',timeout=2)"]
       interval: 30s

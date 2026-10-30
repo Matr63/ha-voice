@@ -1,4 +1,0 @@
-wyoming>=1.5.3
-onnx-asr[cpu,hub]>=0.7.0
-# NumPy 2.x часто падает в Proxmox/KVM без x86-64-v2
-numpy>=1.26.0,<2

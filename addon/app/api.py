@@ -1,150 +1,305 @@
-"""HTTP API + static UI for enrollment and dialogue history."""
+"""HTTP API + web UI (works behind Home Assistant Ingress)."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
+from audio_utils import decode_body, duration_ms
 from dialogue import DialogueRuntime
+from gate_server import GateState
+from settings import SettingsStore
 from speakers import SpeakerStore
+from stt_client import port_open, transcribe
+from version import __version__
 
 _LOGGER = logging.getLogger("ha-voice.api")
 
+Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
-def create_app(store: SpeakerStore, runtime: DialogueRuntime, web_root: Path) -> web.Application:
-    app = web.Application(client_max_size=16 * 1024 * 1024)
-    app["store"] = store
-    app["runtime"] = runtime
+
+@dataclass
+class AppContext:
+    settings: SettingsStore
+    store: SpeakerStore
+    runtime: DialogueRuntime
+    gate: GateState
+    stt_uri: str
+    stt_model: str
+    web_root: Path
+    ports: dict[str, int]
+    started_at: float = field(default_factory=time.time)
+
+
+def _err(message: str, status: int = 400) -> web.Response:
+    return web.json_response({"error": message}, status=status)
+
+
+@web.middleware
+async def errors_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
+    try:
+        response = await handler(request)
+    except web.HTTPException:
+        raise
+    except ValueError as err:
+        return _err(str(err))
+    except KeyError:
+        return _err("Не найдено", 404)
+    except Exception:
+        _LOGGER.exception("API error %s %s", request.method, request.path)
+        return _err("Внутренняя ошибка, см. журнал дополнения", 500)
+    if request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+async def _read_audio(request: web.Request) -> bytes:
+    body = await request.read()
+    if not body:
+        raise ValueError("Пустой аудиофайл")
+    pcm = await asyncio.to_thread(decode_body, body, int(request.query.get("rate", "16000")))
+    if not pcm:
+        raise ValueError("В файле нет звука")
+    return pcm
+
+
+def create_app(ctx: AppContext) -> web.Application:
+    app = web.Application(client_max_size=64 * 1024 * 1024, middlewares=[errors_middleware])
+    store, runtime, settings, dstore = ctx.store, ctx.runtime, ctx.settings, ctx.runtime.dialogue_store
+
+    async def index(request: web.Request) -> web.Response:
+        base = request.headers.get("X-Ingress-Path", "").rstrip("/")
+        html = (ctx.web_root / "index.html").read_text(encoding="utf-8")
+        html = html.replace("__BASE__", base).replace("__VERSION__", __version__)
+        return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
 
     async def health(_: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "diary_enabled": runtime.enabled})
+        return web.json_response({"ok": True, "diary_enabled": runtime.enabled, "version": __version__})
 
-    async def list_speakers(_: web.Request) -> web.Response:
+    async def status(_: web.Request) -> web.Response:
+        s = settings.get()
+        last_audio_age = round(time.time() - runtime.last_audio_at, 1) if runtime.last_audio_at else None
+        return web.json_response(
+            {
+                "ok": True,
+                "version": __version__,
+                "uptime_s": int(time.time() - ctx.started_at),
+                "ports": ctx.ports,
+                "stt": {"online": await port_open(ctx.stt_uri), "model": ctx.stt_model},
+                "gate": {
+                    "active": store.has_speakers(),
+                    "require_match": s.gate_require_match,
+                    "threshold": s.gate_threshold,
+                    "accepted": ctx.gate.accepted,
+                    "rejected": ctx.gate.rejected,
+                },
+                "diary": {
+                    "enabled": s.diary_enabled,
+                    "pcm_clients": runtime.pcm_clients,
+                    "live_rms": round(runtime.live_rms, 4),
+                    "last_audio_age_s": last_audio_age,
+                    "queued": runtime.queued(),
+                    "dropped": runtime.dropped,
+                },
+                "speakers": len(store.list_speakers()),
+                "diary_enabled": s.diary_enabled,
+                "threshold": s.gate_threshold,
+                "last_utterance": runtime.last_utterance,
+            }
+        )
+
+    async def stats(request: web.Request) -> web.Response:
+        return web.json_response(await asyncio.to_thread(dstore.stats, request.query.get("since") or None))
+
+    async def settings_get(_: web.Request) -> web.Response:
+        return web.json_response(settings.to_dict())
+
+    async def settings_set(request: web.Request) -> web.Response:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("Ожидался JSON-объект")
+        settings.update(data)
+        return web.json_response(settings.to_dict())
+
+    async def speakers_list(_: web.Request) -> web.Response:
         return web.json_response({"speakers": store.list_speakers()})
 
-    async def delete_speaker(request: web.Request) -> web.Response:
-        sid = request.match_info["speaker_id"]
-        ok = store.delete_speaker(sid)
-        if not ok:
-            raise web.HTTPNotFound(text="speaker not found")
-        return web.json_response({"ok": True})
-
-    async def enroll(request: web.Request) -> web.Response:
-        name = request.query.get("name") or ""
-        speaker_id = request.query.get("id")
-        ct = request.headers.get("Content-Type", "")
-        sample_rate = int(request.query.get("rate", "16000"))
-        body = await request.read()
-        if "multipart/" in ct:
-            reader = await request.multipart()
-            while True:
-                part = await reader.next()
-                if part is None:
-                    break
-                if part.name == "name":
-                    name = (await part.text()).strip()
-                elif part.name == "id":
-                    speaker_id = (await part.text()).strip() or None
-                elif part.name in ("audio", "file", "wav"):
-                    body = await part.read(decode=False)
-                    raw_rate = part.headers.get("X-Sample-Rate")
-                    if raw_rate:
-                        sample_rate = int(raw_rate)
-        if not name:
-            raise web.HTTPBadRequest(text="name required")
-        if not body:
-            raise web.HTTPBadRequest(text="audio body required")
-        # strip WAV header if present
-        pcm = body
-        if body[:4] == b"RIFF" and len(body) > 44:
-            pcm = body[44:]
-            try:
-                import struct
-
-                sample_rate = struct.unpack_from("<I", body, 24)[0]
-            except Exception:
-                pass
-        try:
-            meta = store.enroll(name=name, pcm=pcm, sample_rate=sample_rate, speaker_id=speaker_id)
-        except ValueError as e:
-            raise web.HTTPBadRequest(text=str(e)) from e
+    async def speakers_create(request: web.Request) -> web.Response:
+        name = request.query.get("name", "")
+        pcm = await _read_audio(request)
+        meta = await asyncio.to_thread(store.enroll, name, pcm, None)
         return web.json_response(meta)
 
-    async def dialogues(request: web.Request) -> web.Response:
-        limit = int(request.query.get("limit", "100"))
-        since = request.query.get("since")
-        rows = runtime.dialogue_store.list_utterances(limit=limit, since=since)
-        return web.json_response({"utterances": rows})
+    async def speakers_add_sample(request: web.Request) -> web.Response:
+        sid = request.match_info["speaker_id"]
+        pcm = await _read_audio(request)
+        meta = await asyncio.to_thread(store.enroll, None, pcm, sid)
+        return web.json_response(meta)
+
+    async def speakers_patch(request: web.Request) -> web.Response:
+        sid = request.match_info["speaker_id"]
+        data = await request.json()
+        meta = store.rename(sid, str(data.get("name", "")))
+        await asyncio.to_thread(dstore.rename_speaker, sid, meta["name"])
+        return web.json_response(meta)
+
+    async def speakers_delete(request: web.Request) -> web.Response:
+        sid = request.match_info["speaker_id"]
+        if not store.delete_speaker(sid):
+            return _err("Голос не найден", 404)
+        await asyncio.to_thread(dstore.forget_speaker, sid)
+        return web.json_response({"ok": True})
+
+    async def enroll_compat(request: web.Request) -> web.Response:
+        sid = request.query.get("id")
+        pcm = await _read_audio(request)
+        meta = await asyncio.to_thread(store.enroll, request.query.get("name") or None, pcm, sid)
+        return web.json_response(meta)
+
+    async def dialogues_list(request: web.Request) -> web.Response:
+        qp = request.query
+        rows, total = await asyncio.to_thread(
+            dstore.query,
+            limit=min(int(qp.get("limit", "50")), 5000),
+            offset=int(qp.get("offset", "0")),
+            speaker=qp.get("speaker") or None,
+            q=(qp.get("q") or "").strip() or None,
+            since=qp.get("since") or None,
+            until=qp.get("until") or None,
+            ascending=qp.get("order") == "asc",
+        )
+        return web.json_response({"utterances": rows, "total": total})
+
+    def _utt_id(request: web.Request) -> int:
+        return int(request.match_info["utt_id"])
+
+    async def dialogue_audio(request: web.Request) -> web.StreamResponse:
+        path = dstore.audio_path(_utt_id(request))
+        if not path.is_file():
+            return _err("Аудио не сохранено", 404)
+        return web.FileResponse(path, headers={"Content-Type": "audio/wav", "Cache-Control": "no-cache"})
+
+    async def dialogue_assign(request: web.Request) -> web.Response:
+        utt_id = _utt_id(request)
+        row = dstore.get(utt_id)
+        if not row:
+            return _err("Реплика не найдена", 404)
+        data = await request.json()
+        sid = data.get("speaker_id") or None
+        new_name = (data.get("name") or "").strip() or None
+        learn = bool(data.get("enroll", True))
+        audio = dstore.audio_path(utt_id)
+        pcm = decode_body(audio.read_bytes()) if (learn and audio.is_file()) else None
+
+        if sid:
+            if store.get(sid) is None:
+                return _err("Голос не найден", 404)
+            if pcm:
+                await asyncio.to_thread(store.enroll, None, pcm, sid)
+        elif new_name:
+            if not pcm:
+                return _err("Для нового голоса нужна сохранённая запись реплики")
+            sid = (await asyncio.to_thread(store.enroll, new_name, pcm, None))["id"]
+        else:
+            return _err("Выберите голос или введите имя")
+
+        dstore.set_speaker(utt_id, sid, store.name_of(sid))
+        return web.json_response({"ok": True, "utterance": dstore.get(utt_id), "learned": bool(pcm)})
+
+    async def dialogue_unassign(request: web.Request) -> web.Response:
+        utt_id = _utt_id(request)
+        dstore.set_speaker(utt_id, None, None)
+        return web.json_response({"ok": True, "utterance": dstore.get(utt_id)})
+
+    async def dialogue_delete(request: web.Request) -> web.Response:
+        if not dstore.delete(_utt_id(request)):
+            return _err("Реплика не найдена", 404)
+        return web.json_response({"ok": True})
 
     async def diary_get(_: web.Request) -> web.Response:
-        last = runtime.last_utterance
+        last = runtime.last_utterance or {}
         return web.json_response(
             {
                 "enabled": runtime.enabled,
-                "last_speaker": (last or {}).get("speaker_name"),
-                "last_text": (last or {}).get("text"),
-                "last_ts": (last or {}).get("ts"),
+                "last_speaker": last.get("speaker_name"),
+                "last_text": last.get("text"),
+                "last_ts": last.get("ts"),
             }
         )
 
     async def diary_set(request: web.Request) -> web.Response:
         data = await request.json()
         if "enabled" in data:
-            runtime.enabled = bool(data["enabled"])
+            runtime.set_enabled(bool(data["enabled"]))
         return web.json_response({"enabled": runtime.enabled})
 
-    async def status(_: web.Request) -> web.Response:
+    async def gate_events(request: web.Request) -> web.Response:
         return web.json_response(
             {
-                "ok": True,
-                "speakers": len(store.list_speakers()),
-                "diary_enabled": runtime.enabled,
-                "threshold": store.threshold,
-                "last_utterance": runtime.last_utterance,
+                "events": ctx.gate.list(int(request.query.get("limit", "100"))),
+                "accepted": ctx.gate.accepted,
+                "rejected": ctx.gate.rejected,
             }
         )
 
-    async def ingest_pcm(request: web.Request) -> web.Response:
-        """HTTP fallback for ESP/devices: POST raw PCM16 mono."""
-        rate = int(request.query.get("rate", "16000"))
-        body = await request.read()
-        if body[:4] == b"RIFF" and len(body) > 44:
-            import struct
+    async def test_audio(request: web.Request) -> web.Response:
+        pcm = await _read_audio(request)
+        match = await asyncio.to_thread(store.match, pcm)
+        text = await transcribe(ctx.stt_uri, pcm)
+        s = settings.get()
+        has_speakers = store.has_speakers()
+        accepted = (not has_speakers) or match.matched or not s.gate_require_match
+        return web.json_response(
+            {
+                "text": text,
+                "duration_ms": duration_ms(pcm),
+                "threshold": s.gate_threshold,
+                "best": {"id": match.speaker_id, "name": match.name, "score": match.score, "matched": match.matched},
+                "scores": match.scores,
+                "assist_accepted": accepted,
+            }
+        )
 
-            rate = struct.unpack_from("<I", body, 24)[0]
-            body = body[44:]
-        row = await runtime.process_utterance(body, rate)
+    async def ingest(request: web.Request) -> web.Response:
+        pcm = await _read_audio(request)
+        row = await runtime.process_utterance(pcm)
         return web.json_response({"ok": True, "utterance": row})
 
-    app.router.add_get("/api/health", health)
-    app.router.add_get("/api/status", status)
-    app.router.add_get("/api/speakers", list_speakers)
-    app.router.add_delete("/api/speakers/{speaker_id}", delete_speaker)
-    app.router.add_post("/api/enroll", enroll)
-    app.router.add_get("/api/dialogues", dialogues)
-    app.router.add_get("/api/diary", diary_get)
-    app.router.add_post("/api/diary", diary_set)
-    app.router.add_post("/api/ingest", ingest_pcm)
-
-    if web_root.is_dir():
-        app.router.add_get("/", lambda r: web.FileResponse(web_root / "index.html"))
-        app.router.add_static("/static/", web_root, show_index=False)
-
+    r = app.router
+    r.add_get("/", index)
+    r.add_get("/api/health", health)
+    r.add_get("/api/status", status)
+    r.add_get("/api/stats", stats)
+    r.add_get("/api/settings", settings_get)
+    r.add_post("/api/settings", settings_set)
+    r.add_get("/api/speakers", speakers_list)
+    r.add_post("/api/speakers", speakers_create)
+    r.add_patch("/api/speakers/{speaker_id}", speakers_patch)
+    r.add_delete("/api/speakers/{speaker_id}", speakers_delete)
+    r.add_post("/api/speakers/{speaker_id}/samples", speakers_add_sample)
+    r.add_post("/api/enroll", enroll_compat)
+    r.add_get("/api/dialogues", dialogues_list)
+    r.add_get("/api/dialogues/{utt_id:\\d+}/audio", dialogue_audio)
+    r.add_post("/api/dialogues/{utt_id:\\d+}/assign", dialogue_assign)
+    r.add_post("/api/dialogues/{utt_id:\\d+}/unassign", dialogue_unassign)
+    r.add_delete("/api/dialogues/{utt_id:\\d+}", dialogue_delete)
+    r.add_get("/api/diary", diary_get)
+    r.add_post("/api/diary", diary_set)
+    r.add_get("/api/gate/events", gate_events)
+    r.add_post("/api/test", test_audio)
+    r.add_post("/api/ingest", ingest)
+    r.add_static("/static/", ctx.web_root, show_index=False)
     return app
 
 
-async def start_api(
-    store: SpeakerStore,
-    runtime: DialogueRuntime,
-    host: str,
-    port: int,
-    web_root: Path,
-) -> web.AppRunner:
-    app = create_app(store, runtime, web_root)
-    runner = web.AppRunner(app)
+async def start_api(ctx: AppContext, host: str, port: int) -> web.AppRunner:
+    runner = web.AppRunner(create_app(ctx), access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, host=host, port=port)
-    await site.start()
+    await web.TCPSite(runner, host=host, port=port).start()
     _LOGGER.info("API/UI on http://%s:%s", host, port)
     return runner

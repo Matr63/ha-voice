@@ -3,44 +3,48 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HA Voice — голоса и дневник</title>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <title>HA Voice</title>
+  <link rel="stylesheet" href="__BASE__/static/styles.css?v=__VERSION__" />
+  <script>window.HV_BASE = "__BASE__"; window.HV_VERSION = "__VERSION__";</script>
 </head>
 <body>
-  <main>
-    <h1>HA Voice</h1>
-    <p class="sub">Enrollment голосов · дневник комнаты · отсечение ТВ</p>
-
-    <section>
-      <h2>Дневник</h2>
-      <label class="row">
-        <input type="checkbox" id="diaryEnabled" />
-        Непрерывная расшифровка
-      </label>
-      <p id="diaryStatus" class="muted"></p>
-    </section>
-
-    <section>
-      <h2>Записать голос</h2>
-      <div class="row">
-        <input id="speakerName" type="text" placeholder="Имя (папа, мама…)" />
-        <button id="recBtn" type="button">Запись 4 с</button>
-        <button id="enrollBtn" type="button" disabled>Сохранить</button>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h2"/><path d="M6 8v8"/><path d="M10 4v16"/><path d="M14 7v10"/><path d="M18 9v6"/><path d="M22 12h-2"/></svg>
+        </div>
+        <div>
+          <div class="brand-title">HA Voice</div>
+          <div class="brand-sub">GigaAM · узнавание голосов · дневник</div>
+        </div>
       </div>
-      <p id="enrollMsg" class="muted"></p>
-    </section>
+      <div class="pills" id="pills"></div>
+    </header>
 
-    <section>
-      <h2>Спикеры</h2>
-      <ul id="speakers"></ul>
-    </section>
+    <nav class="tabs" id="tabs" role="tablist">
+      <button type="button" data-tab="overview">Обзор</button>
+      <button type="button" data-tab="diary">Дневник</button>
+      <button type="button" data-tab="voices">Голоса</button>
+      <button type="button" data-tab="assist">Assist</button>
+      <button type="button" data-tab="test">Проверка</button>
+      <button type="button" data-tab="settings">Настройки</button>
+    </nav>
 
-    <section>
-      <h2>Последние реплики</h2>
-      <button id="refreshBtn" type="button">Обновить</button>
-      <ul id="dialogues"></ul>
-    </section>
-  </main>
-  <script src="/static/app.js"></script>
+    <main>
+      <section class="view" data-view="overview"></section>
+      <section class="view" data-view="diary"></section>
+      <section class="view" data-view="voices"></section>
+      <section class="view" data-view="assist"></section>
+      <section class="view" data-view="test"></section>
+      <section class="view" data-view="settings"></section>
+    </main>
+
+    <footer class="footer muted" id="footer"></footer>
+  </div>
+
+  <dialog id="modal" class="modal"></dialog>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="__BASE__/static/app.js?v=__VERSION__"></script>
 </body>
 </html>

@@ -36,6 +36,16 @@ class OnnxAsrHandler(AsyncEventHandler):
         self.audio_buffer: bytearray | None = None
         self.language: str | None = None
         self.sample_rate = 16000
+        self.channels = 1
+
+    def _recognize(self, audio: np.ndarray) -> str:
+        kwargs: dict[str, Any] = {"sample_rate": self.sample_rate}
+        if self.language:
+            try:
+                return str(self.model.recognize(audio, language=self.language, **kwargs) or "")
+            except TypeError:
+                pass
+        return str(self.model.recognize(audio, **kwargs) or "")
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
@@ -51,6 +61,7 @@ class OnnxAsrHandler(AsyncEventHandler):
         if AudioStart.is_type(event.type):
             start = AudioStart.from_event(event)
             self.sample_rate = start.rate
+            self.channels = start.channels
             self.audio_buffer = bytearray()
             return True
 
@@ -68,13 +79,13 @@ class OnnxAsrHandler(AsyncEventHandler):
                 await self.write_event(Transcript(text="").event())
                 return True
 
-            audio_f32 = np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0
-            kwargs: dict[str, Any] = {"sample_rate": self.sample_rate}
-            if self.language:
-                kwargs["language"] = self.language
+            audio_f32 = np.frombuffer(bytes(buf[: len(buf) - len(buf) % 2]), dtype=np.int16).astype(np.float32) / 32768.0
+            if self.channels > 1:
+                usable = audio_f32.size - audio_f32.size % self.channels
+                audio_f32 = audio_f32[:usable].reshape(-1, self.channels).mean(axis=1)
 
             async with self.model_lock:
-                text = self.model.recognize(audio_f32, **kwargs)
+                text = await asyncio.to_thread(self._recognize, audio_f32)
 
             _LOGGER.info("transcript=%r", text)
             await self.write_event(Transcript(text=str(text or "")).event())

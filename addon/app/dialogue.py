@@ -1,43 +1,48 @@
-"""Continuous room-diary: PCM TCP ingest → VAD → speaker match → Wyoming STT → store."""
+"""Room diary: PCM ingest → VAD → speaker match → STT → SQLite/JSONL (+ audio clips)."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
 import sqlite3
 import struct
+import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from wyoming.asr import Transcript
-from wyoming.audio import AudioChunk, AudioStart, AudioStop
-from wyoming.client import AsyncClient
-
+from audio_utils import TARGET_RATE, duration_ms, normalize_pcm, rms, to_wav
+from settings import SettingsStore
 from speakers import SpeakerStore
+from stt_client import transcribe
 
 _LOGGER = logging.getLogger("ha-voice.dialogue")
 
-# Frame header: magic(4) 'HV01' + rate(u32) + samples(u32) + pcm bytes
+# Frame: b"HV01" + rate(u32 BE) + nbytes(u32 BE) + PCM16 mono
 MAGIC = b"HV01"
+MAX_FRAME_BYTES = 64000
+UNKNOWN = "__unknown__"
+
+_COLUMNS = "id, ts, speaker_id, speaker_name, score, text, duration_ms, has_audio"
 
 
 class DialogueStore:
-    def __init__(self, db_path: Path, jsonl_dir: Path) -> None:
+    def __init__(self, db_path: Path, root_dir: Path) -> None:
         self.db_path = Path(db_path)
-        self.jsonl_dir = Path(jsonl_dir)
-        self.jsonl_dir.mkdir(parents=True, exist_ok=True)
+        self.root_dir = Path(root_dir)
+        self.audio_dir = self.root_dir / "audio"
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS utterances (
@@ -51,7 +56,14 @@ class DialogueStore:
                 )
                 """
             )
-            conn.commit()
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(utterances)")}
+            if "has_audio" not in cols:
+                conn.execute("ALTER TABLE utterances ADD COLUMN has_audio INTEGER NOT NULL DEFAULT 0")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_utt_ts ON utterances(ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_utt_speaker ON utterances(speaker_id)")
+
+    def audio_path(self, utt_id: int) -> Path:
+        return self.audio_dir / f"{int(utt_id)}.wav"
 
     def add(
         self,
@@ -59,47 +71,139 @@ class DialogueStore:
         speaker_id: str | None,
         speaker_name: str | None,
         score: float,
-        duration_ms: int,
+        duration: int,
+        pcm: bytes | None,
     ) -> dict[str, Any]:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                "INSERT INTO utterances (ts, speaker_id, speaker_name, score, text, duration_ms, has_audio)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (ts, speaker_id, speaker_name or "unknown", score, text, duration, 1 if pcm else 0),
+            )
+            utt_id = int(cur.lastrowid)
+        if pcm:
+            self.audio_path(utt_id).write_bytes(to_wav(pcm))
         row = {
+            "id": utt_id,
             "ts": ts,
             "speaker_id": speaker_id,
             "speaker_name": speaker_name or "unknown",
             "score": score,
             "text": text,
-            "duration_ms": duration_ms,
+            "duration_ms": duration,
+            "has_audio": bool(pcm),
         }
-        with self._connect() as conn:
-            cur = conn.execute(
-                "INSERT INTO utterances (ts, speaker_id, speaker_name, score, text, duration_ms) VALUES (?,?,?,?,?,?)",
-                (
-                    row["ts"],
-                    row["speaker_id"],
-                    row["speaker_name"],
-                    row["score"],
-                    row["text"],
-                    row["duration_ms"],
-                ),
-            )
-            row["id"] = int(cur.lastrowid)
-            conn.commit()
-        day = ts[:10]
-        with (self.jsonl_dir / f"{day}.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with (self.root_dir / f"{ts[:10]}.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({k: v for k, v in row.items() if k != "has_audio"}, ensure_ascii=False) + "\n")
         return row
 
-    def list_utterances(self, limit: int = 100, since: str | None = None) -> list[dict[str, Any]]:
-        q = "SELECT id, ts, speaker_id, speaker_name, score, text, duration_ms FROM utterances"
+    @staticmethod
+    def _where(
+        speaker: str | None, q: str | None, since: str | None, until: str | None
+    ) -> tuple[str, list[Any]]:
+        parts: list[str] = []
         args: list[Any] = []
+        if speaker == UNKNOWN:
+            parts.append("speaker_id IS NULL")
+        elif speaker:
+            parts.append("speaker_id = ?")
+            args.append(speaker)
+        if q:
+            parts.append("text LIKE ?")
+            args.append(f"%{q}%")
         if since:
-            q += " WHERE ts >= ?"
+            parts.append("ts >= ?")
             args.append(since)
-        q += " ORDER BY id DESC LIMIT ?"
-        args.append(int(limit))
-        with self._connect() as conn:
-            rows = conn.execute(q, args).fetchall()
-        return [dict(r) for r in rows]
+        if until:
+            parts.append("ts < ?")
+            args.append(until)
+        return (" WHERE " + " AND ".join(parts)) if parts else "", args
+
+    @staticmethod
+    def _row(r: sqlite3.Row) -> dict[str, Any]:
+        d = dict(r)
+        d["has_audio"] = bool(d.get("has_audio"))
+        return d
+
+    def query(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        speaker: str | None = None,
+        q: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        ascending: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        where, args = self._where(speaker, q, since, until)
+        order = "ASC" if ascending else "DESC"
+        with closing(self._connect()) as conn:
+            total = int(conn.execute(f"SELECT COUNT(*) FROM utterances{where}", args).fetchone()[0])
+            rows = conn.execute(
+                f"SELECT {_COLUMNS} FROM utterances{where} ORDER BY id {order} LIMIT ? OFFSET ?",
+                [*args, int(limit), int(offset)],
+            ).fetchall()
+        return [self._row(r) for r in rows], total
+
+    def get(self, utt_id: int) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            r = conn.execute(f"SELECT {_COLUMNS} FROM utterances WHERE id = ?", (int(utt_id),)).fetchone()
+        return self._row(r) if r else None
+
+    def set_speaker(self, utt_id: int, speaker_id: str | None, speaker_name: str | None) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE utterances SET speaker_id = ?, speaker_name = ?, score = NULL WHERE id = ?",
+                (speaker_id, speaker_name or "unknown", int(utt_id)),
+            )
+
+    def rename_speaker(self, speaker_id: str, name: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute("UPDATE utterances SET speaker_name = ? WHERE speaker_id = ?", (name, speaker_id))
+
+    def forget_speaker(self, speaker_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE utterances SET speaker_id = NULL, speaker_name = 'unknown' WHERE speaker_id = ?",
+                (speaker_id,),
+            )
+
+    def delete(self, utt_id: int) -> bool:
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute("DELETE FROM utterances WHERE id = ?", (int(utt_id),))
+        self.audio_path(utt_id).unlink(missing_ok=True)
+        return cur.rowcount > 0
+
+    def prune_audio(self, keep: int) -> None:
+        with closing(self._connect()) as conn, conn:
+            ids = [
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT id FROM utterances WHERE has_audio = 1 ORDER BY id DESC LIMIT -1 OFFSET ?",
+                    (max(0, int(keep)),),
+                )
+            ]
+            if ids:
+                conn.executemany("UPDATE utterances SET has_audio = 0 WHERE id = ?", [(i,) for i in ids])
+        for i in ids:
+            self.audio_path(i).unlink(missing_ok=True)
+
+    def stats(self, since: str | None = None) -> dict[str, Any]:
+        with closing(self._connect()) as conn:
+            total = int(conn.execute("SELECT COUNT(*) FROM utterances").fetchone()[0])
+            where, args = self._where(None, None, since, None)
+            period = int(conn.execute(f"SELECT COUNT(*) FROM utterances{where}", args).fetchone()[0])
+            unknown_where, unknown_args = self._where(UNKNOWN, None, since, None)
+            unknown = int(conn.execute(f"SELECT COUNT(*) FROM utterances{unknown_where}", unknown_args).fetchone()[0])
+            by_speaker = [
+                {"speaker_id": r[0], "count": int(r[1]), "last_ts": r[2]}
+                for r in conn.execute(
+                    "SELECT speaker_id, COUNT(*), MAX(ts) FROM utterances"
+                    " WHERE speaker_id IS NOT NULL GROUP BY speaker_id"
+                )
+            ]
+        return {"total": total, "period": period, "period_unknown": unknown, "by_speaker": by_speaker}
 
 
 class DialogueRuntime:
@@ -107,88 +211,92 @@ class DialogueRuntime:
         self,
         store: SpeakerStore,
         dialogue_store: DialogueStore,
+        settings: SettingsStore,
         stt_uri: str,
-        sample_rate: int = 16000,
-        vad_rms: float = 0.012,
-        min_speech_ms: int = 400,
-        max_utterance_ms: int = 15000,
-        silence_ms: int = 700,
     ) -> None:
         self.store = store
         self.dialogue_store = dialogue_store
+        self.settings = settings
         self.stt_uri = stt_uri
-        self.sample_rate = sample_rate
-        self.vad_rms = vad_rms
-        self.min_speech_ms = min_speech_ms
-        self.max_utterance_ms = max_utterance_ms
-        self.silence_ms = silence_ms
-        self.enabled = True
         self.last_utterance: dict[str, Any] | None = None
+        self.pcm_clients = 0
+        self.last_audio_at: float | None = None
+        self.live_rms = 0.0
+        self.processed = 0
+        self.dropped = 0
+        self.queue: asyncio.Queue[bytes] | None = None
+        self._worker_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
-    async def process_utterance(self, pcm: bytes, sample_rate: int | None = None) -> dict[str, Any] | None:
-        rate = sample_rate or self.sample_rate
-        if not self.enabled or not pcm:
+    @property
+    def enabled(self) -> bool:
+        return self.settings.get().diary_enabled
+
+    def set_enabled(self, value: bool) -> None:
+        self.settings.update({"diary_enabled": bool(value)})
+
+    def start(self) -> None:
+        if self.queue is None:
+            self.queue = asyncio.Queue(maxsize=32)
+            self._worker_task = asyncio.create_task(self._worker())
+
+    def queued(self) -> int:
+        return self.queue.qsize() if self.queue else 0
+
+    def submit(self, pcm: bytes) -> None:
+        if self.queue is None:
+            return
+        try:
+            self.queue.put_nowait(pcm)
+        except asyncio.QueueFull:
+            self.dropped += 1
+            _LOGGER.warning("Diary queue full, utterance dropped")
+
+    async def _worker(self) -> None:
+        assert self.queue is not None
+        while True:
+            pcm = await self.queue.get()
+            try:
+                await self.process_utterance(pcm)
+            except Exception:
+                _LOGGER.exception("Diary processing failed")
+            finally:
+                self.queue.task_done()
+
+    async def process_utterance(self, pcm: bytes, force: bool = False) -> dict[str, Any] | None:
+        """pcm: 16 kHz mono PCM16."""
+        s = self.settings.get()
+        if not pcm or (not force and not s.diary_enabled):
             return None
-        duration_ms = int(len(pcm) / 2 / rate * 1000)
-        if duration_ms < self.min_speech_ms:
+        dur = duration_ms(pcm)
+        if dur < s.diary_min_speech_ms:
             return None
 
         async with self._lock:
-            match = self.store.match_pcm(pcm, rate)
-            text = await self._transcribe(pcm, rate)
-            if not text.strip():
+            match = await asyncio.to_thread(self.store.match, pcm)
+            text = await transcribe(self.stt_uri, pcm)
+            if not text:
                 return None
-            name = match.name if match.matched else "unknown"
-            sid = match.speaker_id if match.matched else None
+            keep = s.diary_keep_audio
             row = self.dialogue_store.add(
-                text=text.strip(),
-                speaker_id=sid,
-                speaker_name=name,
-                score=float(match.score),
-                duration_ms=duration_ms,
+                text=text,
+                speaker_id=match.speaker_id if match.matched else None,
+                speaker_name=match.name if match.matched else "unknown",
+                score=round(float(match.score), 3),
+                duration=dur,
+                pcm=pcm if keep > 0 else None,
             )
+            self.processed += 1
+            if keep > 0 and self.processed % 20 == 0:
+                await asyncio.to_thread(self.dialogue_store.prune_audio, keep)
             self.last_utterance = row
-            _LOGGER.info("diary [%s] %s", name, text.strip())
+            _LOGGER.info("diary [%s %.2f] %s", row["speaker_name"], match.score, text)
             return row
-
-    async def _transcribe(self, pcm: bytes, rate: int) -> str:
-        try:
-            async with AsyncClient.from_uri(self.stt_uri) as client:
-                await client.write_event(AudioStart(rate=rate, width=2, channels=1).event())
-                step = rate * 2 // 5
-                for i in range(0, len(pcm), max(step, 3200)):
-                    await client.write_event(
-                        AudioChunk(
-                            rate=rate,
-                            width=2,
-                            channels=1,
-                            audio=pcm[i : i + max(step, 3200)],
-                        ).event()
-                    )
-                await client.write_event(AudioStop().event())
-                while True:
-                    ev = await client.read_event()
-                    if ev is None:
-                        break
-                    if Transcript.is_type(ev.type):
-                        return Transcript.from_event(ev).text or ""
-        except Exception:
-            _LOGGER.exception("Diary STT failed")
-        return ""
-
-
-def _rms_int16(pcm: bytes) -> float:
-    import numpy as np
-
-    if len(pcm) < 2:
-        return 0.0
-    arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    return float((arr * arr).mean() ** 0.5)
 
 
 class PcmSession:
-    """Accumulate speech by energy VAD from framed PCM stream."""
+    """Energy VAD over the framed stream. The ESP may skip silent frames,
+    so a read timeout also counts as silence."""
 
     def __init__(self, runtime: DialogueRuntime) -> None:
         self.runtime = runtime
@@ -196,40 +304,41 @@ class PcmSession:
         self.in_speech = False
         self.silence_ms = 0
         self.speech_ms = 0
-        self.rate = runtime.sample_rate
 
-    async def feed(self, pcm: bytes, rate: int) -> None:
-        self.rate = rate
-        frame_ms = int(len(pcm) / 2 / rate * 1000) if rate else 0
-        rms = _rms_int16(pcm)
-        speaking = rms >= self.runtime.vad_rms
+    def feed(self, pcm: bytes, rate: int) -> None:
+        if rate != TARGET_RATE:
+            pcm = normalize_pcm(pcm, rate)
+        s = self.runtime.settings.get()
+        level = rms(pcm)
+        self.runtime.live_rms = level
+        self.runtime.last_audio_at = time.time()
+        frame_ms = duration_ms(pcm)
 
-        if speaking:
+        if level >= s.diary_vad_rms:
             if not self.in_speech:
                 self.in_speech = True
                 self.buf = bytearray()
-                self.silence_ms = 0
                 self.speech_ms = 0
             self.buf.extend(pcm)
             self.speech_ms += frame_ms
             self.silence_ms = 0
-            if self.speech_ms >= self.runtime.max_utterance_ms:
-                await self._flush()
+            if self.speech_ms >= s.diary_max_utterance_ms:
+                self.flush()
             return
 
         if self.in_speech:
             self.buf.extend(pcm)
             self.silence_ms += frame_ms
-            if self.silence_ms >= self.runtime.silence_ms:
-                await self._flush()
+            if self.silence_ms >= s.diary_silence_ms:
+                self.flush()
 
-    async def _flush(self) -> None:
-        pcm = bytes(self.buf)
+    def flush(self) -> None:
+        if self.in_speech and self.buf:
+            self.runtime.submit(bytes(self.buf))
         self.buf = bytearray()
         self.in_speech = False
         self.silence_ms = 0
         self.speech_ms = 0
-        await self.runtime.process_utterance(pcm, self.rate)
 
 
 async def handle_pcm_client(
@@ -239,24 +348,34 @@ async def handle_pcm_client(
 ) -> None:
     peer = writer.get_extra_info("peername")
     _LOGGER.info("PCM client connected %s", peer)
+    runtime.pcm_clients += 1
     session = PcmSession(runtime)
     try:
         while True:
-            hdr = await reader.readexactly(12)
+            timeout = runtime.settings.get().diary_silence_ms / 1000.0
+            try:
+                hdr = await asyncio.wait_for(reader.readexactly(12), timeout)
+            except asyncio.TimeoutError:
+                session.flush()
+                runtime.live_rms = 0.0
+                continue
             if hdr[:4] != MAGIC:
                 _LOGGER.warning("Bad PCM magic from %s", peer)
                 break
             rate, nbytes = struct.unpack(">II", hdr[4:12])
-            if nbytes <= 0 or nbytes > 32000 * 2:
+            if nbytes <= 0 or nbytes > MAX_FRAME_BYTES or not 8000 <= rate <= 48000:
+                _LOGGER.warning("Bad PCM frame from %s: rate=%s bytes=%s", peer, rate, nbytes)
                 break
             pcm = await reader.readexactly(nbytes)
             if runtime.enabled:
-                await session.feed(pcm, rate)
+                session.feed(pcm, rate)
     except asyncio.IncompleteReadError:
         pass
     except Exception:
         _LOGGER.exception("PCM client error")
     finally:
+        session.flush()
+        runtime.pcm_clients = max(0, runtime.pcm_clients - 1)
         writer.close()
         try:
             await writer.wait_closed()
@@ -266,26 +385,8 @@ async def handle_pcm_client(
 
 
 async def run_pcm_server(host: str, port: int, runtime: DialogueRuntime) -> None:
-    server = await asyncio.start_server(
-        lambda r, w: handle_pcm_client(r, w, runtime),
-        host=host,
-        port=port,
-    )
+    runtime.start()
+    server = await asyncio.start_server(lambda r, w: handle_pcm_client(r, w, runtime), host=host, port=port)
     _LOGGER.info("Diary PCM server on %s:%s", host, port)
     async with server:
         await server.serve_forever()
-
-
-def build_runtime_from_env(store: SpeakerStore) -> DialogueRuntime:
-    dialogues_dir = Path(os.environ.get("DIALOGUES_DIR", "/data/dialogues"))
-    db = Path(os.environ.get("DIALOGUE_DB", str(dialogues_dir / "dialogue.db")))
-    return DialogueRuntime(
-        store=store,
-        dialogue_store=DialogueStore(db, dialogues_dir),
-        stt_uri=os.environ.get("DIALOGUE_STT_URI", "tcp://127.0.0.1:10305"),
-        sample_rate=int(os.environ.get("DIALOGUE_SAMPLE_RATE", "16000")),
-        vad_rms=float(os.environ.get("DIALOGUE_VAD_RMS", "0.012")),
-        min_speech_ms=int(os.environ.get("DIALOGUE_MIN_SPEECH_MS", "400")),
-        max_utterance_ms=int(os.environ.get("DIALOGUE_MAX_UTTERANCE_MS", "15000")),
-        silence_ms=int(os.environ.get("DIALOGUE_SILENCE_MS", "700")),
-    )

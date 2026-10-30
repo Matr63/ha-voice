@@ -8,12 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY services/speaker_gate/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY addon/app/gate-requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r /app/requirements.txt
 
-COPY services/speaker_gate/*.py /app/
-COPY web /app/web
+COPY addon/app/*.py /app/
+COPY addon/app/web /app/web
 
+ENV PYTHONUNBUFFERED=1
+ENV SETTINGS_FILE=/data/config/settings.json
 ENV SPEAKERS_DIR=/data/speakers
 ENV DIALOGUES_DIR=/data/dialogues
 ENV DIALOGUE_DB=/data/dialogues/dialogue.db

@@ -1,5 +1,5 @@
 name: HA Voice (GigaAM)
-version: "1.0.3"
+version: "1.1.0"
 slug: ha_voice
 description: >-
   GigaAM STT, speaker enrollment, room diary.

@@ -6,13 +6,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY services/stt/requirements.txt /app/requirements.txt
+COPY addon/app/stt-requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY services/stt/server.py /app/server.py
+COPY addon/app/stt_server.py /app/stt_server.py
 COPY services/stt/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
+ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/data/models
 ENV STT_MODEL=gigaam-v3-e2e-rnnt
 ENV STT_QUANTIZATION=int8

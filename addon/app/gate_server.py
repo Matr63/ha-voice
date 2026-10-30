@@ -1,200 +1,179 @@
-"""Wyoming STT proxy: verify enrolled speaker, else reject (blocks TV / strangers)."""
+"""Wyoming STT proxy for Assist: only enrolled voices get a transcript (blocks TV / strangers)."""
 from __future__ import annotations
 
-import argparse
 import asyncio
 import logging
-import os
+from collections import deque
+from datetime import datetime, timezone
 from functools import partial
 from typing import Any
-from urllib.parse import urlparse
 
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
-from wyoming.client import AsyncClient
 from wyoming.event import Event
 from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 from wyoming.server import AsyncEventHandler, AsyncServer
 
+from audio_utils import normalize_pcm
+from settings import SettingsStore
 from speakers import SpeakerStore
+from stt_client import transcribe
+from version import __version__
 
 _LOGGER = logging.getLogger("ha-voice.gate")
+_REPO = "https://github.com/Matr63/ha-voice"
+_background: set[asyncio.Task] = set()
 
 
-def _parse_tcp(uri: str) -> tuple[str, int]:
-    u = urlparse(uri)
-    if u.scheme != "tcp" or not u.hostname or not u.port:
-        raise ValueError(f"Expected tcp://host:port, got {uri}")
-    return u.hostname, int(u.port)
+class GateState:
+    def __init__(self, maxlen: int = 300) -> None:
+        self.events: deque[dict[str, Any]] = deque(maxlen=maxlen)
+        self.accepted = 0
+        self.rejected = 0
+        self._next_id = 1
+
+    def add(self, event: dict[str, Any]) -> dict[str, Any]:
+        event["id"] = self._next_id
+        self._next_id += 1
+        if event["accepted"]:
+            self.accepted += 1
+        else:
+            self.rejected += 1
+        self.events.appendleft(event)
+        return event
+
+    def list(self, limit: int = 100) -> list[dict[str, Any]]:
+        return list(self.events)[: max(1, limit)]
 
 
 class GateHandler(AsyncEventHandler):
     def __init__(
         self,
-        wyoming_info: Info,
+        info_event: Event,
         store: SpeakerStore,
-        upstream_uri: str,
-        require_match: bool,
+        settings: SettingsStore,
+        upstream: str,
+        state: GateState,
         *args: Any,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.wyoming_info_event = wyoming_info.event()
+        self.info_event = info_event
         self.store = store
-        self.upstream_uri = upstream_uri
-        self.require_match = require_match
-        self.audio_buffer = bytearray()
-        self.sample_rate = 16000
-        self.sample_width = 2
-        self.channels = 1
+        self.settings = settings
+        self.upstream = upstream
+        self.state = state
         self.language: str | None = None
-        self.last_match: dict[str, Any] | None = None
+        self.audio = bytearray()
+        self.rate = 16000
+        self.width = 2
+        self.channels = 1
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
-            await self.write_event(self.wyoming_info_event)
-            return True
-
-        if Transcribe.is_type(event.type):
-            tr = Transcribe.from_event(event)
-            self.language = tr.language
-            self.audio_buffer = bytearray()
-            return True
-
-        if AudioStart.is_type(event.type):
+            await self.write_event(self.info_event)
+        elif Transcribe.is_type(event.type):
+            self.language = Transcribe.from_event(event).language
+        elif AudioStart.is_type(event.type):
             start = AudioStart.from_event(event)
-            self.sample_rate = start.rate
-            self.sample_width = start.width
-            self.channels = start.channels
-            self.audio_buffer = bytearray()
-            return True
-
-        if AudioChunk.is_type(event.type):
-            chunk = AudioChunk.from_event(event)
-            self.audio_buffer.extend(chunk.audio)
-            return True
-
-        if AudioStop.is_type(event.type):
-            pcm = bytes(self.audio_buffer)
-            self.audio_buffer = bytearray()
-            match = self.store.match_pcm(pcm, self.sample_rate)
-            self.last_match = {
-                "speaker_id": match.speaker_id,
-                "name": match.name,
-                "score": match.score,
-                "matched": match.matched,
-            }
-            _LOGGER.info(
-                "speaker match name=%s score=%.3f matched=%s",
-                match.name,
-                match.score,
-                match.matched,
-            )
-
-            if self.require_match and not match.matched:
-                await self.write_event(Transcript(text="").event())
-                return True
-
-            text = await self._upstream_transcribe(pcm)
-            if match.matched and match.name and text:
-                # prefix for HA automations / logs (Assist still gets plain intent text)
-                pass
-            await self.write_event(Transcript(text=text).event())
-            return True
-
+            self.rate, self.width, self.channels = start.rate, start.width, start.channels
+            self.audio = bytearray()
+        elif AudioChunk.is_type(event.type):
+            self.audio.extend(AudioChunk.from_event(event).audio)
+        elif AudioStop.is_type(event.type):
+            await self._finish()
         return True
 
-    async def _upstream_transcribe(self, pcm: bytes) -> str:
-        if not pcm:
-            return ""
-        try:
-            async with AsyncClient.from_uri(self.upstream_uri) as client:
-                if self.language:
-                    await client.write_event(Transcribe(language=self.language).event())
-                await client.write_event(
-                    AudioStart(
-                        rate=self.sample_rate,
-                        width=self.sample_width,
-                        channels=self.channels,
-                    ).event()
-                )
-                # chunk to avoid huge frames
-                step = self.sample_rate * self.sample_width * self.channels // 5
-                for i in range(0, len(pcm), max(step, 3200)):
-                    piece = pcm[i : i + max(step, 3200)]
-                    await client.write_event(
-                        AudioChunk(
-                            rate=self.sample_rate,
-                            width=self.sample_width,
-                            channels=self.channels,
-                            audio=piece,
-                        ).event()
+    async def _finish(self) -> None:
+        raw = bytes(self.audio)
+        self.audio = bytearray()
+        bytes_per_sec = self.rate * self.width * self.channels
+        event: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "duration_ms": int(len(raw) / bytes_per_sec * 1000) if bytes_per_sec else 0,
+            "speaker_id": None,
+            "speaker_name": None,
+            "score": None,
+            "matched": False,
+            "accepted": True,
+            "reason": "no_speakers",
+            "text": "",
+        }
+
+        if raw and self.width == 2 and self.store.has_speakers():
+            pcm16 = normalize_pcm(raw, self.rate, self.channels)
+            match = await asyncio.to_thread(self.store.match, pcm16)
+            event.update(
+                speaker_id=match.speaker_id,
+                speaker_name=match.name,
+                score=match.score,
+                matched=match.matched,
+            )
+            if match.matched:
+                event["reason"] = "match"
+            elif self.settings.get().gate_require_match:
+                event.update(accepted=False, reason="unknown_voice")
+            else:
+                event["reason"] = "filter_off"
+
+        record = self.state.add(event)
+        _LOGGER.info(
+            "assist %s reason=%s speaker=%s score=%s",
+            "accepted" if record["accepted"] else "REJECTED",
+            record["reason"],
+            record["speaker_name"],
+            record["score"],
+        )
+
+        if not record["accepted"]:
+            await self.write_event(Transcript(text="").event())
+            task = asyncio.create_task(self._fill_text(raw, record))
+            _background.add(task)
+            task.add_done_callback(_background.discard)
+            return
+
+        record["text"] = await self._transcribe(raw)
+        await self.write_event(Transcript(text=record["text"]).event())
+
+    async def _transcribe(self, raw: bytes) -> str:
+        return await transcribe(self.upstream, raw, self.rate, self.width, self.channels, self.language)
+
+    async def _fill_text(self, raw: bytes, record: dict[str, Any]) -> None:
+        record["text"] = await self._transcribe(raw)
+
+
+def _info() -> Info:
+    attribution = Attribution(name="ha-voice", url=_REPO)
+    return Info(
+        asr=[
+            AsrProgram(
+                name="ha-voice-speaker-gate",
+                description="GigaAM, принимает команды только от записанных голосов",
+                attribution=attribution,
+                installed=True,
+                version=__version__,
+                models=[
+                    AsrModel(
+                        name="gated-gigaam",
+                        description="GigaAM behind speaker verification",
+                        attribution=attribution,
+                        installed=True,
+                        languages=["ru", "en"],
+                        version=__version__,
                     )
-                await client.write_event(AudioStop().event())
-                while True:
-                    ev = await client.read_event()
-                    if ev is None:
-                        break
-                    if Transcript.is_type(ev.type):
-                        return Transcript.from_event(ev).text or ""
-        except Exception:
-            _LOGGER.exception("Upstream STT failed")
-            return ""
-        return ""
+                ],
+            )
+        ]
+    )
 
 
 async def run_gate(
     uri: str,
     upstream: str,
     store: SpeakerStore,
-    require_match: bool,
+    settings: SettingsStore,
+    state: GateState,
 ) -> None:
-    info = Info(
-        asr=[
-            AsrProgram(
-                name="ha-voice-speaker-gate",
-                description="Speaker-gated STT (rejects unknown / TV)",
-                attribution=Attribution(name="ha-voice", url="https://github.com/Matr63/ha-voice"),
-                installed=True,
-                version="1.0.0",
-                models=[
-                    AsrModel(
-                        name="gated-gigaam",
-                        description="GigaAM behind speaker verification",
-                        attribution=Attribution(name="ha-voice", url="https://github.com/Matr63/ha-voice"),
-                        installed=True,
-                        languages=["ru", "en"],
-                        version="1.0.0",
-                    )
-                ],
-            )
-        ]
-    )
     server = AsyncServer.from_uri(uri)
-    _LOGGER.info("Speaker gate listening on %s → %s require_match=%s", uri, upstream, require_match)
-    await server.run(partial(GateHandler, info, store, upstream, require_match))
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--uri", default=os.environ.get("GATE_URI", "tcp://0.0.0.0:10350"))
-    parser.add_argument("--upstream", default=os.environ.get("GATE_UPSTREAM", "tcp://127.0.0.1:10305"))
-    parser.add_argument("--speakers-dir", default=os.environ.get("SPEAKERS_DIR", "/data/speakers"))
-    parser.add_argument("--threshold", type=float, default=float(os.environ.get("GATE_THRESHOLD", "0.55")))
-    parser.add_argument(
-        "--require-match",
-        default=os.environ.get("GATE_REQUIRE_MATCH", "true"),
-    )
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    require = str(args.require_match).lower() in ("1", "true", "yes", "on")
-    store = SpeakerStore(args.speakers_dir, threshold=args.threshold)
-    asyncio.run(run_gate(args.uri, args.upstream, store, require))
-
-
-if __name__ == "__main__":
-    main()
+    _LOGGER.info("Speaker gate on %s → %s", uri, upstream)
+    await server.run(partial(GateHandler, _info().event(), store, settings, upstream, state))
