@@ -1,0 +1,8 @@
+huggingface_hub>=0.23.0
+onnxruntime>=1.16.0
+ruaccent>=0.5.0
+misaki>=0.4.0
+espeakng-loader>=0.1.0
+phonemizer>=3.2.0
+transformers>=4.36.0
+numpy>=1.26.0,<2

@@ -36,6 +36,7 @@
     copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
     link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
     flask: '<path d="M9 2h6"/><path d="M10 2v6L4 19a2 2 0 0 0 1.8 3h12.4a2 2 0 0 0 1.8-3L14 8V2"/><path d="M7 15h10"/>',
+    speaker: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/>',
   };
   const icon = (name, cls = "") =>
     `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ""}</svg>`;
@@ -447,11 +448,15 @@
       : s.gate.require_match
         ? pill("ok", "Фильтр ТВ включён")
         : pill("warn", "Фильтр ТВ выключен");
+    let tts;
+    if (!s.tts || !s.tts.enabled) tts = pill("", "TTS выключен");
+    else if (s.tts.online) tts = pill("ok", `TTS · Kokoro ${s.tts.voice || ""}`);
+    else tts = pill("warn live", "TTS загружается…");
     let diary;
     if (!s.diary.enabled) diary = pill("", "Дневник выключен");
     else if (s.diary.pcm_clients > 0) diary = pill("ok live", "Дневник слушает");
     else diary = pill("warn", "Дневник: нет звука с ESP");
-    el.innerHTML = stt + gate + diary;
+    el.innerHTML = stt + tts + gate + diary;
     $("#footer").textContent = `HA Voice ${s.version} · работает ${fmtUptime(s.uptime_s)}`;
   }
 
@@ -485,6 +490,8 @@
           `<button class="btn sm primary" data-goto="voices">${icon("userPlus")}Добавить голос</button>`
         )
       );
+    if (s.tts && s.tts.enabled && !s.tts.online)
+      banners.push(banner("info", "Озвучка Kokoro-ru загружается", "Первый запуск скачивает модель. Пока можно оставить Piper в Assist."));
     if (s.diary.dropped > 0)
       banners.push(banner("warn", "Дневник не успевает", `Пропущено реплик: ${s.diary.dropped}. Процессор не справляется — увеличьте «Минимальную длину реплики» или перенесите сервис на более мощную машину.`));
 
@@ -497,13 +504,15 @@
     const last = s.last_utterance;
     const steps = [
       [s.stt.online, "Модель GigaAM загружена", "Загружается при первом запуске."],
-      [s.gate.accepted + s.gate.rejected > 0, `Home Assistant подключён к порту ${p.gate}`, "Wyoming Protocol → этот хост и порт, затем выберите его в голосовом ассистенте."],
+      [s.gate.accepted + s.gate.rejected > 0, `Home Assistant подключён к порту ${p.gate}`, "Wyoming Protocol → этот хост и порт, затем выберите его как «Распознавание речи»."],
+      [!(s.tts && s.tts.enabled) || s.tts.online, s.tts && s.tts.enabled ? `Kokoro-ru на порту ${p.tts}` : "Озвучка Kokoro выключена", "Wyoming Protocol → этот хост и порт TTS. В ассистенте «Синтез речи» = Kokoro или Piper."],
       [s.speakers > 0, "Записан хотя бы один голос", "Вкладка «Голоса» или «Кто это?» в дневнике."],
       [s.diary.pcm_clients > 0, "Waveshare передаёт звук в дневник", "Пакет esphome/room_diary_package.yaml и переключатель «Room diary»."],
     ];
 
     const conn = [
-      ["Assist (с фильтром голосов)", `${host}:${p.gate}`],
+      ["Assist STT (фильтр голосов)", `${host}:${p.gate}`],
+      ["Assist TTS (Kokoro-ru)", `${host}:${p.tts}`],
       ["STT без фильтра", `${host}:${p.stt}`],
       ["Дневник ESP (PCM)", `${host}:${p.pcm}`],
       ["API интеграции HA Voice", `${host}:${p.api}`],
@@ -535,7 +544,7 @@
           <dl class="kv">
             ${conn.map(([k, val]) => `<dt>${esc(k)}</dt><dd class="mono">${esc(val)}</dd><dd><button class="btn ghost icon sm" data-copy="${esc(val)}" title="Скопировать">${icon("copy")}</button></dd>`).join("")}
           </dl>
-          <p class="small muted" style="margin-bottom:0">Home Assistant → Настройки → Устройства и службы → Wyoming Protocol → хост и порт <b>${esc(p.gate)}</b>. Затем выберите его как «Распознавание речи» в голосовом ассистенте.</p>
+          <p class="small muted" style="margin-bottom:0">Wyoming Protocol: STT порт <b>${esc(p.gate)}</b>, TTS порт <b>${esc(p.tts)}</b>. В ассистенте распознавание = HA Voice, синтез = Kokoro-ru <i>или</i> Piper.</p>
         </div>
       </div>
       <div class="grid grid-2" style="margin-top:14px">
@@ -840,7 +849,7 @@
             <div class="small muted">${c ? `${c.count} ${plural(c.count, "реплика", "реплики", "реплик")} в дневнике · последняя ${fmtAgoTs(c.last_ts)}` : "В дневнике пока нет реплик"}</div>
             <div>${enough ? badge("ok", "check", "Образцов достаточно") : badge("warn", "alert", "Мало образцов — добавьте ещё 2–3")}</div>
             <div class="voice-actions">
-              <button class="btn sm" data-act="sample">${icon("mic")}Добавить образец</button>
+              <button class="btn sm" data-act="sample">${icon("mic")}Ещё с ESP</button>
               <button class="btn sm ghost" data-act="rename">${icon("edit")}Переименовать</button>
               <span class="spacer"></span>
               <button class="btn sm ghost icon danger" data-act="delete" title="Удалить голос">${icon("trash")}</button>
@@ -849,15 +858,21 @@
       })
       .join("");
 
+    const espOk = state.status && state.status.diary.pcm_clients > 0;
     v.innerHTML = `
       ${banner(
-        "info",
-        "Как лучше записать голос",
-        "Включите «Дневник» и поговорите рядом с Waveshare, затем в «Дневнике» нажмите «Кто это?» у своей реплики. Так голос записывается тем же микрофоном, что и команды Assist, и узнаётся точнее. Надёжнее всего 5–10 фраз в разных местах комнаты."
+        espOk ? "info" : "warn",
+        espOk ? "Лучший способ — запись с Waveshare" : "Waveshare ещё не шлёт звук в дневник",
+        espOk
+          ? "Нажмите «Записать с ESP» — плата пишет 8 с тем же микрофоном, что слышит команды. После записи можно прослушать и сохранить."
+          : "Включите переключатель Room diary у устройства Waveshare. На Обзоре должно быть «Дневник слушает»."
       )}
+      <div class="row" style="margin-bottom:14px">
+        <button class="btn primary" data-act="esp"${espOk ? "" : " disabled"}>${icon("mic")}Записать с ESP</button>
+        <button class="btn" data-act="add">${icon("upload")}Файл / браузер</button>
+      </div>
       <div class="grid grid-2">
-        ${cards}
-        <div class="card add-card" data-act="add" role="button" tabindex="0">${icon("userPlus")}<b>Добавить голос</b><span class="small">Загрузить файл${SECURE ? " или записать в браузере" : ""}</span></div>
+        ${cards || emptyBox("user", "Голосов пока нет — запишите первый с ESP.")}
       </div>`;
   }
 
@@ -866,10 +881,11 @@
     if (!btn) return;
     const act = btn.dataset.act;
     if (act === "add") return openAddVoice();
+    if (act === "esp") return openEspCapture();
     const card = btn.closest("[data-sid]");
     const sp = state.speakers.find((s) => s.id === (card && card.dataset.sid));
     if (!sp) return;
-    if (act === "sample") openAddSample(sp);
+    if (act === "sample") openEspCapture(sp);
     else if (act === "rename") openRename(sp);
     else if (act === "delete") {
       if (!(await confirmDialog(`Удалить голос «${sp.name}»?`, "Реплики в дневнике останутся, но станут «Неизвестный»."))) return;
@@ -881,6 +897,138 @@
         showError(err);
       }
     }
+  }
+
+  function openEspCapture(existing) {
+    const seconds = 8;
+    const body = document.createElement("div");
+    body.className = "stack";
+    body.innerHTML = `
+      <div class="small muted">Встаньте у Waveshare и говорите обычным голосом. Можно прочитать:</div>
+      <div class="phrase">${esc(randomPhrase())}</div>
+      ${existing ? "" : `<div class="field" style="margin:0"><label for="vName">Имя</label><input class="input" id="vName" maxlength="40" placeholder="Например: Папа"></div>`}
+      <div class="meter"><div class="meter-fill" id="cFill"></div></div>
+      <div class="ain-status muted" id="cStatus">Нажмите «Начать запись»</div>
+      <audio id="cAudio" controls hidden style="width:100%"></audio>
+      <div class="row">
+        <button type="button" class="btn primary" id="cStart">${icon("mic")}Начать запись (${seconds} с)</button>
+        <button type="button" class="btn" id="cStop" hidden>Стоп</button>
+        <button type="button" class="btn ghost" id="cAgain" hidden>${icon("refresh")}Ещё раз</button>
+      </div>`;
+
+    let timer = 0;
+    let audioUrl = null;
+    let ready = false;
+
+    const cleanup = () => {
+      clearInterval(timer);
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      api("/api/capture", { method: "DELETE" }).catch(() => {});
+    };
+
+    const setStatus = (text, cls = "muted") => {
+      const el = $("#cStatus", body);
+      el.className = `ain-status ${cls}`;
+      el.textContent = text;
+    };
+
+    const showResult = async () => {
+      ready = false;
+      const st = await api("/api/capture");
+      const fill = $("#cFill", body);
+      fill.style.width = `${levelPct(st.live_rms)}%`;
+      if (st.active) {
+        setStatus(`Идёт запись… ${Math.ceil(st.remaining_s)} с · говорите`, "warn");
+        return false;
+      }
+      if (!st.ready) {
+        setStatus("Слишком мало звука. Подойдите ближе и запишите снова.", "warn");
+        $("#cStart", body).hidden = false;
+        $("#cStop", body).hidden = true;
+        $("#cAgain", body).hidden = true;
+        return false;
+      }
+      ready = true;
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      const res = await fetch(`${BASE}/api/capture/audio`, { cache: "no-store", credentials: "same-origin" });
+      if (!res.ok) throw new Error("Не удалось получить запись");
+      audioUrl = URL.createObjectURL(await res.blob());
+      const audio = $("#cAudio", body);
+      audio.src = audioUrl;
+      audio.hidden = false;
+      setStatus(`Готово: ${(st.duration_ms / 1000).toFixed(1)} с — прослушайте и сохраните`, "ok");
+      $("#cStart", body).hidden = true;
+      $("#cStop", body).hidden = true;
+      $("#cAgain", body).hidden = false;
+      return true;
+    };
+
+    const poll = () => {
+      clearInterval(timer);
+      timer = setInterval(async () => {
+        try {
+          if (await showResult()) clearInterval(timer);
+        } catch (err) {
+          clearInterval(timer);
+          setStatus(err.message || String(err), "warn");
+        }
+      }, 400);
+    };
+
+    openModal({
+      title: existing ? `Образец с ESP: ${existing.name}` : "Запись голоса с ESP",
+      body,
+      onOpen: (dlg) => {
+        $("#cStart", dlg).addEventListener("click", async () => {
+          try {
+            ready = false;
+            $("#cAudio", dlg).hidden = true;
+            await postJson("/api/capture/start", { seconds });
+            $("#cStart", dlg).hidden = true;
+            $("#cStop", dlg).hidden = false;
+            $("#cAgain", dlg).hidden = true;
+            setStatus(`Идёт запись… ${seconds} с · говорите`, "warn");
+            poll();
+          } catch (err) {
+            showError(err);
+          }
+        });
+        $("#cStop", dlg).addEventListener("click", async () => {
+          try {
+            await postJson("/api/capture/stop", {});
+            await showResult();
+            clearInterval(timer);
+          } catch (err) {
+            showError(err);
+          }
+        });
+        $("#cAgain", dlg).addEventListener("click", () => {
+          ready = false;
+          $("#cAudio", dlg).hidden = true;
+          $("#cStart", dlg).hidden = false;
+          $("#cAgain", dlg).hidden = true;
+          setStatus("Нажмите «Начать запись»");
+        });
+      },
+      onClose: cleanup,
+      actions: [
+        { label: "Отмена" },
+        {
+          label: "Сохранить голос",
+          kind: "primary",
+          onClick: async (dlg) => {
+            if (!ready) throw new Error("Сначала сделайте запись и прослушайте");
+            const payload = existing
+              ? { speaker_id: existing.id }
+              : { name: $("#vName", dlg).value.trim() };
+            if (!existing && !payload.name) throw new Error("Введите имя");
+            await postJson("/api/capture/enroll", payload);
+            toast(existing ? "Образец добавлен" : `Голос «${payload.name}» сохранён`);
+            await refreshVoices();
+          },
+        },
+      ],
+    });
   }
 
   async function refreshVoices() {
@@ -1015,7 +1163,7 @@
       </div>
       <div class="card" style="margin-top:14px">
         <div class="row between"><h3>${icon("shield")}Журнал команд Assist</h3><button class="btn sm ghost" data-goto="test">${icon("flask")}Проверить запись</button></div>
-        <p class="card-sub">Запросы распознавания от Home Assistant через порт ${esc(s ? s.ports.gate : "")}. Отклонённые команды не выполняются, но текст показан — видно, что говорил ТВ. Журнал хранится до перезапуска.</p>
+        <p class="card-sub">STT — порт ${esc(s ? s.ports.gate : "")}. Озвучка ответа — порт ${esc(s && s.ports.tts ? s.ports.tts : "10351")} (Kokoro-ru) либо Piper в Assist. Отклонённые команды не выполняются.</p>
         ${events || emptyBox("shield", "Команд пока не было. Скажите ключевое слово рядом с Waveshare.")}
       </div>`;
   }
@@ -1097,6 +1245,27 @@
       ${hint ? `<div class="hint">${esc(hint)}</div>` : ""}
     </div>`;
 
+  let ttsAudioUrl = null;
+  async function playTts(text, voice) {
+    const res = await fetch(BASE + "/api/tts", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, voice }),
+    });
+    const ct = res.headers.get("content-type") || "";
+    if (!res.ok) {
+      const data = ct.includes("json") ? await res.json() : await res.text();
+      throw new Error((data && data.error) || `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    if (ttsAudioUrl) URL.revokeObjectURL(ttsAudioUrl);
+    ttsAudioUrl = URL.createObjectURL(blob);
+    const audio = new Audio(ttsAudioUrl);
+    await audio.play();
+  }
+
   function renderSettings() {
     const v = view("settings");
     const s = state.settings;
@@ -1105,13 +1274,46 @@
       v.innerHTML = emptyBox("alert", "Не удалось загрузить настройки");
       return;
     }
+    const tts = (st && st.tts) || {};
+    const voiceOpts = (tts.voices || [
+      { id: "sveta", label: "Света" },
+      { id: "masha", label: "Маша" },
+      { id: "dima", label: "Дима" },
+    ])
+      .map((x) => `<option value="${esc(x.id)}" ${x.id === s.tts_voice ? "selected" : ""}>${esc(x.label)}</option>`)
+      .join("");
+    const ttsStatus = !tts.enabled
+      ? "выключена в конфигурации дополнения"
+      : tts.online
+        ? "онлайн"
+        : "загружается или недоступна";
     v.innerHTML = `
+      <div class="card" style="margin-bottom:14px">
+        <h3>${icon("speaker")}Озвучка Kokoro-ru</h3>
+        <p class="card-sub">${esc(ttsStatus)} · порт ${esc(st && st.ports ? st.ports.tts : "10351")}. Piper можно оставить — в Assist выбирается один синтез.</p>
+        <div class="field">
+          <label for="ttsText">Проверка</label>
+          <div class="row">
+            <input class="input" id="ttsText" value="Привет. Это проверка озвучки Kokoro." maxlength="400">
+            <button type="button" class="btn primary" id="ttsPlay" ${tts.online ? "" : "disabled"}>${icon("play")}Произнести</button>
+          </div>
+        </div>
+        <ol class="hint" style="margin:8px 0 0;padding-left:18px">
+          <li>Настройки → Устройства и службы → Wyoming Protocol → добавить <b>${esc((typeof location !== "undefined" ? location.hostname : "127.0.0.1") + ":" + (st && st.ports ? st.ports.tts : "10351"))}</b></li>
+          <li>Голосовые ассистенты → ваш Assist → Синтез речи = Kokoro-ru <i>или</i> Piper</li>
+        </ol>
+      </div>
       <form id="sForm" autocomplete="off">
         <div class="grid grid-2">
           <div class="card">
             <h3>${icon("shield")}Фильтр команд Assist</h3>
             ${switchField("gate_require_match", "Отклонять чужие голоса и ТВ", s.gate_require_match, "Если выключить — все команды выполняются, а в журнале только отмечается, кто говорил.")}
             ${rangeField("gate_threshold", "Порог узнавания голоса", s.gate_threshold, 0.3, 0.9, 0.01, "pct", "Ниже — легче пропускает (ТВ может проскочить). Выше — строже (может не узнать вас издалека). Начните с 55–65% и проверьте на вкладке «Проверка».", ["мягче", "строже"])}
+            <div class="field">
+              <label for="f_tts_voice">Голос Kokoro по умолчанию</label>
+              <select class="input" id="f_tts_voice" name="tts_voice">${voiceOpts}</select>
+              <div class="hint">Света / Маша — женские, Дима — мужской. В Assist можно выбрать тот же голос в карточке Wyoming TTS.</div>
+            </div>
           </div>
           <div class="card">
             <h3>${icon("book")}Дневник комнаты</h3>
@@ -1139,7 +1341,7 @@
           <dt>Версия</dt><dd>${esc(st ? st.version : window.HV_VERSION)}</dd><dd></dd>
           <dt>Модель STT</dt><dd class="mono">${esc(st ? st.stt.model : "—")}</dd><dd></dd>
           <dt>Работает</dt><dd>${st ? fmtUptime(st.uptime_s) : "—"}</dd><dd></dd>
-          <dt>Порты</dt><dd class="mono">${st ? `Assist ${st.ports.gate} · STT ${st.ports.stt} · PCM ${st.ports.pcm} · API ${st.ports.api}` : "—"}</dd><dd></dd>
+          <dt>Порты</dt><dd class="mono">${st ? `STT ${st.ports.gate} · TTS ${st.ports.tts} · GigaAM ${st.ports.stt} · PCM ${st.ports.pcm} · API ${st.ports.api}` : "—"}</dd><dd></dd>
         </dl>
         <p class="small muted" style="margin-bottom:0">Настройки, сохранённые здесь, важнее параметров в конфигурации дополнения. Модель и устройство (CPU/GPU) меняются в конфигурации дополнения.</p>
       </div>`;
@@ -1149,12 +1351,27 @@
       if (e.target.type === "range") e.target.nextElementSibling.textContent = FMT[e.target.dataset.fmt](Number(e.target.value));
     });
     $("#sReset").addEventListener("click", () => renderSettings());
+    $("#ttsPlay").addEventListener("click", async () => {
+      const btn = $("#ttsPlay");
+      const text = $("#ttsText").value.trim();
+      if (!text) return;
+      btn.disabled = true;
+      try {
+        await playTts(text, $("#f_tts_voice") ? $("#f_tts_voice").value : s.tts_voice);
+      } catch (err) {
+        showError(err);
+      } finally {
+        btn.disabled = false;
+      }
+    });
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const payload = {};
       for (const el of form.elements) {
         if (!el.name) continue;
-        payload[el.name] = el.type === "checkbox" ? el.checked : Number(el.value);
+        if (el.type === "checkbox") payload[el.name] = el.checked;
+        else if (el.type === "number" || el.type === "range") payload[el.name] = Number(el.value);
+        else payload[el.name] = el.value;
       }
       const btn = $("#sSave");
       btn.disabled = true;

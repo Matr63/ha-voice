@@ -14,6 +14,8 @@ RUN echo "[ha-voice 1/6] apt packages..." \
     python3-dev \
     build-essential \
     libsndfile1 \
+    libespeak-ng1 \
+    espeak-ng \
     ffmpeg \
     curl \
  && rm -rf /var/lib/apt/lists/* \
@@ -23,6 +25,7 @@ WORKDIR /app
 
 COPY app/stt-requirements.txt /app/stt-requirements.txt
 COPY app/gate-requirements.txt /app/gate-requirements.txt
+COPY app/tts-requirements.txt /app/tts-requirements.txt
 
 RUN echo "[ha-voice 2/6] pip: wyoming + onnx-asr (STT)..." \
  && pip3 install --break-system-packages --no-cache-dir -r /app/stt-requirements.txt \
@@ -44,7 +47,11 @@ RUN echo "[ha-voice 5/6] pip: resemblyzer (speaker gate)..." \
  && echo "[ha-voice 5/6] pin numpy<2 (Proxmox/KVM)..." \
  && pip3 install --break-system-packages --no-cache-dir --force-reinstall "numpy>=1.26.0,<2" \
  && python3 -c "import numpy; print('[ha-voice] numpy', numpy.__version__)" \
- && echo "[ha-voice 5/6] resemblyzer+numpy done"
+ && echo "[ha-voice 5/6] resemblyzer+numpy done" \
+ && echo "[ha-voice 5b/6] pip: Kokoro-ru TTS (ruaccent/misaki)..." \
+ && pip3 install --break-system-packages --no-cache-dir -r /app/tts-requirements.txt \
+ && pip3 install --break-system-packages --no-cache-dir --force-reinstall "numpy>=1.26.0,<2" \
+ && echo "[ha-voice 5b/6] TTS deps done"
 
 COPY app/ /app/
 COPY run.sh /run.sh

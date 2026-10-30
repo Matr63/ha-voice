@@ -45,6 +45,8 @@ async def amain() -> None:
     api_port = int(os.environ.get("API_PORT", "8088"))
     pcm_port = int(os.environ.get("DIALOGUE_PCM_PORT", "10500"))
 
+    tts_uri = os.environ.get("TTS_CLIENT_URI", "tcp://127.0.0.1:10351")
+    tts_enabled = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
     ctx = AppContext(
         settings=settings,
         store=store,
@@ -52,8 +54,16 @@ async def amain() -> None:
         gate=gate_state,
         stt_uri=stt_uri,
         stt_model=os.environ.get("STT_MODEL", "gigaam-v3-e2e-rnnt"),
+        tts_uri=tts_uri,
+        tts_enabled=tts_enabled,
         web_root=Path(os.environ.get("WEB_ROOT", "/app/web")),
-        ports={"stt": _port(stt_uri, 10305), "gate": _port(gate_uri, 10350), "pcm": pcm_port, "api": api_port},
+        ports={
+            "stt": _port(stt_uri, 10305),
+            "gate": _port(gate_uri, 10350),
+            "pcm": pcm_port,
+            "api": api_port,
+            "tts": _port(tts_uri, 10351),
+        },
     )
     await start_api(ctx, os.environ.get("API_HOST", "0.0.0.0"), api_port)
 

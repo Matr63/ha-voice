@@ -227,6 +227,10 @@ class DialogueRuntime:
         self.queue: asyncio.Queue[bytes] | None = None
         self._worker_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._capture_until: float | None = None
+        self._capture_buf = bytearray()
+        self._capture_pcm: bytes | None = None
+        self._capture_started_at: float | None = None
 
     @property
     def enabled(self) -> bool:
@@ -242,6 +246,68 @@ class DialogueRuntime:
 
     def queued(self) -> int:
         return self.queue.qsize() if self.queue else 0
+
+    def capture_start(self, seconds: float = 8.0) -> dict[str, Any]:
+        if self.pcm_clients <= 0:
+            raise ValueError("ESP не подключён к порту дневника. Включите переключатель Room diary.")
+        seconds = max(2.0, min(20.0, float(seconds)))
+        now = time.time()
+        self._capture_until = now + seconds
+        self._capture_started_at = now
+        self._capture_buf = bytearray()
+        self._capture_pcm = None
+        return self.capture_status()
+
+    def capture_stop(self) -> dict[str, Any]:
+        if self._capture_until is not None:
+            self._finish_capture()
+        return self.capture_status()
+
+    def capture_clear(self) -> None:
+        self._capture_until = None
+        self._capture_buf = bytearray()
+        self._capture_pcm = None
+        self._capture_started_at = None
+
+    def _finish_capture(self) -> None:
+        self._capture_until = None
+        pcm = bytes(self._capture_buf)
+        self._capture_buf = bytearray()
+        self._capture_pcm = pcm if len(pcm) >= TARGET_RATE * 2 else None  # ≥1 с
+
+    def capture_status(self) -> dict[str, Any]:
+        now = time.time()
+        active = self._capture_until is not None and now < self._capture_until
+        if self._capture_until is not None and not active:
+            self._finish_capture()
+        pcm = self._capture_pcm
+        buf_ms = duration_ms(bytes(self._capture_buf)) if self._capture_buf else 0
+        done_ms = duration_ms(pcm) if pcm else 0
+        remaining = max(0.0, (self._capture_until or 0) - now) if self._capture_until else 0.0
+        return {
+            "active": active,
+            "ready": bool(pcm),
+            "remaining_s": round(remaining, 1),
+            "duration_ms": done_ms if pcm else buf_ms,
+            "pcm_clients": self.pcm_clients,
+            "live_rms": round(self.live_rms, 4),
+        }
+
+    def capture_pcm(self) -> bytes | None:
+        if self._capture_until is not None and time.time() >= self._capture_until:
+            self._finish_capture()
+        return self._capture_pcm
+
+    def _feed_capture(self, pcm: bytes) -> None:
+        if self._capture_until is None:
+            return
+        now = time.time()
+        if now >= self._capture_until:
+            self._finish_capture()
+            return
+        # не раздувать буфер бесконечно
+        if len(self._capture_buf) + len(pcm) <= TARGET_RATE * 2 * 25:
+            self._capture_buf.extend(pcm)
 
     def submit(self, pcm: bytes) -> None:
         if self.queue is None:
@@ -305,13 +371,10 @@ class PcmSession:
         self.silence_ms = 0
         self.speech_ms = 0
 
-    def feed(self, pcm: bytes, rate: int) -> None:
-        if rate != TARGET_RATE:
-            pcm = normalize_pcm(pcm, rate)
+    def feed(self, pcm: bytes, rate: int = TARGET_RATE) -> None:
+        # pcm уже нормализован в handle_pcm_client
         s = self.runtime.settings.get()
         level = rms(pcm)
-        self.runtime.live_rms = level
-        self.runtime.last_audio_at = time.time()
         frame_ms = duration_ms(pcm)
 
         if level >= s.diary_vad_rms:
@@ -367,8 +430,13 @@ async def handle_pcm_client(
                 _LOGGER.warning("Bad PCM frame from %s: rate=%s bytes=%s", peer, rate, nbytes)
                 break
             pcm = await reader.readexactly(nbytes)
+            if rate != TARGET_RATE:
+                pcm = normalize_pcm(pcm, rate)
+            runtime.live_rms = rms(pcm)
+            runtime.last_audio_at = time.time()
+            runtime._feed_capture(pcm)
             if runtime.enabled:
-                session.feed(pcm, rate)
+                session.feed(pcm)
     except asyncio.IncompleteReadError:
         pass
     except Exception:

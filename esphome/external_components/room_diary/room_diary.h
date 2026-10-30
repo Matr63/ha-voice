@@ -4,13 +4,10 @@
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/switch/switch.h"
 
+#include <atomic>
+#include <cstdint>
 #include <string>
 #include <vector>
-#include <atomic>
-
-#ifdef USE_ESP32
-#include <WiFi.h>
-#endif
 
 namespace esphome {
 namespace room_diary {
@@ -30,8 +27,10 @@ class RoomDiary : public Component {
  protected:
   void on_audio_(const std::vector<uint8_t> &data);
   void ensure_connected_();
+  void disconnect_();
   void maybe_send_(const uint8_t *data, size_t len);
   uint32_t rms_i16_(const int16_t *samples, size_t n);
+  bool connected_() const { return this->fd_ >= 0; }
 
   microphone::Microphone *mic_{nullptr};
   switch_::Switch *enable_switch_{nullptr};
@@ -42,10 +41,7 @@ class RoomDiary : public Component {
   uint32_t last_connect_try_ms_{0};
   std::vector<uint8_t> pending_;
   uint32_t sample_rate_{16000};
-
-#ifdef USE_ESP32
-  WiFiClient client_;
-#endif
+  int fd_{-1};
 };
 
 }  // namespace room_diary

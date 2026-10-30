@@ -1,10 +1,10 @@
 name: HA Voice (GigaAM)
-version: "1.1.0"
+version: "1.2.0"
 slug: ha_voice
 description: >-
-  GigaAM STT, speaker enrollment, room diary.
+  GigaAM STT, Kokoro-ru TTS, speaker enrollment, room diary.
   Первая установка 10–30+ мин (torch) — смотрите Log дополнения, строки [ha-voice N/6].
-  После старта: Wyoming :10350, UI Ingress :8088.
+  После старта: Wyoming STT :10350, TTS :10351, UI Ingress :8088.
 url: https://github.com/Matr63/ha-voice
 arch:
   - amd64
@@ -19,11 +19,13 @@ panel_title: HA Voice
 ports:
   10305/tcp: 10305
   10350/tcp: 10350
+  10351/tcp: 10351
   10500/tcp: 10500
   8088/tcp: 8088
 ports_description:
   10305/tcp: Wyoming STT (GigaAM) — optional direct
   10350/tcp: Wyoming STT через speaker gate (рекомендуется для Assist)
+  10351/tcp: Wyoming TTS Kokoro-ru (синтез речи)
   10500/tcp: PCM дневник с ESPHome
   8088/tcp: API / UI
 map:
@@ -36,6 +38,8 @@ options:
   gate_threshold: 0.55
   gate_require_match: true
   diary_vad_rms: 0.012
+  tts_enabled: true
+  tts_voice: sveta
 schema:
   stt_model: str
   stt_quantization: list(int8|fp16|fp32)
@@ -43,3 +47,5 @@ schema:
   gate_threshold: float
   gate_require_match: bool
   diary_vad_rms: float
+  tts_enabled: bool
+  tts_voice: list(sveta|masha|dima)

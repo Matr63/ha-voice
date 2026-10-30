@@ -32,6 +32,7 @@ services:
       - stt
     ports:
       - "${GATE_PORT:-10350}:10350"
+      - "${TTS_PORT:-10351}:10351"
       - "${DIALOGUE_API_PORT:-8088}:8088"
       - "${DIALOGUE_PCM_PORT:-10500}:10500"
     environment:
@@ -53,10 +54,18 @@ services:
       DIALOGUE_DB: /data/dialogues/dialogue.db
       SETTINGS_FILE: /data/config/settings.json
       STT_MODEL: ${STT_MODEL:-gigaam-v3-e2e-rnnt}
+      HF_HOME: /data/models
+      HUGGINGFACE_HUB_CACHE: /data/models
+      TRANSFORMERS_CACHE: /data/models
+      TTS_ENABLED: ${TTS_ENABLED:-true}
+      TTS_VOICE: ${TTS_VOICE:-sveta}
+      TTS_URI: tcp://0.0.0.0:10351
+      TTS_CLIENT_URI: tcp://127.0.0.1:10351
     volumes:
       - ${DATA_DIR:-./data}/speakers:/data/speakers
       - ${DATA_DIR:-./data}/dialogues:/data/dialogues
       - ${DATA_DIR:-./data}/config:/data/config
+      - ${DATA_DIR:-./data}/models:/data/models
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/api/health',timeout=2)"]
       interval: 30s

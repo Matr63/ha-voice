@@ -1,6 +1,15 @@
 #include "room_diary.h"
+
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+
+#include <arpa/inet.h>
+#include <cerrno>
 #include <cmath>
+#include <cstring>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace esphome {
 namespace room_diary {
@@ -28,26 +37,61 @@ uint32_t RoomDiary::rms_i16_(const int16_t *samples, size_t n) {
   return (uint32_t) sqrtf((float) acc / (float) n);
 }
 
+void RoomDiary::disconnect_() {
+  if (this->fd_ < 0)
+    return;
+  ::shutdown(this->fd_, SHUT_RDWR);
+  ::close(this->fd_);
+  this->fd_ = -1;
+}
+
 void RoomDiary::ensure_connected_() {
-#ifdef USE_ESP32
-  if (this->client_.connected())
+  if (this->connected_())
     return;
   uint32_t now = millis();
   if (now - this->last_connect_try_ms_ < 3000)
     return;
   this->last_connect_try_ms_ = now;
-  this->client_.stop();
-  if (this->client_.connect(this->host_.c_str(), this->port_)) {
-    ESP_LOGI(TAG, "PCM connected");
-  } else {
-    ESP_LOGW(TAG, "PCM connect failed");
+
+  char port_str[8];
+  snprintf(port_str, sizeof(port_str), "%u", this->port_);
+
+  struct addrinfo hints = {};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo *res = nullptr;
+  int err = getaddrinfo(this->host_.c_str(), port_str, &hints, &res);
+  if (err != 0 || res == nullptr) {
+    ESP_LOGW(TAG, "PCM DNS failed for %s", this->host_.c_str());
+    return;
   }
-#endif
+
+  int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (fd < 0) {
+    freeaddrinfo(res);
+    ESP_LOGW(TAG, "PCM socket create failed");
+    return;
+  }
+
+  struct timeval tv;
+  tv.tv_sec = 3;
+  tv.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  if (::connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    ESP_LOGW(TAG, "PCM connect failed: %s", strerror(errno));
+    ::close(fd);
+    freeaddrinfo(res);
+    return;
+  }
+  freeaddrinfo(res);
+  this->fd_ = fd;
+  ESP_LOGI(TAG, "PCM connected");
 }
 
 void RoomDiary::maybe_send_(const uint8_t *data, size_t len) {
-#ifdef USE_ESP32
-  if (!this->client_.connected() || len == 0 || len > 64000)
+  if (!this->connected_() || len == 0 || len > 64000)
     return;
   uint8_t hdr[12];
   hdr[0] = 'H';
@@ -64,14 +108,15 @@ void RoomDiary::maybe_send_(const uint8_t *data, size_t len) {
   hdr[9] = (n >> 16) & 0xff;
   hdr[10] = (n >> 8) & 0xff;
   hdr[11] = n & 0xff;
-  if (this->client_.write(hdr, sizeof(hdr)) != sizeof(hdr)) {
-    this->client_.stop();
+
+  ssize_t wrote = ::send(this->fd_, hdr, sizeof(hdr), 0);
+  if (wrote != (ssize_t) sizeof(hdr)) {
+    this->disconnect_();
     return;
   }
-  size_t wrote = this->client_.write(data, len);
-  if (wrote != len)
-    this->client_.stop();
-#endif
+  wrote = ::send(this->fd_, data, len, 0);
+  if (wrote != (ssize_t) len)
+    this->disconnect_();
 }
 
 void RoomDiary::on_audio_(const std::vector<uint8_t> &data) {
@@ -83,7 +128,6 @@ void RoomDiary::on_audio_(const std::vector<uint8_t> &data) {
   size_t n = data.size() / 2;
   if (this->rms_i16_(samples, n) < this->rms_threshold_)
     return;
-  // copy to pending; actual TCP write on main loop
   if (this->pending_.size() + data.size() > 32000)
     this->pending_.clear();
   this->pending_.insert(this->pending_.end(), data.begin(), data.end());
@@ -96,10 +140,7 @@ void RoomDiary::loop() {
   this->enabled_.store(want);
 
   if (!want) {
-#ifdef USE_ESP32
-    if (this->client_.connected())
-      this->client_.stop();
-#endif
+    this->disconnect_();
     this->pending_.clear();
     return;
   }

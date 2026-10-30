@@ -10,12 +10,14 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from audio_utils import decode_body, duration_ms
+from audio_utils import decode_body, duration_ms, to_wav
 from dialogue import DialogueRuntime
 from gate_server import GateState
 from settings import SettingsStore
 from speakers import SpeakerStore
 from stt_client import port_open, transcribe
+from tts_client import synthesize_wav
+from tts_engine import VOICES, resolve_voice
 from version import __version__
 
 _LOGGER = logging.getLogger("ha-voice.api")
@@ -31,6 +33,8 @@ class AppContext:
     gate: GateState
     stt_uri: str
     stt_model: str
+    tts_uri: str
+    tts_enabled: bool
     web_root: Path
     ports: dict[str, int]
     started_at: float = field(default_factory=time.time)
@@ -110,6 +114,13 @@ def create_app(ctx: AppContext) -> web.Application:
                 "diary_enabled": s.diary_enabled,
                 "threshold": s.gate_threshold,
                 "last_utterance": runtime.last_utterance,
+                "tts": {
+                    "enabled": ctx.tts_enabled,
+                    "online": await port_open(ctx.tts_uri) if ctx.tts_enabled else False,
+                    "voice": s.tts_voice,
+                    "voices": [{"id": k, "label": v["label"], "gender": v["gender"]} for k, v in VOICES.items()],
+                    "port": ctx.ports.get("tts"),
+                },
             }
         )
 
@@ -270,6 +281,59 @@ def create_app(ctx: AppContext) -> web.Application:
         row = await runtime.process_utterance(pcm)
         return web.json_response({"ok": True, "utterance": row})
 
+    async def _json_obj(request: web.Request) -> dict[str, Any]:
+        try:
+            data = await request.json()
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def capture_start(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        return web.json_response(runtime.capture_start(float(data.get("seconds", 8))))
+
+    async def capture_get(_: web.Request) -> web.Response:
+        return web.json_response(runtime.capture_status())
+
+    async def capture_stop(_: web.Request) -> web.Response:
+        return web.json_response(runtime.capture_stop())
+
+    async def capture_delete(_: web.Request) -> web.Response:
+        runtime.capture_clear()
+        return web.json_response({"ok": True})
+
+    async def capture_audio(_: web.Request) -> web.StreamResponse:
+        pcm = runtime.capture_pcm()
+        if not pcm:
+            return _err("Записи ещё нет — сначала запишите с ESP", 404)
+        return web.Response(body=to_wav(pcm), content_type="audio/wav", headers={"Cache-Control": "no-store"})
+
+    async def tts_speak(request: web.Request) -> web.StreamResponse:
+        if not ctx.tts_enabled:
+            return _err("Озвучка Kokoro выключена в конфигурации дополнения")
+        data = await _json_obj(request)
+        text = (data.get("text") or "").strip()
+        if not text:
+            raise ValueError("Введите текст")
+        voice = resolve_voice(data.get("voice") or settings.get().tts_voice)
+        try:
+            wav = await synthesize_wav(ctx.tts_uri, text, voice)
+        except Exception as err:
+            _LOGGER.exception("TTS test failed")
+            return _err(str(err) or "TTS не ответил — смотрите журнал дополнения", 503)
+        return web.Response(body=wav, content_type="audio/wav", headers={"Cache-Control": "no-store"})
+
+    async def capture_enroll(request: web.Request) -> web.Response:
+        pcm = runtime.capture_pcm()
+        if not pcm:
+            return _err("Записи ещё нет — сначала запишите с ESP", 400)
+        data = await _json_obj(request)
+        sid = data.get("speaker_id") or request.query.get("id")
+        name = (data.get("name") or request.query.get("name") or "").strip() or None
+        meta = await asyncio.to_thread(store.enroll, name, pcm, sid)
+        runtime.capture_clear()
+        return web.json_response(meta)
+
     r = app.router
     r.add_get("/", index)
     r.add_get("/api/health", health)
@@ -293,6 +357,13 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_get("/api/gate/events", gate_events)
     r.add_post("/api/test", test_audio)
     r.add_post("/api/ingest", ingest)
+    r.add_post("/api/capture/start", capture_start)
+    r.add_get("/api/capture", capture_get)
+    r.add_post("/api/capture/stop", capture_stop)
+    r.add_delete("/api/capture", capture_delete)
+    r.add_get("/api/capture/audio", capture_audio)
+    r.add_post("/api/capture/enroll", capture_enroll)
+    r.add_post("/api/tts", tts_speak)
     r.add_static("/static/", ctx.web_root, show_index=False)
     return app
 

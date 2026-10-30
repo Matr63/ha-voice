@@ -21,6 +21,9 @@ LIMITS: dict[str, tuple[float, float]] = {
 }
 
 
+TTS_VOICES = ("sveta", "masha", "dima")
+
+
 @dataclass(frozen=True)
 class Settings:
     gate_require_match: bool = True
@@ -31,6 +34,12 @@ class Settings:
     diary_min_speech_ms: int = 400
     diary_max_utterance_ms: int = 15000
     diary_keep_audio: int = 500
+    tts_voice: str = "sveta"
+
+
+def _env_voice(name: str, default: str) -> str:
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw if raw in TTS_VOICES else default
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -61,10 +70,16 @@ def _defaults_from_env() -> Settings:
         diary_min_speech_ms=_env_num("DIALOGUE_MIN_SPEECH_MS", d.diary_min_speech_ms, int),
         diary_max_utterance_ms=_env_num("DIALOGUE_MAX_UTTERANCE_MS", d.diary_max_utterance_ms, int),
         diary_keep_audio=_env_num("DIALOGUE_KEEP_AUDIO", d.diary_keep_audio, int),
+        tts_voice=_env_voice("TTS_VOICE", d.tts_voice),
     )
 
 
 def _coerce(name: str, value: Any, current: Any) -> Any:
+    if name == "tts_voice":
+        v = str(value).strip().lower()
+        return v if v in TTS_VOICES else current
+    if isinstance(current, str):
+        return str(value)
     if isinstance(current, bool):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
