@@ -1,5 +1,7 @@
 #!/bin/bash
-set -e
+set -u
+
+export PYTHONUNBUFFERED=1
 
 echo "[ha-voice] ===== start ====="
 echo "[ha-voice] reading options..."
@@ -21,13 +23,17 @@ os.environ.setdefault(
 )
 os.environ.setdefault("DIALOGUE_VAD_RMS", str(opts.get("diary_vad_rms", 0.012)))
 env_path = Path("/tmp/ha_voice_env")
+# без кавычек Python !r — проще для bash source
+def sh_export(k: str) -> str:
+    v = os.environ[k].replace("'", "'\"'\"'")
+    return f"export {k}='{v}'"
 lines = [
-    f"export STT_MODEL={os.environ['STT_MODEL']!r}",
-    f"export STT_QUANTIZATION={os.environ['STT_QUANTIZATION']!r}",
-    f"export STT_DEVICE={os.environ['STT_DEVICE']!r}",
-    f"export GATE_THRESHOLD={os.environ['GATE_THRESHOLD']!r}",
-    f"export GATE_REQUIRE_MATCH={os.environ['GATE_REQUIRE_MATCH']!r}",
-    f"export DIALOGUE_VAD_RMS={os.environ['DIALOGUE_VAD_RMS']!r}",
+    sh_export("STT_MODEL"),
+    sh_export("STT_QUANTIZATION"),
+    sh_export("STT_DEVICE"),
+    sh_export("GATE_THRESHOLD"),
+    sh_export("GATE_REQUIRE_MATCH"),
+    sh_export("DIALOGUE_VAD_RMS"),
 ]
 env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 print("[ha-voice] options:", {k: os.environ.get(k) for k in (
@@ -37,7 +43,7 @@ PY
 # shellcheck disable=SC1091
 source /tmp/ha_voice_env
 
-mkdir -p /data/models /data/speakers /data/dialogues
+mkdir -p /data/models /data/speakers /data/dialogues /tmp/ha-voice-logs
 
 export HF_HOME=/data/models
 export GATE_URI=tcp://0.0.0.0:10350
@@ -51,61 +57,110 @@ export DIALOGUES_DIR=/data/dialogues
 export DIALOGUE_DB=/data/dialogues/dialogue.db
 export WEB_ROOT=/app/web
 
-echo "[ha-voice] STT: loading ${STT_MODEL} (${STT_QUANTIZATION}) on ${STT_DEVICE}"
-echo "[ha-voice] first run may download model weights — watch this log"
-QUANT_ARGS=()
-if [ -n "${STT_QUANTIZATION}" ]; then
-  QUANT_ARGS=(--quantization "${STT_QUANTIZATION}")
+echo "[ha-voice] preflight imports..."
+if ! python3 - <<'PY'
+import traceback
+try:
+    import numpy
+    import wyoming
+    import onnx_asr
+    print("[ha-voice] imports ok: numpy", numpy.__version__)
+except Exception:
+    traceback.print_exc()
+    raise SystemExit(1)
+PY
+then
+  echo "[ha-voice] ERROR: python imports failed"
+  exit 1
 fi
+
+STT_LOG=/tmp/ha-voice-logs/stt.log
+GATE_LOG=/tmp/ha-voice-logs/gate.log
+
+echo "[ha-voice] STT: loading ${STT_MODEL} (${STT_QUANTIZATION}) on ${STT_DEVICE}"
+echo "[ha-voice] first run may download model weights — see ${STT_LOG}"
+
+QUANT_EXTRA=()
+if [ -n "${STT_QUANTIZATION}" ] && [ "${STT_QUANTIZATION}" != "fp32" ]; then
+  QUANT_EXTRA=(--quantization "${STT_QUANTIZATION}")
+fi
+
 python3 /app/stt_server.py \
   --model "${STT_MODEL}" \
   --uri "tcp://0.0.0.0:10305" \
   --device "${STT_DEVICE}" \
-  "${QUANT_ARGS[@]}" &
+  "${QUANT_EXTRA[@]}" \
+  >"${STT_LOG}" 2>&1 &
 STT_PID=$!
 
 READY=0
-for i in $(seq 1 300); do
+for i in $(seq 1 600); do
   if python3 -c "import socket;s=socket.create_connection(('127.0.0.1',10305),1);s.close()" 2>/dev/null; then
     READY=1
     echo "[ha-voice] STT ready after ${i}s (pid=${STT_PID})"
     break
   fi
   if ! kill -0 "$STT_PID" 2>/dev/null; then
-    echo "[ha-voice] ERROR: STT process exited early"
+    echo "[ha-voice] ERROR: STT process exited early — dump ${STT_LOG}:"
+    tail -n 200 "${STT_LOG}" || true
     wait "$STT_PID" || true
     exit 1
   fi
   if [ $((i % 15)) -eq 0 ]; then
-    echo "[ha-voice] waiting STT… ${i}s / 300s"
+    echo "[ha-voice] waiting STT… ${i}s / 600s"
+    tail -n 5 "${STT_LOG}" 2>/dev/null || true
   fi
   sleep 1
 done
 if [ "$READY" != "1" ]; then
-  echo "[ha-voice] ERROR: STT did not open port 10305 in 300s"
+  echo "[ha-voice] ERROR: STT did not open port 10305 in 600s — dump:"
+  tail -n 200 "${STT_LOG}" || true
   kill "$STT_PID" 2>/dev/null || true
   exit 1
 fi
 
 echo "[ha-voice] starting speaker gate + diary API (Wyoming :10350, UI :8088, PCM :10500)"
-python3 /app/main.py &
+python3 /app/main.py >"${GATE_LOG}" 2>&1 &
 GATE_PID=$!
 
-for i in $(seq 1 60); do
+API_OK=0
+for i in $(seq 1 120); do
   if python3 -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/api/health',timeout=1)" 2>/dev/null; then
+    API_OK=1
     echo "[ha-voice] API ready after ${i}s"
     break
   fi
   if ! kill -0 "$GATE_PID" 2>/dev/null; then
-    echo "[ha-voice] ERROR: gate/API process exited"
+    echo "[ha-voice] ERROR: gate/API exited — dump ${GATE_LOG}:"
+    tail -n 200 "${GATE_LOG}" || true
     wait "$GATE_PID" || true
     exit 1
   fi
+  if [ $((i % 15)) -eq 0 ]; then
+    echo "[ha-voice] waiting API… ${i}s"
+    tail -n 5 "${GATE_LOG}" 2>/dev/null || true
+  fi
   sleep 1
 done
+if [ "$API_OK" != "1" ]; then
+  echo "[ha-voice] WARNING: API not healthy yet, continuing (gate may still be loading embeddings)"
+fi
 
 echo "[ha-voice] ===== running ====="
 trap 'echo "[ha-voice] stopping…"; kill '"$STT_PID"' '"$GATE_PID"' 2>/dev/null || true' SIGTERM SIGINT
-wait -n "$STT_PID" "$GATE_PID"
-echo "[ha-voice] a child exited — shutting down"
-exit $?
+
+while true; do
+  if ! kill -0 "$STT_PID" 2>/dev/null; then
+    echo "[ha-voice] STT died — dump:"
+    tail -n 200 "${STT_LOG}" || true
+    kill "$GATE_PID" 2>/dev/null || true
+    exit 1
+  fi
+  if ! kill -0 "$GATE_PID" 2>/dev/null; then
+    echo "[ha-voice] gate died — dump:"
+    tail -n 200 "${GATE_LOG}" || true
+    kill "$STT_PID" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 2
+done

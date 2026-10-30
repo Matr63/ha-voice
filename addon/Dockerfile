@@ -28,9 +28,9 @@ RUN echo "[ha-voice 2/6] pip: wyoming + onnx-asr (STT)..." \
  && pip3 install --break-system-packages --no-cache-dir -r /app/stt-requirements.txt \
  && echo "[ha-voice 2/6] STT deps done"
 
-RUN echo "[ha-voice 3/6] pip: aiohttp/numpy/soundfile..." \
+RUN echo "[ha-voice 3/6] pip: aiohttp/numpy1.26/soundfile..." \
  && pip3 install --break-system-packages --no-cache-dir \
-      "wyoming>=1.5.3" "numpy>=1.26.0" "aiohttp>=3.9.0" "soundfile>=0.12.1" "scipy>=1.11.0" "webrtcvad>=2.0.10" \
+      "wyoming>=1.5.3" "numpy>=1.26.0,<2" "aiohttp>=3.9.0" "soundfile>=0.12.1" "scipy>=1.11.0" "webrtcvad>=2.0.10" \
  && echo "[ha-voice 3/6] light deps done"
 
 RUN echo "[ha-voice 4/6] pip: torch CPU (долго, ~1–2 GB)..." \
@@ -41,11 +41,15 @@ RUN echo "[ha-voice 4/6] pip: torch CPU (долго, ~1–2 GB)..." \
 
 RUN echo "[ha-voice 5/6] pip: resemblyzer (speaker gate)..." \
  && pip3 install --break-system-packages --no-cache-dir "resemblyzer>=0.1.4" \
- && echo "[ha-voice 5/6] resemblyzer done"
+ && echo "[ha-voice 5/6] pin numpy<2 (Proxmox/KVM)..." \
+ && pip3 install --break-system-packages --no-cache-dir --force-reinstall "numpy>=1.26.0,<2" \
+ && python3 -c "import numpy; print('[ha-voice] numpy', numpy.__version__)" \
+ && echo "[ha-voice 5/6] resemblyzer+numpy done"
 
 COPY app/ /app/
 COPY run.sh /run.sh
 RUN echo "[ha-voice 6/6] copy app + chmod" \
+ && sed -i 's/\r$//' /run.sh \
  && chmod a+x /run.sh \
  && echo "[ha-voice] image build complete"
 
@@ -54,5 +58,8 @@ ENV SPEAKERS_DIR=/data/speakers
 ENV DIALOGUES_DIR=/data/dialogues
 ENV DIALOGUE_DB=/data/dialogues/dialogue.db
 ENV WEB_ROOT=/app/web
+ENV PYTHONUNBUFFERED=1
 
-CMD ["/run.sh"]
+# bash явно — без проблем с CRLF shebang
+CMD ["bash", "/run.sh"]
+
