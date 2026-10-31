@@ -27,8 +27,12 @@ from settings import SettingsStore
 _LOGGER = logging.getLogger("ha-voice.assistant")
 
 CONVERSATION_TTL_S = 300
+KEEP_AUDIO = 40
 MAX_TOOL_ROUNDS = 6
 MAX_PROMPT_ENTITIES = 200
+# HA answers that mean "didn't understand the phrase / no device by that name":
+# with llm_fallback on, the LLM gets a second try at these.
+FALLBACK_CODES = {"no_intent_match", "no_valid_targets", "no_intent", "failed_to_handle"}
 # Services the LLM may call; everything listed in settings can be read.
 ACTION_DOMAINS = {
     "light", "switch", "fan", "cover", "climate", "media_player", "scene", "script",
@@ -131,6 +135,8 @@ class Assistant:
         self.ha = ha
         self.log: deque[dict[str, Any]] = deque(maxlen=200)
         self._next_id = 1
+        # command audio by log id: "чей это голос?" in the log teaches the voice
+        self.audio: dict[int, bytes] = {}
         self._convs: dict[str, _Conversation] = {}
         self._session: aiohttp.ClientSession | None = None
 
@@ -138,9 +144,14 @@ class Assistant:
     def history(self, limit: int = 100) -> list[dict[str, Any]]:
         return list(self.log)[: max(1, limit)]
 
-    def record(self, entry: dict[str, Any]) -> dict[str, Any]:
+    def record(self, entry: dict[str, Any], pcm: bytes | None = None) -> dict[str, Any]:
         entry["id"] = self._next_id
         self._next_id += 1
+        if pcm:
+            self.audio[entry["id"]] = pcm
+            entry["has_audio"] = True
+            for old in sorted(self.audio)[:-KEEP_AUDIO]:
+                del self.audio[old]
         entry.setdefault("ts", datetime.now().astimezone().isoformat(timespec="seconds"))
         self.log.appendleft(entry)
         return entry
@@ -148,7 +159,14 @@ class Assistant:
     def forget(self, conv_key: str) -> None:
         self._convs.pop(conv_key, None)
 
-    async def handle(self, text: str, conv_key: str, speaker: str | None = None) -> AssistantResult:
+    async def handle(
+        self,
+        text: str,
+        conv_key: str,
+        speaker: str | None = None,
+        device_id: str | None = None,
+        room: str | None = None,
+    ) -> AssistantResult:
         s = self.settings.get()
         backend = s.assistant_backend
         conv = self._conv(conv_key)
@@ -156,16 +174,18 @@ class Assistant:
             if backend == "off":
                 result = AssistantResult(backend="off")
             elif backend == "openai":
-                result = await self._llm(text, conv, speaker)
+                result = await self._llm(text, conv, speaker, room)
             else:
-                result = await self._ha(text, conv)
+                result = await self._ha(text, conv, device_id)
+                if result.error in FALLBACK_CODES and s.llm_fallback:
+                    result = await self._fallback(text, conv, speaker, result, room)
         except (HaError, aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("Assistant %s failed: %s", backend, err)
             result = AssistantResult(speech="Не получилось связаться с сервером.", backend=backend, error=str(err))
         except Exception as err:
             _LOGGER.exception("Assistant %s failed", backend)
             result = AssistantResult(speech="Что-то пошло не так.", backend=backend, error=str(err))
-        if not result.expect_reply and backend == "openai":
+        if not result.expect_reply and result.backend.endswith("openai"):
             # keep the context briefly so "а теперь выключи" still works
             conv.messages = conv.messages[-12:]
         return result
@@ -190,9 +210,9 @@ class Assistant:
         return self._session
 
     # ------------------------------------------------------------ backends
-    async def _ha(self, text: str, conv: _Conversation) -> AssistantResult:
+    async def _ha(self, text: str, conv: _Conversation, device_id: str | None = None) -> AssistantResult:
         s = self.settings.get()
-        data = await self.ha.conversation(text, s.ha_agent_id or None, conv.ha_conversation_id)
+        data = await self.ha.conversation(text, s.ha_agent_id or None, conv.ha_conversation_id, device_id=device_id)
         conv.ha_conversation_id = data.get("conversation_id") or conv.ha_conversation_id
         response = data.get("response") or {}
         speech = (((response.get("speech") or {}).get("plain") or {}).get("speech") or "").strip()
@@ -204,6 +224,22 @@ class Assistant:
             err = ((response.get("data") or {}).get("code")) or "error"
         return AssistantResult(speech=speech, expect_reply=expect, backend="ha", actions=actions, error=err)
 
+    async def _fallback(
+        self, text: str, conv: _Conversation, speaker: str | None, ha_result: AssistantResult, room: str | None = None
+    ) -> AssistantResult:
+        """HA did not understand: let the LLM try. If it is not reachable, keep HA's answer."""
+        keep = len(conv.messages)
+        try:
+            result = await self._llm(text, conv, speaker, room)
+        except (HaError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            _LOGGER.info("LLM fallback unavailable: %s", err)
+            del conv.messages[keep:]
+            return ha_result
+        result.backend = "ha+openai"
+        if not result.speech and not result.actions:
+            return ha_result
+        return result
+
     async def _entities_text(self) -> str:
         try:
             rows = await self.ha.entities(self._domains())
@@ -212,11 +248,14 @@ class Assistant:
         rows = rows[:MAX_PROMPT_ENTITIES]
         return "\n".join(f"{r['entity_id']} | {r['name']} | {r['area'] or '-'} | {r['state']}" for r in rows)
 
-    async def _llm(self, text: str, conv: _Conversation, speaker: str | None) -> AssistantResult:
+    async def _llm(self, text: str, conv: _Conversation, speaker: str | None, room: str | None = None) -> AssistantResult:
         s = self.settings.get()
+        who = f"Говорит: {speaker}." if speaker else ""
+        if room:
+            who += f" Колонка стоит в комнате «{room}»: если комната не названа, речь о ней."
         system = SYSTEM_PROMPT.format(
             now=datetime.now().strftime("%A %d.%m.%Y %H:%M"),
-            speaker=f"Говорит: {speaker}." if speaker else "",
+            speaker=who.strip(),
             entities=await self._entities_text(),
             extra=s.llm_prompt.strip(),
         )

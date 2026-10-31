@@ -14,6 +14,7 @@ rate + nbytes + mono PCM; it still feeds the diary but cannot speak.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import struct
 import time
@@ -23,11 +24,10 @@ from typing import Any
 import numpy as np
 
 from audio_utils import (
-    EARCON_RATE,
     TARGET_RATE,
     apply_gain,
     duration_ms,
-    earcon,
+    earcon_audio,
     normalize_pcm,
     pcm16_to_float,
     rms,
@@ -82,8 +82,15 @@ STATE_NAMES = {
 FRAME_BYTES = 640  # 20 ms at 16 kHz mono
 TTS_CHUNK = 4096
 PING_EVERY_S = 5.0
+# boards in neighbouring rooms hear the same words; phrase activations arrive
+# after STT, so the window covers the recognition queue too
+CLAIM_WINDOW_S = 3.5
+WAKE_AUDIO_S = 1.5
+WAKE_AUDIO_CHUNKS = 64   # board frames are 20-60 ms; trimmed to WAKE_AUDIO_S on use
+# the TV comes back by itself if a board never returns to idle
+DUCK_MAX_S = 90.0
+TV_OFF_STATES = ("off", "unavailable", "unknown", "standby")
 SILENT_LINK_S = 30.0
-COMMAND_WAIT_S = 5.0
 
 
 def pack(ftype: int, payload: bytes = b"", rate: int = 0, channels: int = 0, bits: int = 0) -> bytes:
@@ -170,12 +177,13 @@ class CommandCapture:
         self.silent = silent  # TV on: show nothing until the voice is recognised
         self.seg = Segmenter(preroll_ms=200)
         self.started = time.monotonic()
+        self.wake_pcm = b""
 
-    def feed(self, pcm: bytes, threshold: float, silence_ms: int, max_ms: int) -> Any:
+    def feed(self, pcm: bytes, threshold: float, silence_ms: int, max_ms: int, wait_s: float) -> Any:
         done = self.seg.feed(pcm, threshold, silence_ms, max_ms)
         if done:
             return done[0]
-        if not self.seg.in_speech and time.monotonic() - self.started > COMMAND_WAIT_S:
+        if not self.seg.in_speech and time.monotonic() - self.started > wait_s:
             return self.TIMEOUT
         return None
 
@@ -198,14 +206,21 @@ class Satellite:
         self.busy = False
         self.mute_until = 0.0
         self.command: CommandCapture | None = None
+        self.room = ""                # HA area: context for "включи свет" without a room
+        self.room_source = ""         # "ha" (the board's device in HA) or "manual"
+        self.ha_device_id: str | None = None
         self.last_wake: dict[str, Any] | None = None
         self.last_wake_ts = 0.0
         self.ch_rms = [0.0, 0.0]      # long-term level per ES7210 slot
         self.ch_active = 0
         self.raw_rms = 0.0            # before digital gain
+        # the last ~1.5 s of mic audio: the wake word itself, added to the command
+        # for voice matching (a 1 s command alone is too short to tell voices apart)
+        self.recent_audio: deque[bytes] = deque(maxlen=WAKE_AUDIO_CHUNKS)
         self.diary_seg = Segmenter()
         self.wake = WakeDetector(hub.settings)
         self._tts_done = asyncio.Event()
+        self._earcon_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
         self._last_send = time.monotonic()
         self._speak_task: asyncio.Task | None = None
@@ -227,6 +242,9 @@ class Satellite:
             "esphome": self.info.get("esphome"),
             # firmware build for OTA; boards before 2.2 did not say and are all Waveshare
             "board": self.info.get("board") or "waveshare",
+            "room": self.room,
+            "room_source": self.room_source,
+            "ha_device": bool(self.ha_device_id),
             "proto": self.proto,
             "can_speak": self.can_speak,
             "listening": self.listening,
@@ -265,6 +283,8 @@ class Satellite:
 
     async def set_state(self, state: int) -> None:
         self.state = state
+        if state in (ST_IDLE, ST_SLEEP):
+            self._spawn(self.hub.unduck_tv())
         await self.send(T_STATE, bytes([state]))
 
     async def set_volume(self, percent: int) -> None:
@@ -287,20 +307,31 @@ class Satellite:
 
     async def play_earcon(self, kind: str) -> None:
         """A short sound through the TTS path; the mic is ignored while it plays."""
-        if not self.can_speak or self.speaking:
+        if not self.can_speak or self.speaking or self._earcon_lock.locked():
             return
-        pcm = earcon(kind, self.hub.settings.get().sound_volume)
-        # playback + Wi-Fi + the board's resampler buffer
-        self.mute_until = max(self.mute_until, time.monotonic() + len(pcm) / 2 / EARCON_RATE + 0.35)
-        await self.send(T_TTS_START, rate=EARCON_RATE, channels=1, bits=16)
-        for i in range(0, len(pcm), TTS_CHUNK):
-            await self.send(T_AUDIO, pcm[i : i + TTS_CHUNK], rate=EARCON_RATE, channels=1, bits=16)
-        await self.send(T_TTS_END)
+        async with self._earcon_lock:
+            pcm, rate = earcon_audio(kind, self.hub.settings.get().sound_volume)
+            dur = len(pcm) / 2 / rate
+            # playback + Wi-Fi + the board's resampler buffer
+            self.mute_until = max(self.mute_until, time.monotonic() + dur + 0.35)
+            self._tts_done.clear()
+            await self.send(T_TTS_START, rate=rate, channels=1, bits=16)
+            for i in range(0, len(pcm), TTS_CHUNK):
+                await self.send(T_AUDIO, pcm[i : i + TTS_CHUNK], rate=rate, channels=1, bits=16)
+            await self.send(T_TTS_END)
+            try:
+                await asyncio.wait_for(self._tts_done.wait(), timeout=dur + 2.5)
+            except asyncio.TimeoutError:
+                # the board's player did not finish (stuck on a short stream):
+                # reset it, or every later sound and reply would queue behind it
+                if not self.speaking:
+                    _LOGGER.info("%s: no tts_done after the %s sound, resetting playback", self.id, kind)
+                    await self.send(T_TTS_ABORT)
 
     async def flash_error(self) -> None:
-        if self.hub.settings.get().sound_error:
-            await self.play_earcon("error")
         await self.set_state(ST_ERROR)
+        if self.hub.settings.get().sound_error:
+            self._spawn(self.play_earcon("error"))
         await asyncio.sleep(2)
         if self.state == ST_ERROR:
             await self.go_idle()
@@ -330,6 +361,27 @@ class Satellite:
         )
         await self.push_board_settings()
         await self.go_idle()
+        self._spawn(self.resolve_room())
+
+    async def resolve_room(self) -> None:
+        """Room from the panel, else the area of this board's ESPHome device in HA."""
+        try:
+            manual = str(json.loads(self.hub.settings.get().sat_rooms or "{}").get(self.id) or "").strip()
+        except (ValueError, AttributeError):
+            manual = ""
+        ha = self.hub.ha
+        dev, area = "", ""
+        if ha is not None and ha.configured:
+            try:
+                dev, area = await ha.device_for_mac(self.info.get("mac", ""))
+                if manual and manual != area:
+                    dev = await ha.area_device(manual)
+            except Exception as err:
+                _LOGGER.info("%s: room lookup in HA failed: %s", self.id, err)
+        self.room = manual or area
+        self.room_source = "manual" if manual else ("ha" if area else "")
+        self.ha_device_id = dev or None
+        _LOGGER.info("%s: room %r (%s), HA device %s", self.id, self.room, self.room_source or "-", dev or "-")
 
     async def on_event(self, text: str) -> None:
         _LOGGER.debug("event %s: %s", self.id, text)
@@ -389,6 +441,8 @@ class Satellite:
         # the board hears its own reply: ignore the mic while speaking
         if self.speaking or time.monotonic() < self.mute_until:
             return
+        if self.command is None:
+            self.recent_audio.append(pcm)
         s = self.hub.settings.get()
         # utterances go through GigaAM for the diary and for phrase commands
         # ("алекса ...", "не спи"), even when the diary itself is off
@@ -397,15 +451,15 @@ class Satellite:
                 self.hub.runtime.submit(seg, source=self.id)
 
         if self.command is not None:
-            res = self.command.feed(pcm, s.diary_vad_rms, s.command_silence_ms, s.command_max_ms)
+            res = self.command.feed(pcm, s.diary_vad_rms, s.command_silence_ms, s.command_max_ms, s.command_wait_s)
             if res is CommandCapture.TIMEOUT:
                 _LOGGER.info("%s: no command after %s", self.id, self.command.reason)
                 self.command = None
                 await self.go_idle()
             elif res:
-                silent = self.command.silent
+                silent, wake_pcm = self.command.silent, self.command.wake_pcm
                 self.command = None
-                self._spawn(self.run_command(res, silent=silent))
+                self._spawn(self.run_command(res, silent=silent, wake_pcm=wake_pcm))
             return
 
         if self.busy:
@@ -434,6 +488,8 @@ class Satellite:
         if await self.mode_phrase(rest, explicit=bool(hit)):
             return
         if hit is None or self.hub.modes.sleeping():
+            return
+        if not self.hub.claim(self):
             return
         self.last_wake = {"ts": time.time(), "score": 1.0, "word": hit[0], "by": "phrase"}
         _LOGGER.info("%s: activation phrase '%s' -> %r", self.id, hit[0], rest)
@@ -469,21 +525,30 @@ class Satellite:
 
     # ---------------------------------------------------------- dialogue
     async def start_command(self, reason: str) -> None:
+        # two boards heard the same wake word: the first one takes it
+        if reason == "wake" and not self.hub.claim(self):
+            return
         silent = reason == "wake" and self.hub.tv_guard()
         self.command = CommandCapture(reason, silent=silent)
+        if reason == "wake":
+            pre = b"".join(self.recent_audio)
+            self.command.wake_pcm = pre[-int(WAKE_AUDIO_S * TARGET_RATE) * 2 :]
+        self.recent_audio.clear()
+        self._spawn(self.hub.duck_tv())
         if not silent:
             await self.set_state(ST_LISTENING)
             if self.hub.settings.get().sound_wake:
-                await self.play_earcon("wake")
+                # not awaited: the mic loop must keep running (mute_until covers the sound)
+                self._spawn(self.play_earcon("wake"))
 
-    async def run_command(self, pcm: bytes, silent: bool = False) -> None:
+    async def run_command(self, pcm: bytes, silent: bool = False, wake_pcm: bytes = b"") -> None:
         hub = self.hub
         s = hub.settings.get()
         self.busy = True
         try:
             if not silent:
                 await self.set_state(ST_THINKING)
-            match_task = asyncio.create_task(asyncio.to_thread(hub.runtime.store.match, pcm))
+            match_task = asyncio.create_task(asyncio.to_thread(hub.runtime.store.match, wake_pcm + pcm))
             raw = await transcribe(hub.stt_uri, pcm)
             match = await match_task
         except Exception as err:
@@ -513,7 +578,7 @@ class Satellite:
         if not text:
             entry["error"] = "Пустое распознавание"
             _LOGGER.info("%s: command STT empty (%d ms)", self.id, entry["duration_ms"])
-            hub.assistant.record(entry)
+            hub.assistant.record(entry, pcm)
             if hub.tv_guard():
                 await self.go_idle()
             else:
@@ -523,14 +588,17 @@ class Satellite:
             return
         self.busy = True
         try:
-            if not hub.voice_allowed(match):
+            if hub.voice_allowed(match):
+                # "колонка, выключи свет" in one breath: the TV is lowered for the answer
+                self._spawn(hub.duck_tv())
+            else:
                 tv = hub.tv_guard()
                 entry.update(
                     rejected=True,
                     error="Голос не узнан, включён ТВ — команда отклонена" if tv else "Голос не узнан — команда отклонена",
                 )
                 _LOGGER.info("%s: command rejected, unknown voice (%.2f, tv=%s): %s", self.id, match.score, tv, text)
-                hub.assistant.record(entry)
+                hub.assistant.record(entry, pcm)
                 # with the TV on this is most likely the TV itself: stay dark
                 if tv:
                     await self.go_idle()
@@ -539,7 +607,9 @@ class Satellite:
                 return
             if self.state != ST_THINKING:
                 await self.set_state(ST_THINKING)
-            result = await hub.assistant.handle(text, conv_key=self.id, speaker=speaker)
+            result = await hub.assistant.handle(
+                text, conv_key=self.id, speaker=speaker, device_id=self.ha_device_id, room=self.room or None
+            )
             entry.update(
                 reply=result.speech,
                 backend=result.backend,
@@ -547,7 +617,7 @@ class Satellite:
                 expect_reply=result.expect_reply,
                 error=result.error,
             )
-            hub.assistant.record(entry)
+            hub.assistant.record(entry, pcm)
             _LOGGER.info("%s: «%s» -> «%s»", self.id, text, result.speech)
             if result.speech and self.can_speak:
                 self.say(result.speech, expect_reply=result.expect_reply)
@@ -558,7 +628,7 @@ class Satellite:
         except Exception as err:
             _LOGGER.exception("%s: command failed", self.id)
             entry["error"] = str(err)
-            hub.assistant.record(entry)
+            hub.assistant.record(entry, pcm)
             self._spawn(self.flash_error())
         finally:
             self.busy = False
@@ -653,6 +723,107 @@ class SatelliteHub:
         self.stt_uri = stt_uri
         self.tts_uri = tts_uri
         self.satellites: dict[str, Satellite] = {}
+        self._claim: tuple[float, Satellite] | None = None
+        self._ducked: dict[str, Any] | None = None
+        self._duck_lock = asyncio.Lock()
+        self._duck_timer: asyncio.Task | None = None
+
+    def claim(self, sat: Satellite) -> bool:
+        """One activation for all boards: the first board that heard the wake word
+        or phrase answers; the others ignore the same words for CLAIM_WINDOW_S."""
+        now = time.monotonic()
+        prev = self._claim
+        if prev and prev[1] is not sat and now - prev[0] < CLAIM_WINDOW_S and prev[1].id in self.satellites:
+            _LOGGER.info("%s: activation ignored, %s already answers", sat.id, prev[1].id)
+            return False
+        self._claim = (now, sat)
+        return True
+
+    # -------------------------------------------------------- TV ducking
+    async def duck_tv(self) -> None:
+        """Lower / mute / pause the TV while a board listens and answers."""
+        s = self.settings.get()
+        entity = s.tv_entity.strip()
+        if s.tv_duck == "off" or not entity or self.ha is None or not self.ha.configured:
+            return
+        async with self._duck_lock:
+            if self._ducked is not None:
+                return
+            try:
+                st = await self.ha.state(entity)
+                state = st.get("state")
+                if state in TV_OFF_STATES:
+                    return
+                attrs = st.get("attributes") or {}
+                vol = attrs.get("volume_level")
+                mode = s.tv_duck
+                if mode == "pause":
+                    if state != "playing":
+                        return
+                    await self.ha.call_service("media_player", "media_pause", {"entity_id": entity})
+                    saved: dict[str, Any] = {"mode": "pause"}
+                elif mode == "mute" or vol is None:
+                    if attrs.get("is_volume_muted"):
+                        return
+                    await self.ha.call_service("media_player", "volume_mute", {"entity_id": entity, "is_volume_muted": True})
+                    saved = {"mode": "mute"}
+                else:
+                    vol = float(vol)
+                    target = round(vol * s.tv_duck_level / 100, 3)
+                    if target >= vol:
+                        return
+                    await self.ha.call_service("media_player", "volume_set", {"entity_id": entity, "volume_level": target})
+                    saved = {"mode": "volume", "volume": vol, "target": target}
+            except Exception as err:
+                _LOGGER.info("TV duck %s failed: %s", entity, err)
+                return
+            saved["entity"] = entity
+            self._ducked = saved
+            _LOGGER.info("TV %s ducked: %s", entity, saved)
+            self._duck_timer = asyncio.create_task(self._unduck_later())
+
+    async def _unduck_later(self) -> None:
+        await asyncio.sleep(DUCK_MAX_S)
+        self._duck_timer = None
+        await self.unduck_tv(force=True)
+
+    async def unduck_tv(self, force: bool = False) -> None:
+        """Back to how it was, once no board is listening, thinking or answering."""
+        if self._ducked is None and not self._duck_lock.locked():
+            return
+        # waits for a duck still in flight, so a quick "no command" does not leave the TV low
+        async with self._duck_lock:
+            busy = [x for x in self.satellites.values() if x.state not in (ST_IDLE, ST_SLEEP, ST_ERROR)]
+            if self._ducked is None or (busy and not force):
+                return
+            saved, self._ducked = self._ducked, None
+            if self._duck_timer is not None and self._duck_timer is not asyncio.current_task():
+                self._duck_timer.cancel()
+            self._duck_timer = None
+            entity = saved["entity"]
+            try:
+                st = await self.ha.state(entity)
+                attrs = st.get("attributes") or {}
+                if saved["mode"] == "pause":
+                    if st.get("state") == "paused":
+                        await self.ha.call_service("media_player", "media_play", {"entity_id": entity})
+                elif saved["mode"] == "mute":
+                    if attrs.get("is_volume_muted"):
+                        await self.ha.call_service("media_player", "volume_mute", {"entity_id": entity, "is_volume_muted": False})
+                else:
+                    now = attrs.get("volume_level")
+                    # someone changed the volume meanwhile: leave theirs
+                    if now is None or abs(float(now) - saved["target"]) <= 0.02:
+                        await self.ha.call_service(
+                            "media_player", "volume_set", {"entity_id": entity, "volume_level": saved["volume"]}
+                        )
+                _LOGGER.info("TV %s restored", entity)
+            except Exception as err:
+                _LOGGER.info("TV restore %s failed: %s", entity, err)
+
+    async def refresh_rooms(self) -> None:
+        for sat in list(self.satellites.values()):
+            await sat.resolve_room()
 
     def list(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self.satellites.values()]

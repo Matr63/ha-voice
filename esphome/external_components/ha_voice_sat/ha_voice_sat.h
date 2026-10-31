@@ -150,6 +150,8 @@ class HaVoiceSat : public Component {
   // speaker side (main loop only)
   enum class TtsPhase { IDLE, PLAYING, DRAINING };
   TtsPhase tts_phase_{TtsPhase::IDLE};
+  bool drain_kicked_{false};
+  uint32_t drain_since_ms_{0};  // a speaker that never reports stopped must not block TTS forever
   std::vector<uint8_t> play_buf_;
   size_t play_off_{0};
 

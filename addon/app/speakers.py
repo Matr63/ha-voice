@@ -23,6 +23,9 @@ _NAME_RE = re.compile(r"^[\w .()\-]{1,40}$")
 MIN_ENROLL_SEC = 1.0
 MIN_MATCH_SEC = 0.5
 MAX_SAMPLES_KEPT = 10
+# one embedding per recording: a short command from across the room is closer
+# to the best-matching recording than to the average of all of them
+MAX_SAMPLE_EMBEDDINGS = 24
 
 
 @dataclass
@@ -50,6 +53,7 @@ class SpeakerStore:
         self._encoder_lock = threading.Lock()
         self._encoder = None
         self._embeddings: dict[str, np.ndarray] = {}
+        self._samples: dict[str, np.ndarray] = {}   # (n, 256) per speaker
         self._meta: dict[str, dict[str, Any]] = {}
         self._load()
 
@@ -65,6 +69,7 @@ class SpeakerStore:
     def _load(self) -> None:
         with self._lock:
             self._embeddings.clear()
+            self._samples.clear()
             self._meta.clear()
             for path in sorted(self.root.glob("*/meta.json")):
                 try:
@@ -75,6 +80,8 @@ class SpeakerStore:
                     sid = str(meta.get("id") or path.parent.name)
                     self._meta[sid] = meta
                     self._embeddings[sid] = np.load(emb_path).astype(np.float32)
+                    if (path.parent / "samples.npy").is_file():
+                        self._samples[sid] = np.load(path.parent / "samples.npy").astype(np.float32)
                 except Exception:
                     _LOGGER.exception("Failed to load speaker %s", path)
 
@@ -132,6 +139,7 @@ class SpeakerStore:
                 return False
             shutil.rmtree(self._speaker_dir(speaker_id), ignore_errors=True)
             self._embeddings.pop(speaker_id, None)
+            self._samples.pop(speaker_id, None)
             self._meta.pop(speaker_id, None)
             return True
 
@@ -162,6 +170,37 @@ class SpeakerStore:
         norm = float(np.linalg.norm(emb))
         return emb / norm if norm > 1e-9 else None
 
+    def _sample_embeddings(self, sid: str) -> np.ndarray | None:
+        """Per-recording embeddings; voices enrolled before 2.2.4 get them from their kept WAVs once."""
+        with self._lock:
+            got = self._samples.get(sid)
+        if got is not None:
+            return got
+        d = self._speaker_dir(sid)
+        wavs = sorted(d.glob("sample_*.wav"))
+        if not wavs:
+            return None
+        from audio_utils import decode_body
+
+        embs = [e for e in (self.embed(decode_body(w.read_bytes())) for w in wavs) if e is not None]
+        if not embs:
+            return None
+        arr = np.stack(embs).astype(np.float32)
+        with self._lock:
+            if sid in self._meta:
+                np.save(d / "samples.npy", arr)
+                self._samples[sid] = arr
+        _LOGGER.info("Voice %s: %d recordings indexed", sid, len(embs))
+        return arr
+
+    def _score(self, emb: np.ndarray, sid: str, centroid: np.ndarray) -> float:
+        score = float(np.dot(emb, centroid))
+        samples = self._sample_embeddings(sid)
+        if samples is not None and len(samples):
+            sims = np.sort(samples @ emb)[::-1]
+            score = max(score, float(np.mean(sims[:2])))
+        return score
+
     def match(self, pcm: bytes) -> MatchResult:
         emb = self.embed(pcm)
         if emb is None:
@@ -172,7 +211,7 @@ class SpeakerStore:
         if not refs:
             return MatchResult(None, None, 0.0, False)
         scores = sorted(
-            ({"id": sid, "name": names.get(sid, sid), "score": round(float(np.dot(emb, ref)), 3)} for sid, ref in refs),
+            ({"id": sid, "name": names.get(sid, sid), "score": round(self._score(emb, sid, ref), 3)} for sid, ref in refs),
             key=lambda x: x["score"],
             reverse=True,
         )
@@ -196,6 +235,9 @@ class SpeakerStore:
             if not clean_name:
                 raise ValueError("Укажите имя")
             samples = int((old or {}).get("samples", 0)) + 1
+            prev_samples = self._samples.get(sid) if old else None
+            new_samples = emb[None, :] if prev_samples is None else np.vstack([prev_samples, emb[None, :]])
+            new_samples = new_samples[-MAX_SAMPLE_EMBEDDINGS:].astype(np.float32)
             if old and sid in self._embeddings:
                 prev = self._embeddings[sid]
                 emb = prev * (samples - 1) + emb
@@ -213,6 +255,8 @@ class SpeakerStore:
             d = self._speaker_dir(sid)
             d.mkdir(parents=True, exist_ok=True)
             np.save(d / "embedding.npy", emb)
+            np.save(d / "samples.npy", new_samples)
+            self._samples[sid] = new_samples
             self._save_meta(sid, meta)
             (d / f"sample_{samples:04d}.wav").write_bytes(to_wav(pcm[: TARGET_RATE * 2 * 30]))
             for stale in sorted(d.glob("sample_*.wav"))[:-MAX_SAMPLES_KEPT]:

@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from assistant import Assistant, result_dict
-from audio_utils import decode_body, duration_ms, to_wav
+from audio_utils import decode_body, duration_ms, save_sound, sound_info, sound_path, to_wav
 from dialogue import DialogueRuntime
 from firmware import BOARDS, KINDS, FirmwareStore, board_key, file_name
 from gate_server import GateState
@@ -226,6 +226,8 @@ def create_app(ctx: AppContext) -> web.Application:
             await hub.push_board_settings()
         if any(before[k] != after[k] for k in ("sleep_schedule", "sleep_start", "sleep_end")):
             await hub.set_sleep(hub.modes.sleeping(), "panel")
+        if before["sat_rooms"] != after["sat_rooms"]:
+            await hub.refresh_rooms()
         return web.json_response(settings.to_public_dict())
 
     async def speakers_list(_: web.Request) -> web.Response:
@@ -485,6 +487,16 @@ def create_app(ctx: AppContext) -> web.Application:
             raise ValueError("Колонка не подключена")
         return sat
 
+    async def ha_areas(_: web.Request) -> web.Response:
+        try:
+            return web.json_response({"areas": await ctx.ha.areas()})
+        except HaError as err:
+            return web.json_response({"areas": [], "error": str(err)})
+
+    async def satellites_rooms_refresh(_: web.Request) -> web.Response:
+        await hub.refresh_rooms()
+        return web.json_response({"satellites": hub.list()})
+
     async def satellites_list(_: web.Request) -> web.Response:
         return web.json_response({"satellites": hub.list()})
 
@@ -509,6 +521,27 @@ def create_app(ctx: AppContext) -> web.Application:
             raise ValueError("Эта прошивка не умеет воспроизводить звук")
         await sat.play_earcon(sound)
         return web.json_response({"ok": True})
+
+    def _sound_kind(request: web.Request) -> str:
+        kind = request.match_info["kind"]
+        if kind not in ("wake", "error"):
+            raise ValueError("Сигнал: wake или error")
+        return kind
+
+    async def sounds_get(_: web.Request) -> web.Response:
+        return web.json_response({k: sound_info(k) for k in ("wake", "error")})
+
+    async def sound_upload(request: web.Request) -> web.Response:
+        kind = _sound_kind(request)
+        body = await request.read()
+        if len(body) > 4 * 1024 * 1024:
+            raise ValueError("Файл больше 4 МБ")
+        return web.json_response(save_sound(kind, body))
+
+    async def sound_reset(request: web.Request) -> web.Response:
+        kind = _sound_kind(request)
+        sound_path(kind).unlink(missing_ok=True)
+        return web.json_response(sound_info(kind))
 
     async def satellite_volume(request: web.Request) -> web.Response:
         data = await _json_obj(request)
@@ -536,6 +569,25 @@ def create_app(ctx: AppContext) -> web.Application:
         return web.json_response({"ok": True})
 
     # ---------------------------------------------------------- assistant
+    async def assistant_log_assign(request: web.Request) -> web.Response:
+        """A command from the log -> one more recording of that voice."""
+        entry_id = int(request.match_info["entry_id"])
+        pcm = assistant.audio.get(entry_id)
+        if not pcm:
+            return _err("Запись команды уже не хранится (держатся последние 40)", 404)
+        data = await _json_obj(request)
+        sid = data.get("speaker_id") or None
+        name = (data.get("name") or "").strip() or None
+        if sid and store.get(sid) is None:
+            return _err("Голос не найден", 404)
+        if not sid and not name:
+            raise ValueError("Выберите голос или введите имя")
+        meta = await asyncio.to_thread(store.enroll, None if sid else name, pcm, sid)
+        for e in assistant.log:
+            if e.get("id") == entry_id:
+                e.update(speaker=meta["name"], learned=True)
+        return web.json_response({"ok": True, "speaker": meta})
+
     async def assistant_log(request: web.Request) -> web.Response:
         return web.json_response({"log": assistant.history(int(request.query.get("limit", "100")))})
 
@@ -721,14 +773,20 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_get("/api/tts/models.zip", tts_models_export)
     r.add_post("/api/tts/models", tts_models_import)
     r.add_get("/api/satellites", satellites_list)
+    r.add_post("/api/satellites/rooms", satellites_rooms_refresh)
+    r.add_get("/api/ha/areas", ha_areas)
     r.add_post("/api/satellites/say", satellite_say)
     r.add_post("/api/satellites/volume", satellite_volume)
     r.add_post("/api/satellites/earcon", satellite_earcon)
+    r.add_get("/api/sounds", sounds_get)
+    r.add_post("/api/sounds/{kind}", sound_upload)
+    r.add_delete("/api/sounds/{kind}", sound_reset)
     r.add_post("/api/satellites/listen", satellite_listen)
     r.add_post("/api/satellites/microphone", satellite_listen_switch)
     r.add_get("/api/mode", mode_get)
     r.add_post("/api/mode", mode_set)
     r.add_get("/api/assistant/log", assistant_log)
+    r.add_post("/api/assistant/log/{entry_id:\\d+}/assign", assistant_log_assign)
     r.add_post("/api/assistant/ask", assistant_ask)
     r.add_get("/api/assistant/agents", assistant_agents)
     r.add_get("/api/ha", ha_status)

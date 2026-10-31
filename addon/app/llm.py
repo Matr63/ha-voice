@@ -143,7 +143,9 @@ class LlmManager:
             "error": self.error,
             "started_at": self.started_at,
             "url": LLM_URL,
-            "active": s.assistant_backend == "openai" and s.llm_url.rstrip("/") == LLM_URL,
+            "active": s.llm_url.rstrip("/") == LLM_URL
+            and (s.assistant_backend == "openai" or (s.assistant_backend == "ha" and s.llm_fallback)),
+            "fallback": s.assistant_backend == "ha" and s.llm_fallback,
             "dir": str(self.root),
             "disk_free": disk,
             "job": self.job,
@@ -286,7 +288,10 @@ class LlmManager:
         _LOGGER.info("llama-server pid=%s model=%s threads=%s ctx=%s", self._proc.pid, path.name, threads, s.llm_ctx)
         changes: dict[str, Any] = {"llm_local_model": path.name}
         if activate:
-            changes.update(assistant_backend="openai", llm_url=LLM_URL, llm_model=path.stem, llm_api_key="")
+            changes.update(llm_url=LLM_URL, llm_model=path.stem, llm_api_key="")
+            # HA agent + fallback stays: exact commands in HA, the rest to this model
+            if not (s.assistant_backend == "ha" and s.llm_fallback):
+                changes["assistant_backend"] = "openai"
         self.settings.update(changes)
         self._watch = asyncio.create_task(self._watch_proc(self._proc))
         return self.status()

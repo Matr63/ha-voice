@@ -21,6 +21,8 @@ LIMITS: dict[str, tuple[float, float]] = {
     "wake_threshold": (0.1, 0.95),
     "command_silence_ms": (300, 3000),
     "command_max_ms": (3000, 30000),
+    "command_wait_s": (2, 30),
+    "tv_duck_level": (0, 90),
     "sat_volume": (0, 100),
     "sat_mic_gain": (0, 36),
     "sat_led_brightness": (0, 100),
@@ -33,6 +35,7 @@ LIMITS: dict[str, tuple[float, float]] = {
 ENUMS: dict[str, tuple[str, ...]] = {
     "wake_backend": ("local", "wyoming"),
     "assistant_backend": ("ha", "openai", "off"),
+    "tv_duck": ("volume", "mute", "pause", "off"),
     "mic_channel": ("auto", "left", "right", "mix"),
 }
 
@@ -69,6 +72,9 @@ class Settings:
     # TV next to the board: diary for known voices only, stricter commands while it plays
     diary_known_only: bool = False
     tv_entity: str = ""             # media_player.* in Home Assistant
+    # while a board listens and answers: quieter TV ("volume"), "mute", "pause" or "off"
+    tv_duck: str = "volume"
+    tv_duck_level: int = 25         # % of the TV's volume while ducked
     sat_mic_gain: int = 36          # ES7210 hardware gain, dB (3 dB steps)
     sat_led_brightness: int = 80
     mic_boost_db: int = 6           # digital gain on the PC (the board's loud slot is picked first)
@@ -88,6 +94,8 @@ class Settings:
     wake_phrases: str = "алекса, колонка"
     command_silence_ms: int = 800
     command_max_ms: int = 10000
+    # after the wake word: how long to wait for the command to start
+    command_wait_s: int = 6
     # assistant
     assistant_backend: str = "ha"
     ha_agent_id: str = ""
@@ -95,6 +103,11 @@ class Settings:
     llm_model: str = "qwen2.5:7b"
     llm_api_key: str = ""
     llm_prompt: str = ""
+    # with the HA agent: phrases HA did not understand go to the LLM above
+    llm_fallback: bool = True
+    # room per board, JSON {"<board name>": "<HA area>"}; a board not listed
+    # takes the area of its ESPHome device in HA
+    sat_rooms: str = "{}"
     # local model run by the add-on (llama.cpp); empty = none
     llm_local_model: str = ""
     llm_threads: int = 0            # 0 = all cores but one
@@ -153,6 +166,7 @@ def _defaults_from_env() -> Settings:
         llm_url=_env_str("LLM_URL", d.llm_url),
         llm_model=_env_str("LLM_MODEL", d.llm_model),
         llm_api_key=_env_str("LLM_API_KEY", d.llm_api_key),
+        llm_fallback=_env_bool("LLM_FALLBACK", d.llm_fallback),
         ha_url=_env_str("HA_URL", d.ha_url),
         ha_token=_env_str("HA_TOKEN", d.ha_token),
     )

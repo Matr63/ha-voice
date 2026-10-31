@@ -173,6 +173,8 @@ void HaVoiceSat::loop_speaker_() {
         this->speaker_->stop();
         high_freq.stop();
         this->tts_phase_ = TtsPhase::DRAINING;
+        this->drain_since_ms_ = millis();
+        this->drain_kicked_ = false;
       }
       this->play_buf_.clear();
       this->play_off_ = 0;
@@ -220,9 +222,26 @@ void HaVoiceSat::loop_speaker_() {
         this->speaker_->finish();
         high_freq.stop();
         this->tts_phase_ = TtsPhase::DRAINING;
+        this->drain_since_ms_ = millis();
+        this->drain_kicked_ = false;
       }
     }
 
+    if (this->tts_phase_ == TtsPhase::DRAINING && !this->speaker_->is_stopped()) {
+      // A very short stream can leave the resampler waiting forever after finish():
+      // stop it hard, and give up waiting if even that does not report stopped.
+      uint32_t waited = millis() - this->drain_since_ms_;
+      if (waited > 8000) {
+        ESP_LOGW(TAG, "Speaker did not stop, forcing TTS idle");
+        this->speaker_->stop();
+        this->tts_phase_ = TtsPhase::IDLE;
+        this->tts_end_trigger_.trigger();
+        this->send_event("tts_done");
+      } else if (waited > 3000 && !this->drain_kicked_) {
+        this->drain_kicked_ = true;
+        this->speaker_->stop();
+      }
+    }
     if (this->tts_phase_ == TtsPhase::DRAINING && this->speaker_->is_stopped()) {
       this->tts_phase_ = TtsPhase::IDLE;
       this->tts_end_trigger_.trigger();

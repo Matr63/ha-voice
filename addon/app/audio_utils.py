@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import io
+import os
 import wave
+from pathlib import Path
 
 import numpy as np
 
@@ -90,6 +92,84 @@ def earcon(kind: str, volume_pct: int = 60) -> bytes:
         parts.append(tone * np.clip(env, 0.0, 1.0) * amp / 1.25)
         parts.append(np.zeros(int(EARCON_RATE * 0.03)))
     return float_to_pcm16(np.concatenate(parts).astype(np.float32))
+
+
+SOUNDS_DIR = Path(os.environ.get("SOUNDS_DIR", "/data/sounds"))
+SOUND_MAX_S = 6.0
+
+
+def sound_path(kind: str) -> Path:
+    return SOUNDS_DIR / f"{kind}.wav"
+
+
+def read_sound(body: bytes) -> tuple[np.ndarray, int]:
+    """User WAV (8/16/24/32-bit PCM, any rate) -> float mono and its rate."""
+    try:
+        with wave.open(io.BytesIO(body), "rb") as w:
+            width, channels, rate = w.getsampwidth(), w.getnchannels(), w.getframerate()
+            frames = w.readframes(w.getnframes())
+    except (wave.Error, EOFError) as err:
+        raise ValueError(f"Нужен WAV без сжатия (PCM): {err}") from err
+    if width == 1:
+        audio = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif width == 2:
+        audio = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    elif width == 3:
+        b = np.frombuffer(frames[: len(frames) - len(frames) % 3], dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+        audio = np.where(v >= 1 << 23, v - (1 << 24), v).astype(np.float32) / 8388608.0
+    elif width == 4:
+        audio = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError("Неподдерживаемая разрядность WAV")
+    if channels > 1:
+        audio = audio[: audio.size - audio.size % channels].reshape(-1, channels).mean(axis=1)
+    if not 8000 <= rate <= 48000:
+        audio, rate = resample(audio, rate, EARCON_RATE), EARCON_RATE
+    if audio.size == 0:
+        raise ValueError("Пустой звук")
+    if audio.size > rate * SOUND_MAX_S:
+        raise ValueError(f"Сигнал длиннее {SOUND_MAX_S:.0f} с")
+    return audio, rate
+
+
+def sound_info(kind: str) -> dict:
+    p = sound_path(kind)
+    if not p.is_file():
+        return {"custom": False}
+    try:
+        with wave.open(str(p), "rb") as w:
+            return {"custom": True, "duration_ms": int(w.getnframes() * 1000 / w.getframerate())}
+    except (wave.Error, EOFError):
+        return {"custom": False}
+
+
+def save_sound(kind: str, body: bytes) -> dict:
+    audio, rate = read_sound(body)
+    SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = sound_path(kind).with_suffix(".tmp")
+    tmp.write_bytes(to_wav(float_to_pcm16(audio), rate))
+    tmp.replace(sound_path(kind))
+    return sound_info(kind)
+
+
+def earcon_audio(kind: str, volume_pct: int = 60) -> tuple[bytes, int]:
+    """The user's WAV if uploaded, else the built-in tone; padded with silence
+    so the board's resampler is running before the sound and has a tail to drain."""
+    audio = None
+    p = sound_path(kind)
+    if p.is_file():
+        try:
+            audio, rate = read_sound(p.read_bytes())
+            audio = audio * max(0.0, min(100.0, float(volume_pct))) / 100.0
+        except (OSError, ValueError):
+            audio = None
+    if audio is None:
+        rate = EARCON_RATE
+        audio = pcm16_to_float(earcon(kind, volume_pct))
+    pad = np.zeros(int(rate * 0.12), dtype=np.float32)
+    tail = np.zeros(int(rate * 0.2), dtype=np.float32)
+    return float_to_pcm16(np.concatenate([pad, audio.astype(np.float32), tail])), rate
 
 
 def split_stereo(pcm: bytes) -> tuple[np.ndarray, np.ndarray]:

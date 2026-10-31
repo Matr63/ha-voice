@@ -469,7 +469,14 @@
     stopped: "остановлен",
   };
   const BACKENDS = { ha: "Home Assistant", openai: "LLM (OpenAI-совместимый)", off: "выключен" };
-  const satellite = () => (state.status && state.status.satellites && state.status.satellites[0]) || null;
+  const satellites = () => (state.status && state.status.satellites) || [];
+  // the board picked in «Колонки и комнаты» (first one by default)
+  const satellite = () => {
+    const all = satellites();
+    return all.find((x) => x.id === state.satId) || all[0] || null;
+  };
+  const satId = () => (satellite() || {}).id;
+  const BOARD_LABELS = { waveshare: "Waveshare", xvf3800: "ReSpeaker XVF3800" };
 
   function renderPills() {
     const el = $("#pills");
@@ -484,7 +491,8 @@
     else if (!sat.listening) col = pill("warn", "Колонка: микрофон выключен");
     else {
       const [dot, text] = SAT_STATES[sat.state] || ["ok", sat.state];
-      col = pill(dot, `Колонка · ${text}`);
+      const n = satellites().length;
+      col = pill(dot, n > 1 ? `${sat.room || sat.name} · ${text} (+${n - 1})` : `Колонка · ${text}`);
     }
     const stt = s.stt.online ? pill("ok", "GigaAM") : pill("warn live", "GigaAM загружается…");
     let tts;
@@ -646,9 +654,10 @@
 
     v.innerHTML = `
       ${banners.join("")}
+      ${satellites().length ? `<div class="card" style="margin-bottom:14px" id="satRooms">${roomsCard()}</div>` : ""}
       <div class="grid grid-2">
         <div class="card">
-          <div class="row between"><h3>${icon("speaker")}${esc(sat ? sat.name : "Колонка")}</h3><span class="pill"><span class="dot ${dot}"></span>${esc(stateText)}</span></div>
+          <div class="row between"><h3>${icon("speaker")}${esc(sat ? sat.name : "Колонка")}${sat && sat.room ? ` <span class="muted small">· ${esc(sat.room)}</span>` : ""}</h3><span class="pill"><span class="dot ${dot}"></span>${esc(stateText)}</span></div>
           <div class="meter" style="margin-top:8px"><div class="meter-fill" style="width:${fresh ? levelPct(sat.live_rms) : 0}%"></div></div>
           <div class="row between small" style="margin-top:8px">
             <span>${esc(mic)}</span>
@@ -694,10 +703,72 @@
         </div>
       </div>`;
     ensureEspWebTools();
+    const rooms = $("#satRooms");
+    if (rooms) {
+      if (!state.areas) {
+        state.areas = [];
+        api("/api/ha/areas").then((d) => { state.areas = d.areas || []; const el = $("#satRooms"); if (el && !editing("speaker")) el.innerHTML = roomsCard(); }).catch(() => {});
+      }
+      rooms.addEventListener("change", onRoomChange);
+    }
     const bf = $("#boardForm");
     if (bf) bindSettingsForm(bf, async () => renderSpeaker());
     const sf = $("#sleepForm");
     if (sf) bindSettingsForm(sf, async () => renderSpeaker());
+  }
+
+  function satRooms() {
+    try {
+      return JSON.parse((state.settings || {}).sat_rooms || "{}") || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function roomsCard() {
+    const all = satellites();
+    const cur = satId();
+    const manual = satRooms();
+    const rows = all.map((x) => {
+      const [dot, text] = SAT_STATES[x.state] || ["", x.state];
+      const areas = [...(state.areas || [])];
+      if (manual[x.id] && !areas.includes(manual[x.id])) areas.push(manual[x.id]);
+      const auto = x.room_source === "ha" ? `Из HA: ${x.room}` : "Из HA (область не задана)";
+      return `
+        <div class="row between" style="gap:10px;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--line, rgba(127,127,127,.2))">
+          <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">
+            <button type="button" class="btn sm ${x.id === cur ? "primary" : "ghost"}" data-sat="${esc(x.id)}">${icon("speaker")}${esc(x.name)}</button>
+            <span class="small muted">${esc(BOARD_LABELS[x.board] || x.board)} · <span class="mono">${esc(x.ip)}</span> · <span class="dot ${dot}"></span> ${esc(text)}${x.listening ? "" : " · микрофон выключен"}</span>
+          </div>
+          <label class="small" style="display:flex;gap:8px;align-items:center">Комната
+            <select class="input" data-room="${esc(x.id)}" style="max-width:240px">
+              <option value="">${esc(auto)}</option>
+              ${areas.map((a) => `<option value="${esc(a)}" ${manual[x.id] === a ? "selected" : ""}>${esc(a)}</option>`).join("")}
+            </select>
+          </label>
+        </div>`;
+    });
+    return `
+      <div class="row between"><h3>${icon("speaker")}Колонки и комнаты</h3><span class="small muted">${all.length} подключено</span></div>
+      <p class="card-sub">Кнопка с именем выбирает колонку для этой вкладки и «Озвучки». Комната — область платы в HA (Настройки → Устройства → плата ESPHome → Область) или выбранная здесь: «включи свет» без комнаты выполнится в комнате той колонки, что услышала. Если ключевое слово услышали две колонки — отвечает та, что услышала первой, а дневник пишет фразу один раз.</p>
+      ${rows.join("")}`;
+  }
+
+  async function onRoomChange(ev) {
+    const t = ev.target;
+    if (!t.dataset.room) return;
+    const rooms = satRooms();
+    if (t.value) rooms[t.dataset.room] = t.value;
+    else delete rooms[t.dataset.room];
+    try {
+      state.settings = await postJson("/api/settings", { sat_rooms: JSON.stringify(rooms) });
+      toast(t.value ? `Комната: ${t.value}` : "Комната — из Home Assistant");
+      t.blur();
+      await poll();
+      renderSpeaker();
+    } catch (err) {
+      showError(err);
+    }
   }
 
   function boardSettingsCard(sat, st) {
@@ -752,12 +823,19 @@
 
   async function onSpeakerClick(ev) {
     const t = ev.target;
+    const pick = t.closest("[data-sat]");
+    if (pick) {
+      state.satId = pick.dataset.sat;
+      renderSpeaker();
+      renderPills();
+      return;
+    }
     const fw = t.closest("[data-fw]");
     const mic = t.closest("[data-mic]");
     const sleep = t.closest("[data-sleep]");
     try {
       if (mic) {
-        await postJson("/api/satellites/microphone", { listen: mic.dataset.mic === "1" });
+        await postJson("/api/satellites/microphone", { id: satId(), listen: mic.dataset.mic === "1" });
         toast(mic.dataset.mic === "1" ? "Микрофон включён" : "Микрофон выключен");
         await poll();
         renderSpeaker();
@@ -769,10 +847,10 @@
       } else if (t.closest("#spSayBtn")) {
         const text = $("#spSay").value.trim();
         if (!text) return;
-        await postJson("/api/satellites/say", { text });
+        await postJson("/api/satellites/say", { id: satId(), text });
         toast("Говорю на колонке");
       } else if (t.closest("#spListen")) {
-        await postJson("/api/satellites/listen", {});
+        await postJson("/api/satellites/listen", { id: satId() });
         toast("Колонка слушает команду");
       } else if (fw && fw.dataset.fw === "fetch") {
         fw.disabled = true;
@@ -1447,6 +1525,7 @@
     ms: (x) => `${x} мс`,
     sec: (x) => `${Math.round(x / 1000)} с`,
     vol: (x) => `${x}%`,
+    s: (x) => `${x} с`,
     db: (x) => `${x} дБ`,
     threads: (x) => (Number(x) ? String(x) : "авто"),
   };
@@ -1577,6 +1656,23 @@
     repaint();
   }
 
+  function soundsBox(sat) {
+    const can = sat && sat.can_speak;
+    const snd = state.sounds || {};
+    const row = (kind, label) => {
+      const info = snd[kind] || {};
+      return `
+        <div class="row" style="gap:8px;margin-bottom:6px;flex-wrap:wrap;align-items:center">
+          <button type="button" class="btn ghost sm" data-earcon="${kind}" ${can ? "" : "disabled"}>${icon("play")}${label}</button>
+          <span class="small muted" style="min-width:110px">${info.custom ? `свой, ${(info.duration_ms / 1000).toFixed(1)} с` : "встроенный"}</span>
+          <label class="btn ghost sm">${icon("upload")}Свой WAV<input type="file" accept=".wav,audio/wav" data-sound-upload="${kind}" hidden></label>
+          ${info.custom ? `<button type="button" class="btn ghost sm" data-sound-reset="${kind}">Встроенный</button>` : ""}
+        </div>`;
+    };
+    return `${row("wake", "«Слушаю»")}${row("error", "Ошибка")}
+      <div class="hint" style="margin-bottom:8px">Свой звук: WAV без сжатия, до 6 секунд. Громкость сигналов применяется и к нему.</div>`;
+  }
+
   function renderTts() {
     const v = view("tts");
     const s = state.settings;
@@ -1613,10 +1709,7 @@
           ${switchField("sound_wake", "Сигнал «слушаю» — после ключевого слова", s.sound_wake, "Короткий звук: колонка начала слушать команду.")}
           ${switchField("sound_error", "Сигнал ошибки", s.sound_error, "Звучит, если команду не расслышали или она не выполнилась.")}
           ${rangeField("sound_volume", "Громкость сигналов", s.sound_volume ?? 60, 10, 100, 5, "vol")}
-          <div class="row" style="gap:8px;margin-bottom:6px">
-            <button type="button" class="btn ghost sm" data-earcon="wake" ${sat && sat.can_speak ? "" : "disabled"}>${icon("play")}«Слушаю»</button>
-            <button type="button" class="btn ghost sm" data-earcon="error" ${sat && sat.can_speak ? "" : "disabled"}>${icon("play")}Ошибка</button>
-          </div>
+          <div id="soundsBox">${soundsBox(sat)}</div>
           ${saveRow()}
         </form>
         <div class="card">
@@ -1634,15 +1727,37 @@
       </div>
       <div class="card" style="margin-top:14px" id="ttsModels">${modelsCard()}</div>`;
     bindSettingsForm($("#ttsForm"), async () => renderTts());
-    $$("[data-earcon]", v).forEach((b) =>
-      b.addEventListener("click", async () => {
-        try {
-          await postJson("/api/satellites/earcon", { sound: b.dataset.earcon });
-        } catch (err) {
-          showError(err);
+    const box = $("#soundsBox");
+    const repaintSounds = () => { box.innerHTML = soundsBox(sat); };
+    if (!state.sounds) api("/api/sounds").then((d) => { state.sounds = d; repaintSounds(); }).catch(() => {});
+    box.addEventListener("click", async (ev) => {
+      const b = ev.target.closest("button[data-earcon], button[data-sound-reset]");
+      if (!b) return;
+      b.disabled = true;
+      try {
+        if (b.dataset.earcon) await postJson("/api/satellites/earcon", { id: satId(), sound: b.dataset.earcon });
+        else {
+          state.sounds[b.dataset.soundReset] = await api(`/api/sounds/${b.dataset.soundReset}`, { method: "DELETE" });
+          toast("Вернул встроенный сигнал");
         }
-      })
-    );
+      } catch (err) {
+        showError(err);
+      }
+      repaintSounds();
+    });
+    box.addEventListener("change", async (ev) => {
+      const t = ev.target;
+      if (!t.dataset.soundUpload || !t.files || !t.files[0]) return;
+      try {
+        state.sounds[t.dataset.soundUpload] = await api(`/api/sounds/${t.dataset.soundUpload}`, {
+          method: "POST", headers: { "Content-Type": "audio/wav" }, body: t.files[0],
+        });
+        toast("Свой сигнал загружен");
+      } catch (err) {
+        showError(err);
+      }
+      repaintSounds();
+    });
     if (!state.ttsModels) loadTtsModels().then(() => { const el = $("#ttsModels"); if (el) el.innerHTML = modelsCard(); }).catch(() => {});
     $("#ttsModels").addEventListener("change", onModelsUpload);
     const restart = $("#ttsRestart");
@@ -1670,7 +1785,7 @@
     });
     $("#ttsBoard").addEventListener("click", async () => {
       try {
-        await postJson("/api/satellites/say", { text: $("#ttsText").value.trim(), voice: voice() });
+        await postJson("/api/satellites/say", { id: satId(), text: $("#ttsText").value.trim(), voice: voice() });
         toast("Говорю на колонке");
       } catch (err) {
         showError(err);
@@ -1701,8 +1816,8 @@
     const who = e.speaker ? `<span class="chip" style="--h:${hue(e.speaker)}">${esc(e.speaker)}</span>` : "";
     const b = e.rejected
       ? badge("bad", "x", "Отклонено")
-      : e.error && !e.reply
-        ? badge("bad", "alert", "Ошибка")
+      : e.error && (!e.reply || HA_ERRORS[e.error])
+        ? badge("bad", "alert", HA_ERRORS[e.error] ? "Не понял" : "Ошибка")
         : (e.actions || []).length
           ? badge("ok", "check", "Выполнено")
           : badge("", "info", "Ответ");
@@ -1714,14 +1829,44 @@
         <div class="utt-time">${fmtTime(e.ts)}</div>
         <div>${b}<div class="utt-meta" style="margin-top:4px">${esc(e.satellite === "panel" ? "из панели" : e.satellite || "")}</div></div>
         <div>
-          <div class="utt-head">${who}${e.duration_ms ? `<span class="utt-meta">${fmtDur(e.duration_ms)}</span>` : ""}</div>
+          <div class="utt-head">${who}${e.score != null && e.satellite !== "panel" ? `<span class="utt-meta" title="Похожесть на лучший записанный голос; порог в «Настройках»">голос ${pct(e.score)}</span>` : ""}${e.duration_ms ? `<span class="utt-meta">${fmtDur(e.duration_ms)}</span>` : ""}</div>
           <div class="event-text">«${esc(e.text || e.heard || "—")}»</div>
           ${e.reply ? `<div class="small" style="margin-top:4px">${icon("speaker")} ${esc(e.reply)}</div>` : ""}
           ${actions ? `<div style="margin-top:4px">${actions}</div>` : ""}
-          ${e.error ? `<div class="small bad" style="margin-top:4px">${esc(e.error)}</div>` : ""}
+          ${e.error ? `<div class="small bad" style="margin-top:4px">${esc(HA_ERRORS[e.error] || e.error)}</div>` : ""}
+          ${e.backend === "ha+openai" ? `<div class="small muted" style="margin-top:4px">HA не понял — ответила LLM</div>` : ""}
+          ${e.has_audio && (state.speakers || []).length ? `
+          <div class="row small" style="gap:6px;margin-top:6px;align-items:center">
+            ${e.learned ? `<span class="ok">${icon("check")} запомнил голос</span>` : `<span class="muted">Чей это голос?</span>
+            <select class="input" data-learn="${e.id}" style="max-width:180px;padding:2px 6px">
+              <option value="">выбрать…</option>
+              ${state.speakers.map((sp) => `<option value="${esc(sp.id)}">${esc(sp.name)}</option>`).join("")}
+            </select>`}
+          </div>` : ""}
         </div>
       </div>`;
   }
+
+  async function onLearnChange(ev) {
+    const t = ev.target;
+    if (!t.dataset.learn || !t.value) return;
+    t.disabled = true;
+    try {
+      const res = await postJson(`/api/assistant/log/${t.dataset.learn}/assign`, { speaker_id: t.value });
+      const e = state.assistantLog.find((x) => String(x.id) === t.dataset.learn);
+      if (e) Object.assign(e, { speaker: res.speaker.name, learned: true });
+      toast(`Запомнил: ${res.speaker.name} (записей: ${res.speaker.samples})`);
+      await loadSpeakers();
+    } catch (err) {
+      showError(err);
+    }
+    renderAssistantLog();
+  }
+
+  const HA_ERRORS = {
+    no_intent_match: "HA не знает такой фразы. Скажите как в шаблонах HA («какая температура на кухне») или включите «Если HA не понял — спросить LLM».",
+    no_valid_targets: "В HA нет устройства с таким именем (или оно не открыто для Assist). Добавьте псевдоним: Настройки → Голосовые ассистенты → Открыть доступ → устройство → Псевдонимы.",
+  };
 
   /* ---------------- local LLM (llama.cpp on this server) ---------------- */
   const LLM_STATES = { stopped: ["", "остановлена"], loading: ["warn live", "загружается в память"], ready: ["ok", "работает"], error: ["bad", "ошибка"] };
@@ -1777,7 +1922,7 @@
     el.innerHTML = `
       <div class="row between"><h3>${icon("robot")}Своя модель на этом сервере</h3>
         ${l.active ? `<span class="pill"><span class="dot ok"></span>ассистент использует её</span>` : ""}</div>
-      <p class="card-sub">LLM работает прямо на машине с Home Assistant (llama.cpp, только процессор), интернет не нужен. «Запустить и использовать» переключает «Кто отвечает» на LLM с адресом <span class="mono">${esc(l.url)}</span>.
+      <p class="card-sub">LLM работает прямо на машине с Home Assistant (llama.cpp, только процессор), интернет не нужен. «Запустить и использовать» ставит её адрес <span class="mono">${esc(l.url)}</span> в настройки LLM: ${l.fallback ? "агент HA остаётся главным, модель разбирает то, что он не понял" : "«Кто отвечает» переключается на LLM"}.
         Модели лежат в <span class="mono">${esc(l.dir)}</span>${l.disk_free != null ? ` (свободно ${fmtBytes(l.disk_free)})` : ""} — туда можно положить файл и через Samba.</p>
       ${l.available ? "" : banner("warn", "llama-server не найден", "Образ собран без него: обновите/переустановите дополнение. В Docker Compose используйте Ollama (поле «Адрес API» выше).")}
       ${l.state === "error" ? banner("bad", "Модель не запустилась", esc(l.error || "")) : ""}
@@ -1894,8 +2039,9 @@
           ])}
           <div data-show="ha">
             ${selectField("ha_agent_id", "Агент разговора HA", s.ha_agent_id, agents, "Встроенный понимает «включи свет на кухне» без интернета. Агент с ИИ (OpenAI, Ollama, Gemini) настраивается в HA.")}
+            ${switchField("llm_fallback", "Если HA не понял — спросить LLM", s.llm_fallback, "Встроенный агент знает только свои шаблоны («какая температура на кухне») и точные имена устройств. Остальное («выключи тв», «температура кухни») разберёт LLM ниже — своя модель на этом сервере или Ollama.")}
           </div>
-          <div data-show="openai">
+          <div data-show="openai ha">
             ${textField("llm_url", "Адрес API", s.llm_url, "Ollama на этом ПК: <span class='mono'>http://127.0.0.1:11434/v1</span> (в compose — <span class='mono'>http://host.docker.internal:11434/v1</span>)")}
             ${textField("llm_model", "Модель", s.llm_model, "Нужна модель с tool calling, например qwen2.5:7b или llama3.1:8b.")}
             ${textField("llm_api_key", "API-ключ", s.llm_api_key, "Для Ollama не нужен.", 'type="password"')}
@@ -1910,6 +2056,7 @@
           ${textField("wake_phrases", "Свои фразы (по тексту)", s.wake_phrases, "Через запятую, например: <span class='mono'>алекса, колонка, дом</span>. «Колонка, включи свет» выполнится целиком; просто «колонка» — колонка начнёт слушать команду. Пусто — выключено.")}
           ${selectField("wake_word", "Модель openWakeWord", s.wake_word, wake.length ? wake : [[s.wake_word, s.wake_word]], "Своё слово: положите обученную модель <span class='mono'>.onnx</span> в папку <span class='mono'>wakewords</span> дополнения и перезапустите.")}
           ${rangeField("wake_threshold", "Чувствительность", s.wake_threshold, 0.2, 0.9, 0.05, "pct", "Ниже — откликается легче (и чаще ошибается).", ["чутче", "строже"])}
+          ${rangeField("command_wait_s", "Сколько ждать команду", s.command_wait_s ?? 6, 2, 30, 1, "s", "После ключевого слова: если за это время не начать говорить, колонка перестаёт слушать.")}
           ${rangeField("command_silence_ms", "Пауза — конец команды", s.command_silence_ms, 300, 2000, 100, "ms")}
           ${selectField("wake_backend", "Где работает", s.wake_backend, [["local", "В этом дополнении (рекомендуется)"], ["wyoming", "Внешний Wyoming openWakeWord"]])}
           <div data-show-wake="wyoming">${textField("wake_uri", "Адрес Wyoming", s.wake_uri, "Аддон openWakeWord на HAOS: <span class='mono'>tcp://core-openwakeword:10400</span>")}</div>
@@ -1933,7 +2080,7 @@
 
     const syncShow = () => {
       const b = $("#f_assistant_backend").value;
-      $$("[data-show]", v).forEach((el) => { el.hidden = el.dataset.show !== b; });
+      $$("[data-show]", v).forEach((el) => { el.hidden = !el.dataset.show.split(" ").includes(b); });
       $$("[data-show-wake]", v).forEach((el) => { el.hidden = el.dataset.showWake !== $("#f_wake_backend").value; });
     };
     $("#f_assistant_backend").addEventListener("change", syncShow);
@@ -1941,6 +2088,8 @@
     syncShow();
     bindSettingsForm($("#asForm"));
     bindSettingsForm($("#wwForm"));
+    $("#asLog").addEventListener("change", onLearnChange);
+    if (!(state.speakers || []).length) loadSpeakers().then(renderAssistantLog).catch(() => {});
     renderLlm();
     $("#llmCard").addEventListener("click", onLlmClick);
     $("#llmCard").addEventListener("change", onLlmChange);
@@ -2004,6 +2153,13 @@
           ${rangeField("gate_threshold", "Порог узнавания голоса", s.gate_threshold, 0.3, 0.9, 0.01, "pct", "Ниже — легче пропускает (ТВ может проскочить). Выше — строже. Начните с 55–65%.", ["мягче", "строже"])}
           ${switchField("diary_known_only", "Не записывать в дневник неизвестные голоса", s.diary_known_only, "В дневнике останутся только записанные голоса. ТВ и гости не попадут.")}
           ${tvField(s, st)}
+          ${selectField("tv_duck", "Телевизор во время команды", s.tv_duck, [
+            ["volume", "Сделать тише"],
+            ["mute", "Выключить звук"],
+            ["pause", "Поставить на паузу"],
+            ["off", "Не трогать"],
+          ], "После ключевого слова ТВ стихает, пока колонка слушает и отвечает, потом всё возвращается как было. Если громкость за это время поменяли вручную — не трогаем.")}
+          ${rangeField("tv_duck_level", "Громкость ТВ на время команды", s.tv_duck_level ?? 25, 0, 90, 5, "vol", "Доля от текущей громкости телевизора.")}
           ${noVoices ? `<div class="hint warn">Голоса ещё не записаны — фильтры начнут работать после первой записи во вкладке «Голоса».</div>` : ""}
           ${saveRow()}
         </form>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import sqlite3
@@ -19,6 +20,7 @@ from stt_client import transcribe
 _LOGGER = logging.getLogger("ha-voice.dialogue")
 
 UNKNOWN = "__unknown__"
+DUP_WINDOW_S = 6.0
 
 _COLUMNS = "id, ts, speaker_id, speaker_name, score, text, duration_ms, has_audio, source"
 
@@ -335,6 +337,16 @@ class DialogueRuntime:
             finally:
                 self.queue.task_done()
 
+    def _duplicate(self, text: str, source: str | None) -> bool:
+        """Two boards in neighbouring rooms hear one phrase: keep it once."""
+        now = time.monotonic()
+        norm = " ".join(text.lower().replace("ё", "е").split()).strip(".,!?…")
+        recent = [r for r in getattr(self, "_recent_texts", []) if now - r[0] < DUP_WINDOW_S]
+        dup = any(src != source and difflib.SequenceMatcher(None, t, norm).ratio() >= 0.8 for _, src, t in recent)
+        recent.append((now, source, norm))
+        self._recent_texts = recent[-20:]
+        return dup
+
     async def process_utterance(
         self, pcm: bytes, force: bool = False, source: str | None = None
     ) -> dict[str, Any] | None:
@@ -365,6 +377,9 @@ class DialogueRuntime:
             except Exception:
                 _LOGGER.exception("phrase command failed")
         if not save:
+            return None
+        if not force and self._duplicate(text, source):
+            _LOGGER.debug("diary: same words from another board skipped: %s", text)
             return None
         if not force and not match.matched and self.keep_unknown is not None and not self.keep_unknown():
             self.skipped_unknown += 1

@@ -28,6 +28,21 @@ _ENTITIES_TEMPLATE = """
 {{ ns.rows | tojson }}
 """
 
+# The ESPHome device of a board (by MAC) and its area: HA uses the device's
+# area for "включи свет" without a room.
+_DEVICE_TEMPLATE = """
+{%- set ns = namespace(d='') -%}
+{%- for e in integration_entities('esphome') -%}
+{%- if not ns.d -%}
+{%- set d = device_id(e) -%}
+{%- if d and (device_attr(d, 'connections') | string | lower).find(MAC) >= 0 -%}{%- set ns.d = d -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{ [ns.d, (area_name(ns.d) if ns.d else '') or ''] | tojson }}
+"""
+_AREAS_TEMPLATE = "{{ areas() | map('area_name') | list | tojson }}"
+_AREA_DEVICE_TEMPLATE = "{{ (area_devices(AREA) | first) or '' }}"
+
 
 class HaError(RuntimeError):
     pass
@@ -87,6 +102,7 @@ class HaClient:
     def __init__(self, settings: SettingsStore) -> None:
         self.settings = settings
         self._session: aiohttp.ClientSession | None = None
+        self._device_id_ok = True
 
     def target(self) -> tuple[str, str] | None:
         s = self.settings.get()
@@ -146,6 +162,25 @@ class HaClient:
         rows = json.loads(raw) if isinstance(raw, str) else raw
         return [{"entity_id": r[0], "name": r[1], "state": r[2], "area": r[3]} for r in rows]
 
+    async def _template_json(self, tpl: str) -> Any:
+        raw = await self.request("POST", "/template", {"template": tpl})
+        return json.loads(raw) if isinstance(raw, str) else raw
+
+    async def device_for_mac(self, mac: str) -> tuple[str, str]:
+        """(device_id, area name) of the board in HA's ESPHome integration, or ('', '')."""
+        if not mac:
+            return "", ""
+        d, area = await self._template_json(_DEVICE_TEMPLATE.replace("MAC", json.dumps(mac.lower())))
+        return d or "", area or ""
+
+    async def areas(self) -> list[str]:
+        return list(await self._template_json(_AREAS_TEMPLATE))
+
+    async def area_device(self, area: str) -> str:
+        """Any device in the area: passed as device_id it gives HA the room context."""
+        raw = await self.request("POST", "/template", {"template": _AREA_DEVICE_TEMPLATE.replace("AREA", json.dumps(area))})
+        return str(raw).strip()
+
     async def state(self, entity_id: str) -> dict[str, Any]:
         return await self.request("GET", f"/states/{entity_id}")
 
@@ -153,13 +188,28 @@ class HaClient:
         return await self.request("POST", f"/services/{domain}/{service}", data)
 
     async def conversation(
-        self, text: str, agent_id: str | None, conversation_id: str | None, language: str = "ru"
+        self,
+        text: str,
+        agent_id: str | None,
+        conversation_id: str | None,
+        language: str = "ru",
+        device_id: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"text": text, "language": language}
         if agent_id:
             payload["agent_id"] = agent_id
         if conversation_id:
             payload["conversation_id"] = conversation_id
+        if device_id and self._device_id_ok:
+            try:
+                return await self.request("POST", "/conversation/process", {**payload, "device_id": device_id})
+            except HaError as err:
+                # older HA rejects unknown keys in this REST call: the room then
+                # comes only from the phrase itself
+                if " 400:" not in str(err):
+                    raise
+                _LOGGER.info("HA does not take device_id in /conversation/process: %s", err)
+                self._device_id_ok = False
         return await self.request("POST", "/conversation/process", payload)
 
     async def agents(self) -> list[dict[str, str]]:
