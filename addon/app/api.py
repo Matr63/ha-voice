@@ -594,6 +594,12 @@ def create_app(ctx: AppContext) -> web.Application:
                 e.update(speaker=meta["name"], learned=True)
         return web.json_response({"ok": True, "speaker": meta})
 
+    async def assistant_log_audio(request: web.Request) -> web.Response:
+        pcm = assistant.audio.get(int(request.match_info["entry_id"]))
+        if not pcm:
+            return _err("Запись команды уже не хранится", 404)
+        return web.Response(body=to_wav(pcm), content_type="audio/wav", headers={"Cache-Control": "no-cache"})
+
     async def assistant_log(request: web.Request) -> web.Response:
         return web.json_response({"log": assistant.history(int(request.query.get("limit", "100")))})
 
@@ -793,6 +799,7 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_get("/api/mode", mode_get)
     r.add_post("/api/mode", mode_set)
     r.add_get("/api/assistant/log", assistant_log)
+    r.add_get("/api/assistant/log/{entry_id:\\d+}/audio", assistant_log_audio)
     r.add_post("/api/assistant/log/{entry_id:\\d+}/assign", assistant_log_assign)
     r.add_post("/api/assistant/ask", assistant_ask)
     r.add_get("/api/assistant/agents", assistant_agents)

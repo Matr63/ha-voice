@@ -86,6 +86,8 @@ PING_EVERY_S = 5.0
 # after STT, so the window covers the recognition queue too
 CLAIM_WINDOW_S = 3.5
 WAKE_AUDIO_S = 1.5
+EMPTY_STREAK = 3
+WAKE_PAUSE_S = 60.0
 RATE_CHECK_S = 4.0
 WAKE_AUDIO_CHUNKS = 64   # board frames are 20-60 ms; trimmed to WAKE_AUDIO_S on use
 # the TV comes back by itself if a board never returns to idle
@@ -208,6 +210,8 @@ class Satellite:
         self.mute_until = 0.0
         self.command: CommandCapture | None = None
         self.thinking_since: float | None = None
+        self.empty_streak = 0
+        self.wake_pause_until = 0.0
         self.room = ""                # HA area: context for "включи свет" without a room
         self.room_source = ""         # "ha" (the board's device in HA) or "manual"
         self.ha_device_id: str | None = None
@@ -519,7 +523,9 @@ class Satellite:
         s = self.hub.settings.get()
         # utterances go through GigaAM for the diary and for phrase commands
         # ("алекса ...", "не спи"), even when the diary itself is off
-        if s.diary_enabled or self.hub.text_commands_enabled():
+        # not while a command is recorded or handled: that audio goes to STT once,
+        # as the command, and the recogniser is not kept busy with the diary meanwhile
+        if (s.diary_enabled or self.hub.text_commands_enabled()) and self.command is None and not self.busy:
             for seg in self.diary_seg.feed(pcm, s.diary_vad_rms, s.diary_silence_ms, s.diary_max_utterance_ms):
                 self.hub.runtime.submit(seg, source=self.id)
 
@@ -532,12 +538,17 @@ class Satellite:
             elif res:
                 silent, wake_pcm = self.command.silent, self.command.wake_pcm
                 self.command = None
+                self.diary_seg.reset()
                 self._spawn(self.run_command(res, silent=silent, wake_pcm=wake_pcm))
+                # the command is recorded: the TV may play again while it is handled
+                self._spawn(self.hub.unduck_tv(listening_only=True))
             return
 
         if self.busy:
             return
         score = await self.wake.feed(pcm)
+        if score is not None and time.monotonic() < self.wake_pause_until:
+            return
         if score is not None:
             self.last_wake = {"ts": time.time(), "score": round(score, 3), "word": s.wake_word}
             self.last_wake_ts = time.time()
@@ -600,6 +611,7 @@ class Satellite:
         if reason == "wake" and not self.hub.claim(self):
             return
         silent = reason == "wake" and self.hub.tv_guard()
+        self.diary_seg.reset()
         self.command = CommandCapture(reason, silent=silent)
         if reason == "wake":
             pre = b"".join(self.recent_audio)
@@ -649,20 +661,25 @@ class Satellite:
         if not text:
             entry["error"] = "Пустое распознавание"
             _LOGGER.info("%s: command STT empty (%d ms)", self.id, entry["duration_ms"])
+            self.empty_streak += 1
+            if self.empty_streak >= EMPTY_STREAK:
+                # the wake word keeps firing on noise (often the TV): rest a minute
+                self.wake_pause_until = time.monotonic() + WAKE_PAUSE_S
+                self.empty_streak = 0
+                entry["error"] = f"Пустое распознавание {EMPTY_STREAK} раза подряд — ключевое слово отдыхает {int(WAKE_PAUSE_S)} с"
+                _LOGGER.warning("%s: %d empty commands in a row, wake word paused", self.id, EMPTY_STREAK)
             hub.assistant.record(entry, pcm)
             if hub.tv_guard():
                 await self.go_idle()
             else:
                 await self.flash_error()
             return
+        self.empty_streak = 0
         if await self.mode_phrase(text, explicit=True):
             return
         self.busy = True
         try:
-            if hub.voice_allowed(match):
-                # "колонка, выключи свет" in one breath: the TV is lowered for the answer
-                self._spawn(hub.duck_tv())
-            else:
+            if not hub.voice_allowed(match):
                 tv = hub.tv_guard()
                 entry.update(
                     rejected=True,
@@ -853,9 +870,9 @@ class SatelliteHub:
                         return
                     await self.ha.call_service("media_player", "media_pause", {"entity_id": entity})
                     saved: dict[str, Any] = {"mode": "pause"}
+                elif attrs.get("is_volume_muted"):
+                    return  # already silent: touching the volume would unmute some TVs
                 elif mode == "mute" or vol is None:
-                    if attrs.get("is_volume_muted"):
-                        return
                     await self.ha.call_service("media_player", "volume_mute", {"entity_id": entity, "is_volume_muted": True})
                     saved = {"mode": "mute"}
                 else:
@@ -878,13 +895,17 @@ class SatelliteHub:
         self._duck_timer = None
         await self.unduck_tv(force=True)
 
-    async def unduck_tv(self, force: bool = False) -> None:
-        """Back to how it was, once no board is listening, thinking or answering."""
+    async def unduck_tv(self, force: bool = False, listening_only: bool = False) -> None:
+        """Back to how it was, once no board is listening (listening_only: the command
+        is recorded) or, by default, listening, thinking or answering."""
         if self._ducked is None and not self._duck_lock.locked():
             return
         # waits for a duck still in flight, so a quick "no command" does not leave the TV low
         async with self._duck_lock:
-            busy = [x for x in self.satellites.values() if x.state not in (ST_IDLE, ST_SLEEP, ST_ERROR)]
+            if listening_only:
+                busy = [x for x in self.satellites.values() if x.command is not None]
+            else:
+                busy = [x for x in self.satellites.values() if x.state not in (ST_IDLE, ST_SLEEP, ST_ERROR)]
             if self._ducked is None or (busy and not force):
                 return
             saved, self._ducked = self._ducked, None
@@ -973,17 +994,17 @@ class SatelliteHub:
 
     # -------------------------------------------------------------- TV
     def tv_guard(self) -> bool:
-        """TV playing and voices enrolled: unknown voices are treated as the TV."""
-        return self.tv_on and self.runtime.store.has_speakers()
+        """TV playing, voices enrolled and «Отказывать незнакомым» on: unknown voices
+        are treated as the TV (stricter threshold, wake word shows nothing)."""
+        return self.tv_on and self.runtime.store.has_speakers() and self.settings.get().gate_require_match
 
     def voice_allowed(self, match: Any) -> bool:
         s = self.settings.get()
-        if not self.runtime.store.has_speakers():
+        if not self.runtime.store.has_speakers() or not s.gate_require_match:
             return True
         if self.tv_guard():
-            # stricter while the TV talks, even if the filter is off
             return bool(match.matched) and float(match.score) >= min(0.95, s.gate_threshold + 0.1)
-        return bool(match.matched) or not s.gate_require_match
+        return bool(match.matched)
 
     def keep_unknown_in_diary(self) -> bool:
         if not self.runtime.store.has_speakers():

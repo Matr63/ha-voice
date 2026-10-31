@@ -1887,6 +1887,7 @@
           ${actions ? `<div style="margin-top:4px">${actions}</div>` : ""}
           ${e.error ? `<div class="small bad" style="margin-top:4px">${esc(HA_ERRORS[e.error] || e.error)}</div>` : ""}
           ${e.backend === "ha+openai" ? `<div class="small muted" style="margin-top:4px">HA не понял — ответила LLM</div>` : ""}
+          ${e.has_audio ? `<audio controls preload="none" src="${BASE}/api/assistant/log/${e.id}/audio" style="height:30px;margin-top:6px;max-width:100%"></audio>` : ""}
           ${e.has_audio && (state.speakers || []).length ? `
           <div class="row small" style="gap:6px;margin-top:6px;align-items:center">
             ${e.learned ? `<span class="ok">${icon("check")} запомнил голос</span>` : `<span class="muted">Чей это голос?</span>
@@ -2184,7 +2185,7 @@
     const tv = (st && st.tv) || {};
     const players = state.mediaPlayers;
     const now = tv.entity ? ` Сейчас: <b>${tv.on ? "включён" : "выключен"}</b>${tv.state ? ` (${esc(tv.state)})` : ""}.` : "";
-    const hint = `Пока ТВ включён: его речь не пишется в дневник, команды выполняются только знакомым голосам с порогом +10%, а ключевое слово из ТВ не зажигает кольцо.${now}`;
+    const hint = `Пока ТВ включён, его речь не пишется в дневник. Если включено «Отказывать незнакомым голосам»: команды выполняются только знакомым голосам с порогом +10%, а ключевое слово из ТВ не зажигает кольцо.${now}`;
     if (!players) return textField("tv_entity", "Телевизор (media_player)", s.tv_entity, hint, 'placeholder="media_player.televizor"');
     const opts = [["", "— не выбран —"], ...players.map((p) => [p.id, `${p.name} (${p.state})`])];
     if (s.tv_entity && !players.some((p) => p.id === s.tv_entity)) opts.push([s.tv_entity, s.tv_entity]);
@@ -2222,7 +2223,7 @@
             ["mute", "Выключить звук"],
             ["pause", "Поставить на паузу"],
             ["off", "Не трогать"],
-          ], "После ключевого слова ТВ стихает, пока колонка слушает и отвечает, потом всё возвращается как было. Если громкость за это время поменяли вручную — не трогаем.")}
+          ], "После ключевого слова ТВ стихает, пока вы говорите команду, и возвращается, как только команда записана. Если звук на ТВ уже выключен — не трогаем; если громкость за это время поменяли вручную — тоже.")}
           ${rangeField("tv_duck_level", "Громкость ТВ на время команды", s.tv_duck_level ?? 25, 0, 90, 5, "vol", "Доля от текущей громкости телевизора.")}
           ${noVoices ? `<div class="hint warn">Голоса ещё не записаны — фильтры начнут работать после первой записи во вкладке «Голоса».</div>` : ""}
           ${saveRow()}
