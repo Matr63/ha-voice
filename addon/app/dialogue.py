@@ -227,6 +227,9 @@ class DialogueRuntime:
         self.stt_empty = 0
         # satellite hub: phrase commands ("алекса ...", "не спи") from every utterance
         self.on_transcript: Callable[[str | None, str, Any, bytes], Awaitable[None]] | None = None
+        # satellite hub: False -> unknown voices (the TV) are not written to the diary
+        self.keep_unknown: Callable[[], bool] | None = None
+        self.skipped_unknown = 0
         self.queue: asyncio.Queue[tuple[bytes, str | None]] | None = None
         self._worker_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -362,6 +365,10 @@ class DialogueRuntime:
             except Exception:
                 _LOGGER.exception("phrase command failed")
         if not save:
+            return None
+        if not force and not match.matched and self.keep_unknown is not None and not self.keep_unknown():
+            self.skipped_unknown += 1
+            _LOGGER.debug("diary: unknown voice skipped (%.2f): %s", match.score, text)
             return None
         async with self._lock:
             keep = s.diary_keep_audio

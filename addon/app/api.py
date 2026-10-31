@@ -134,6 +134,7 @@ def create_app(ctx: AppContext) -> web.Application:
                     "queued": runtime.queued(),
                     "dropped": runtime.dropped,
                     "stt_empty": runtime.stt_empty,
+                    "skipped_unknown": runtime.skipped_unknown,
                 },
                 "satellites": hub.list(),
                 "wake": {
@@ -143,6 +144,7 @@ def create_app(ctx: AppContext) -> web.Application:
                     "phrases": s.wake_phrases,
                 },
                 "mode": hub.modes.status(),
+                "tv": {"entity": s.tv_entity, "on": hub.tv_on, "state": hub.tv_state, "guard": hub.tv_guard()},
                 "assistant": {
                     "backend": s.assistant_backend,
                     "ha_configured": ctx.ha.configured,
@@ -455,6 +457,15 @@ def create_app(ctx: AppContext) -> web.Application:
     async def assistant_agents(_: web.Request) -> web.Response:
         return web.json_response({"agents": await ctx.ha.agents()})
 
+    async def ha_media_players(_: web.Request) -> web.Response:
+        states = await ctx.ha.request("GET", "/states")
+        players = [
+            {"id": x["entity_id"], "name": (x.get("attributes") or {}).get("friendly_name") or x["entity_id"], "state": x.get("state")}
+            for x in states
+            if x.get("entity_id", "").startswith("media_player.")
+        ]
+        return web.json_response({"players": sorted(players, key=lambda p: p["name"])})
+
     async def ha_status(_: web.Request) -> web.Response:
         return web.json_response(await ctx.ha.ping())
 
@@ -553,6 +564,7 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_post("/api/assistant/ask", assistant_ask)
     r.add_get("/api/assistant/agents", assistant_agents)
     r.add_get("/api/ha", ha_status)
+    r.add_get("/api/ha/media_players", ha_media_players)
     r.add_get("/api/wake/models", wake_models)
     r.add_get("/api/firmware", firmware_info)
     r.add_post("/api/firmware/fetch", firmware_fetch)

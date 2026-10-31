@@ -59,6 +59,9 @@ class Settings:
     tts_voice: str = "sveta"
     # satellite (Waveshare board)
     sat_volume: int = 60
+    # TV next to the board: diary for known voices only, stricter commands while it plays
+    diary_known_only: bool = False
+    tv_entity: str = ""             # media_player.* in Home Assistant
     sat_mic_gain: int = 36          # ES7210 hardware gain, dB (3 dB steps)
     sat_led_brightness: int = 80
     mic_boost_db: int = 18          # digital gain on the PC: Waveshare mics are quiet

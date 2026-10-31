@@ -56,7 +56,7 @@ async def amain() -> None:
     ha = HaClient(settings)
     assistant = Assistant(settings, ha)
     modes = Modes(settings)
-    hub = SatelliteHub(settings, runtime, assistant, stt_uri, tts_uri, modes)
+    hub = SatelliteHub(settings, runtime, assistant, stt_uri, tts_uri, modes, ha)
     firmware = FirmwareStore(Path(os.environ.get("FIRMWARE_DIR", "/data/firmware")))
     ctx = AppContext(
         settings=settings,

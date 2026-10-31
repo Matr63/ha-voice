@@ -155,8 +155,9 @@ class CommandCapture:
 
     TIMEOUT = object()
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, silent: bool = False) -> None:
         self.reason = reason
+        self.silent = silent  # TV on: show nothing until the voice is recognised
         self.seg = Segmenter(preroll_ms=200)
         self.started = time.monotonic()
 
@@ -376,8 +377,9 @@ class Satellite:
                 self.command = None
                 await self.go_idle()
             elif res:
+                silent = self.command.silent
                 self.command = None
-                self._spawn(self.run_command(res))
+                self._spawn(self.run_command(res, silent=silent))
             return
 
         if self.busy:
@@ -441,15 +443,18 @@ class Satellite:
 
     # ---------------------------------------------------------- dialogue
     async def start_command(self, reason: str) -> None:
-        self.command = CommandCapture(reason)
-        await self.set_state(ST_LISTENING)
+        silent = reason == "wake" and self.hub.tv_guard()
+        self.command = CommandCapture(reason, silent=silent)
+        if not silent:
+            await self.set_state(ST_LISTENING)
 
-    async def run_command(self, pcm: bytes) -> None:
+    async def run_command(self, pcm: bytes, silent: bool = False) -> None:
         hub = self.hub
         s = hub.settings.get()
         self.busy = True
         try:
-            await self.set_state(ST_THINKING)
+            if not silent:
+                await self.set_state(ST_THINKING)
             match_task = asyncio.create_task(asyncio.to_thread(hub.runtime.store.match, pcm))
             raw = await transcribe(hub.stt_uri, pcm)
             match = await match_task
@@ -468,7 +473,6 @@ class Satellite:
 
     async def run_text(self, text: str, match: Any, pcm: bytes, heard: str = "") -> None:
         hub = self.hub
-        s = hub.settings.get()
         speaker = match.name if match.matched else None
         entry: dict[str, Any] = {
             "satellite": self.id,
@@ -482,20 +486,31 @@ class Satellite:
             entry["error"] = "Пустое распознавание"
             _LOGGER.info("%s: command STT empty (%d ms)", self.id, entry["duration_ms"])
             hub.assistant.record(entry)
-            await self.flash_error()
+            if hub.tv_guard():
+                await self.go_idle()
+            else:
+                await self.flash_error()
             return
         if await self.mode_phrase(text, explicit=True):
             return
         self.busy = True
         try:
+            if not hub.voice_allowed(match):
+                tv = hub.tv_guard()
+                entry.update(
+                    rejected=True,
+                    error="Голос не узнан, включён ТВ — команда отклонена" if tv else "Голос не узнан — команда отклонена",
+                )
+                _LOGGER.info("%s: command rejected, unknown voice (%.2f, tv=%s): %s", self.id, match.score, tv, text)
+                hub.assistant.record(entry)
+                # with the TV on this is most likely the TV itself: stay dark
+                if tv:
+                    await self.go_idle()
+                else:
+                    self._spawn(self.flash_error())
+                return
             if self.state != ST_THINKING:
                 await self.set_state(ST_THINKING)
-            if s.gate_require_match and hub.runtime.store.has_speakers() and not match.matched:
-                entry.update(rejected=True, error="Голос не узнан — команда отклонена")
-                _LOGGER.info("%s: command rejected, unknown voice (%.2f): %s", self.id, match.score, text)
-                hub.assistant.record(entry)
-                self._spawn(self.flash_error())
-                return
             result = await hub.assistant.handle(text, conv_key=self.id, speaker=speaker)
             entry.update(
                 reply=result.speech,
@@ -589,12 +604,23 @@ class Satellite:
 
 class SatelliteHub:
     def __init__(
-        self, settings: SettingsStore, runtime: Any, assistant: Any, stt_uri: str, tts_uri: str, modes: Modes
+        self,
+        settings: SettingsStore,
+        runtime: Any,
+        assistant: Any,
+        stt_uri: str,
+        tts_uri: str,
+        modes: Modes,
+        ha: Any = None,
     ) -> None:
         self.settings = settings
         self.modes = modes
+        self.ha = ha
         self.runtime = runtime
+        self.tv_on = False
+        self.tv_state: str | None = None
         runtime.on_transcript = self._on_transcript
+        runtime.keep_unknown = self.keep_unknown_in_diary
         self.assistant = assistant
         self.stt_uri = stt_uri
         self.tts_uri = tts_uri
@@ -654,6 +680,40 @@ class SatelliteHub:
         for sat in list(self.satellites.values()):
             if sat.state in (ST_IDLE, ST_SLEEP) and sat.state != sat.idle_state():
                 await sat.go_idle()
+
+    # -------------------------------------------------------------- TV
+    def tv_guard(self) -> bool:
+        """TV playing and voices enrolled: unknown voices are treated as the TV."""
+        return self.tv_on and self.runtime.store.has_speakers()
+
+    def voice_allowed(self, match: Any) -> bool:
+        s = self.settings.get()
+        if not self.runtime.store.has_speakers():
+            return True
+        if self.tv_guard():
+            # stricter while the TV talks, even if the filter is off
+            return bool(match.matched) and float(match.score) >= min(0.95, s.gate_threshold + 0.1)
+        return bool(match.matched) or not s.gate_require_match
+
+    def keep_unknown_in_diary(self) -> bool:
+        if not self.runtime.store.has_speakers():
+            return True
+        return not (self.settings.get().diary_known_only or self.tv_on)
+
+    async def tv_loop(self) -> None:
+        while True:
+            entity = self.settings.get().tv_entity.strip()
+            on, state = False, None
+            if entity and self.ha is not None and self.ha.configured:
+                try:
+                    state = (await self.ha.state(entity)).get("state")
+                    on = state in ("on", "playing", "buffering", "paused")
+                except Exception as err:
+                    _LOGGER.debug("TV state %s: %s", entity, err)
+            if on != self.tv_on:
+                _LOGGER.info("TV %s %s (%s)", entity, "ON" if on else "OFF", state)
+            self.tv_on, self.tv_state = on, state
+            await asyncio.sleep(10)
 
     async def mode_loop(self) -> None:
         while True:
@@ -719,6 +779,7 @@ class SatelliteHub:
     async def serve(self, host: str, port: int) -> None:
         self.runtime.start()
         self._mode_task = asyncio.create_task(self.mode_loop())
+        self._tv_task = asyncio.create_task(self.tv_loop())
         server = await asyncio.start_server(self.handle_client, host=host, port=port)
         _LOGGER.info("Satellite server on %s:%s", host, port)
         async with server:

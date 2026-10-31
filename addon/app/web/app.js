@@ -1648,6 +1648,17 @@
   }
 
   /* ---------------- settings ---------------- */
+  function tvField(s, st) {
+    const tv = (st && st.tv) || {};
+    const players = state.mediaPlayers;
+    const now = tv.entity ? ` Сейчас: <b>${tv.on ? "включён" : "выключен"}</b>${tv.state ? ` (${esc(tv.state)})` : ""}.` : "";
+    const hint = `Пока ТВ включён: его речь не пишется в дневник, команды выполняются только знакомым голосам с порогом +10%, а ключевое слово из ТВ не зажигает кольцо.${now}`;
+    if (!players) return textField("tv_entity", "Телевизор (media_player)", s.tv_entity, hint, 'placeholder="media_player.televizor"');
+    const opts = [["", "— не выбран —"], ...players.map((p) => [p.id, `${p.name} (${p.state})`])];
+    if (s.tv_entity && !players.some((p) => p.id === s.tv_entity)) opts.push([s.tv_entity, s.tv_entity]);
+    return selectField("tv_entity", "Телевизор", s.tv_entity, opts, hint);
+  }
+
   function renderSettings() {
     const v = view("settings");
     const s = state.settings;
@@ -1657,6 +1668,7 @@
       return;
     }
     const ha = state.ha;
+    const noVoices = !st || !st.speakers;
     const haLine = !ha ? "проверяю…" : ha.ok ? `подключено · Home Assistant ${esc(ha.version || "")}` : esc(ha.error || "нет доступа");
     v.innerHTML = `
       <div class="grid grid-2">
@@ -1671,6 +1683,9 @@
           <h3>${icon("shield")}Чьи команды выполнять</h3>
           ${switchField("gate_require_match", "Отказывать незнакомым голосам и ТВ", s.gate_require_match, "Пока не записан ни один голос, выполняются все команды.")}
           ${rangeField("gate_threshold", "Порог узнавания голоса", s.gate_threshold, 0.3, 0.9, 0.01, "pct", "Ниже — легче пропускает (ТВ может проскочить). Выше — строже. Начните с 55–65%.", ["мягче", "строже"])}
+          ${switchField("diary_known_only", "Не записывать в дневник неизвестные голоса", s.diary_known_only, "В дневнике останутся только записанные голоса. ТВ и гости не попадут.")}
+          ${tvField(s, st)}
+          ${noVoices ? `<div class="hint warn">Голоса ещё не записаны — фильтры начнут работать после первой записи во вкладке «Голоса».</div>` : ""}
           ${saveRow()}
         </form>
       </div>
@@ -1707,10 +1722,13 @@
       </div>`;
     const reload = async () => {
       state.ha = await api("/api/ha").catch((err) => ({ ok: false, error: err.message }));
+      state.mediaPlayers = state.ha && state.ha.ok
+        ? ((await api("/api/ha/media_players").catch(() => ({}))).players || null)
+        : null;
       renderSettings();
     };
     bindSettingsForm($("#haForm"), reload);
-    bindSettingsForm($("#gateForm"));
+    bindSettingsForm($("#gateForm"), async () => renderSettings());
     bindSettingsForm($("#diaryForm"));
     if (!ha) reload();
   }
