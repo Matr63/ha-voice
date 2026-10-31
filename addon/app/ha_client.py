@@ -31,6 +31,11 @@ class HaError(RuntimeError):
     pass
 
 
+def supervisor_token() -> str | None:
+    # HASSIO_TOKEN is the older name the Supervisor still sets next to SUPERVISOR_TOKEN
+    return os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN") or None
+
+
 class HaClient:
     def __init__(self, settings: SettingsStore) -> None:
         self.settings = settings
@@ -40,7 +45,7 @@ class HaClient:
         s = self.settings.get()
         if s.ha_url and s.ha_token:
             return s.ha_url.rstrip("/") + "/api", s.ha_token
-        token = os.environ.get("SUPERVISOR_TOKEN")
+        token = supervisor_token()
         if token:
             return "http://supervisor/core/api", token
         return None
@@ -77,7 +82,12 @@ class HaClient:
 
     async def ping(self) -> dict[str, Any]:
         if not self.configured:
-            return {"ok": False, "error": "не настроен"}
+            tokens = sorted(k for k in os.environ if "TOKEN" in k)
+            return {
+                "ok": False,
+                "error": "не настроен: нет токена Supervisor и не заданы адрес/токен HA",
+                "env_tokens": tokens,
+            }
         try:
             cfg = await self.request("GET", "/config")
             return {"ok": True, "version": cfg.get("version"), "location": cfg.get("location_name")}

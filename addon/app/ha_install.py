@@ -15,6 +15,8 @@ from pathlib import Path
 
 import aiohttp
 
+from ha_client import supervisor_token
+
 _LOGGER = logging.getLogger("ha-voice.install")
 
 SOURCE = Path(os.environ.get("INTEGRATION_SRC", "/app/integration/ha_voice"))
@@ -49,7 +51,7 @@ def copy_integration() -> bool:
 
 
 async def _supervisor(session: aiohttp.ClientSession, method: str, path: str, payload: dict) -> None:
-    token = os.environ["SUPERVISOR_TOKEN"]
+    token = supervisor_token()
     async with session.request(
         method, f"http://supervisor{path}", json=payload, headers={"Authorization": f"Bearer {token}"}
     ) as resp:
@@ -58,7 +60,9 @@ async def _supervisor(session: aiohttp.ClientSession, method: str, path: str, pa
 
 
 async def run(api_port: int) -> None:
-    if not os.environ.get("SUPERVISOR_TOKEN"):
+    if not supervisor_token():
+        tokens = sorted(k for k in os.environ if "TOKEN" in k)
+        _LOGGER.info("No Supervisor token (env: %s) — integration auto-install skipped", tokens or "none")
         return  # docker compose: the integration is installed by hand / HACS
     try:
         changed = await asyncio.to_thread(copy_integration)

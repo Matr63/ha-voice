@@ -143,7 +143,8 @@ else
 fi
 
 echo "[ha-voice] starting HA Voice (колонка :10500, UI :8088, Wyoming STT :10350 — необязательно)"
-python3 /app/main.py >"${GATE_LOG}" 2>&1 &
+# also mirrored to the add-on log, so HA access / satellite issues are visible there
+python3 /app/main.py > >(tee "${GATE_LOG}") 2>&1 &
 GATE_PID=$!
 
 API_OK=0
