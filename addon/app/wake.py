@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,12 @@ def match_prefix(text: str, phrases: list[str]) -> tuple[str, str] | None:
     return None
 
 
+# Two boards load their models in parallel threads; importing openwakeword from
+# both at once fails with "partially initialized module".
+_LOAD_LOCK = threading.Lock()
+RETRY_FAILED_S = 30.0
+
+
 def _resolve_model(name: str) -> str:
     custom = custom_dir() / f"{name}.onnx"
     if custom.is_file():
@@ -87,10 +94,11 @@ class LocalWake:
     """openWakeWord running in this process. One instance per satellite stream."""
 
     def __init__(self, model: str) -> None:
-        from openwakeword.model import Model  # heavy import, only when used
+        with _LOAD_LOCK:
+            from openwakeword.model import Model  # heavy import, only when used
 
-        self.name = model
-        self._model = Model(wakeword_models=[_resolve_model(model)], inference_framework="onnx")
+            self.name = model
+            self._model = Model(wakeword_models=[_resolve_model(model)], inference_framework="onnx")
         self._buf = np.zeros(0, dtype=np.int16)
         self._last_hit = 0.0
         self.last_score = 0.0
@@ -205,6 +213,7 @@ class WakeDetector:
         self._key: tuple[str, str, str] | None = None
         self.error: str | None = None
         self._failed_key: tuple[str, str, str] | None = None
+        self._failed_at = 0.0
 
     @property
     def last_score(self) -> float:
@@ -213,7 +222,9 @@ class WakeDetector:
     async def _ensure(self) -> None:
         s = self.settings.get()
         key = (s.wake_backend, s.wake_word, s.wake_uri)
-        if key == self._key or key == self._failed_key:
+        if key == self._key:
+            return
+        if key == self._failed_key and time.monotonic() - self._failed_at < RETRY_FAILED_S:
             return
         await self.close()
         if s.wake_word == NO_MODEL:
@@ -233,6 +244,7 @@ class WakeDetector:
             _LOGGER.exception("Wake word '%s' failed to load", s.wake_word)
             self.error = f"{type(err).__name__}: {err}"
             self._failed_key = key
+            self._failed_at = time.monotonic()
 
     async def feed(self, pcm: bytes) -> float | None:
         await self._ensure()
