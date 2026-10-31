@@ -26,6 +26,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "sat_led_brightness": (0, 100),
     "mic_boost_db": (0, 36),
     "llm_threads": (0, 64),
+    "sound_volume": (10, 100),
     "llm_ctx": (2048, 32768),
 }
 
@@ -61,6 +62,10 @@ class Settings:
     tts_voice: str = "sveta"
     # satellite (Waveshare board)
     sat_volume: int = 60
+    # short sounds on the board: "listening" after the wake word, and errors
+    sound_wake: bool = True
+    sound_error: bool = True
+    sound_volume: int = 60
     # TV next to the board: diary for known voices only, stricter commands while it plays
     diary_known_only: bool = False
     tv_entity: str = ""             # media_player.* in Home Assistant

@@ -56,7 +56,6 @@ mkdir -p /data/models /data/speakers /data/dialogues /tmp/ha-voice-logs
 
 export HF_HOME=/data/models
 export HUGGINGFACE_HUB_CACHE=/data/models
-export TRANSFORMERS_CACHE=/data/models
 export HF_HUB_CACHE=/data/models
 # a stalled HuggingFace connection must fail, not hang the loader forever
 export HF_HUB_DOWNLOAD_TIMEOUT=60

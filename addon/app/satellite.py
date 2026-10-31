@@ -22,7 +22,17 @@ from typing import Any
 
 import numpy as np
 
-from audio_utils import TARGET_RATE, apply_gain, duration_ms, normalize_pcm, pcm16_to_float, rms, split_stereo
+from audio_utils import (
+    EARCON_RATE,
+    TARGET_RATE,
+    apply_gain,
+    duration_ms,
+    earcon,
+    normalize_pcm,
+    pcm16_to_float,
+    rms,
+    split_stereo,
+)
 from modes import Modes
 from settings import SettingsStore
 from stt_client import transcribe
@@ -275,7 +285,21 @@ class Satellite:
     async def go_idle(self) -> None:
         await self.set_state(self.idle_state())
 
+    async def play_earcon(self, kind: str) -> None:
+        """A short sound through the TTS path; the mic is ignored while it plays."""
+        if not self.can_speak or self.speaking:
+            return
+        pcm = earcon(kind, self.hub.settings.get().sound_volume)
+        # playback + Wi-Fi + the board's resampler buffer
+        self.mute_until = max(self.mute_until, time.monotonic() + len(pcm) / 2 / EARCON_RATE + 0.35)
+        await self.send(T_TTS_START, rate=EARCON_RATE, channels=1, bits=16)
+        for i in range(0, len(pcm), TTS_CHUNK):
+            await self.send(T_AUDIO, pcm[i : i + TTS_CHUNK], rate=EARCON_RATE, channels=1, bits=16)
+        await self.send(T_TTS_END)
+
     async def flash_error(self) -> None:
+        if self.hub.settings.get().sound_error:
+            await self.play_earcon("error")
         await self.set_state(ST_ERROR)
         await asyncio.sleep(2)
         if self.state == ST_ERROR:
@@ -449,6 +473,8 @@ class Satellite:
         self.command = CommandCapture(reason, silent=silent)
         if not silent:
             await self.set_state(ST_LISTENING)
+            if self.hub.settings.get().sound_wake:
+                await self.play_earcon("wake")
 
     async def run_command(self, pcm: bytes, silent: bool = False) -> None:
         hub = self.hub

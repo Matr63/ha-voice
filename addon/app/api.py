@@ -19,6 +19,7 @@ from firmware import BOARDS, KINDS, FirmwareStore, board_key, file_name
 from gate_server import GateState
 from ha_client import HaClient, HaError
 from llm import PRESETS, LlmManager
+import models_archive
 from satellite import SatelliteHub
 from settings import SettingsStore
 from speakers import SpeakerStore
@@ -413,10 +414,8 @@ def create_app(ctx: AppContext) -> web.Application:
             return _err(str(err) or "TTS не ответил — смотрите журнал дополнения", 503)
         return web.Response(body=wav, content_type="audio/wav", headers={"Cache-Control": "no-store"})
 
-    async def tts_restart(_: web.Request) -> web.Response:
+    def restart_tts() -> None:
         """run.sh restarts Kokoro when it exits; the flag skips its back-off."""
-        if not ctx.tts_enabled:
-            return _err("Озвучка Kokoro выключена в конфигурации дополнения")
         Path("/tmp/ha-voice-tts-restart").touch()
         pid = tts_state().get("pid")
         if pid:
@@ -424,7 +423,49 @@ def create_app(ctx: AppContext) -> web.Application:
                 os.kill(int(pid), signal.SIGTERM)
             except (OSError, ValueError):
                 pass
+
+    async def tts_restart(_: web.Request) -> web.Response:
+        if not ctx.tts_enabled:
+            return _err("Озвучка Kokoro выключена в конфигурации дополнения")
+        restart_tts()
         return web.json_response({"ok": True})
+
+    models_tmp = Path(os.environ.get("HF_HOME", "/data/models"))
+
+    async def tts_models(_: web.Request) -> web.Response:
+        return web.json_response(await asyncio.to_thread(models_archive.status))
+
+    async def tts_models_export(request: web.Request) -> web.StreamResponse:
+        path = await asyncio.to_thread(models_archive.export, models_tmp / ".ha-voice-models.zip")
+        resp = web.StreamResponse(
+            headers={
+                "Content-Type": "application/zip",
+                "Content-Disposition": 'attachment; filename="ha-voice-kokoro-models.zip"',
+                "Content-Length": str(path.stat().st_size),
+                "Cache-Control": "no-store",
+            }
+        )
+        await resp.prepare(request)
+        try:
+            with open(path, "rb") as fh:
+                while chunk := await asyncio.to_thread(fh.read, 1024 * 1024):
+                    await resp.write(chunk)
+        finally:
+            models_archive.cleanup(path)
+        await resp.write_eof()
+        return resp
+
+    async def tts_models_import(request: web.Request) -> web.Response:
+        # streamed to disk: the archive is ~0.5 GB, far over client_max_size
+        tmp = models_tmp / ".ha-voice-import.zip"
+        try:
+            await models_archive.receive(request.content.iter_chunked(1024 * 1024), tmp)
+            result = await asyncio.to_thread(models_archive.install, tmp)
+        finally:
+            models_archive.cleanup(tmp)
+        if ctx.tts_enabled:
+            restart_tts()
+        return web.json_response(result)
 
     async def capture_enroll(request: web.Request) -> web.Response:
         pcm = runtime.capture_pcm()
@@ -457,6 +498,17 @@ def create_app(ctx: AppContext) -> web.Application:
             raise ValueError("Эта прошивка не умеет говорить — обновите колонку до прошивки HA Voice")
         sat.say(text, data.get("voice") or None)
         return web.json_response({"ok": True, "satellite": sat.id})
+
+    async def satellite_earcon(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        sound = data.get("sound") or "wake"
+        if sound not in ("wake", "error"):
+            raise ValueError("Сигнал: wake или error")
+        sat = _satellite(data)
+        if not sat.can_speak:
+            raise ValueError("Эта прошивка не умеет воспроизводить звук")
+        await sat.play_earcon(sound)
+        return web.json_response({"ok": True})
 
     async def satellite_volume(request: web.Request) -> web.Response:
         data = await _json_obj(request)
@@ -665,9 +717,13 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_post("/api/capture/enroll", capture_enroll)
     r.add_post("/api/tts", tts_speak)
     r.add_post("/api/tts/restart", tts_restart)
+    r.add_get("/api/tts/models", tts_models)
+    r.add_get("/api/tts/models.zip", tts_models_export)
+    r.add_post("/api/tts/models", tts_models_import)
     r.add_get("/api/satellites", satellites_list)
     r.add_post("/api/satellites/say", satellite_say)
     r.add_post("/api/satellites/volume", satellite_volume)
+    r.add_post("/api/satellites/earcon", satellite_earcon)
     r.add_post("/api/satellites/listen", satellite_listen)
     r.add_post("/api/satellites/microphone", satellite_listen_switch)
     r.add_get("/api/mode", mode_get)

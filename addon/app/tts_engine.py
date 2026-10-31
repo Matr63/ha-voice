@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -73,9 +74,35 @@ def read_state() -> dict[str, Any]:
         return {}
 
 
+RUACCENT_REPO = "ruaccent/accentuator"
+RUACCENT_DONE = ".ha-voice-complete"
+OMOGRAPH_MODEL = "turbo3.1"  # what ru_g2p.py asks for
+REFRESH_EVERY_S = 7 * 24 * 3600
+
+
+def ruaccent_patterns(omograph: str = OMOGRAPH_MODEL) -> list[str]:
+    """The part of ruaccent/accentuator that RUAccent.load() reads."""
+    return [
+        "dictionary/*",
+        "nn/nn_accent/*",
+        "nn/nn_stress_usage_predictor/*",
+        "nn/nn_yo_homograph_resolver/*",
+        f"nn/nn_omograph/{omograph}/*",
+        "koziev/*",
+    ]
+
+
+def ruaccent_dir(root: Path | None = None) -> Path:
+    return (root or data_root()).parent / "ruaccent"
+
+
 def _ruaccent_workdir(root: Path) -> None:
-    """RUAccent keeps its models next to the package, i.e. inside the image, so
-    every add-on update downloaded them again. Point it at /data instead."""
+    """RUAccent downloads its models itself, next to the package (inside the
+    image: gone after every add-on restart), and only checks that a folder
+    exists, so a download cut in the middle stays broken forever. Here the
+    models are fetched by us into /data with resume, marked complete, and
+    RUAccent finds them all on disk: no network once they are there.
+    koziev/ is always read next to the package, so it is a symlink."""
     try:
         from ruaccent import RUAccent
     except ImportError:
@@ -84,17 +111,53 @@ def _ruaccent_workdir(root: Path) -> None:
         return
     if "workdir" not in inspect.signature(RUAccent.load).parameters:
         return
-    workdir = root.parent / "ruaccent"
+    import ruaccent
+
+    workdir = ruaccent_dir(root)
     workdir.mkdir(parents=True, exist_ok=True)
+    pkg_koziev = Path(ruaccent.__file__).resolve().parent / "koziev"
+    data_koziev = workdir / "koziev"
+    done = workdir / RUACCENT_DONE
     original = RUAccent.load
 
     @functools.wraps(original)
     def load(self: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("workdir", str(workdir))
+        omograph = kwargs.get("omograph_model_size") or OMOGRAPH_MODEL
+        if not done.is_file() or not (workdir / "nn" / "nn_omograph" / omograph / "model.onnx").is_file():
+            done.unlink(missing_ok=True)
+            write_state("download", detail="модели ударений RUAccent (~700 МБ, с докачкой)")
+            _LOGGER.info("download %s -> %s", RUACCENT_REPO, workdir)
+            try:
+                snapshot_download(RUACCENT_REPO, local_dir=str(workdir), allow_patterns=ruaccent_patterns(omograph))
+            except Exception as err:
+                raise RuntimeError(
+                    f"не удалось скачать модели ударений с HuggingFace: {err}. "
+                    "Загрузите архив моделей с ПК (вкладка «Озвучка»)"
+                ) from err
+            done.write_text(omograph, encoding="utf-8")
+        if pkg_koziev.is_symlink():
+            if pkg_koziev.resolve() != data_koziev.resolve():
+                pkg_koziev.unlink()
+        elif pkg_koziev.is_dir():
+            shutil.rmtree(pkg_koziev, ignore_errors=True)
+        if not pkg_koziev.is_symlink():
+            pkg_koziev.symlink_to(data_koziev, target_is_directory=True)
+        write_state("g2p", detail="модели ударений RUAccent")
         return original(self, *args, **kwargs)
 
     load._ha_voice = True  # type: ignore[attr-defined]
     RUAccent.load = load
+
+
+def models_ready(root: Path | None = None) -> bool:
+    """True when Kokoro and RUAccent can start without the internet."""
+    root = root or data_root()
+    return (
+        all((root / rel).is_file() for rel in _NEED)
+        and (root / "espeak-data" / "ru_dict").is_file()
+        and (ruaccent_dir(root) / RUACCENT_DONE).is_file()
+    )
 
 
 def resolve_voice(name: str | None) -> str:
@@ -119,7 +182,7 @@ class KokoroEngine:
     def load(self) -> None:
         _LOGGER.info("Kokoro-ru: assets in %s", self.root)
         self._ensure_files()
-        write_state("g2p", detail="ударения RUAccent (первый раз скачивает ~300 МБ)")
+        write_state("g2p", detail="ударения RUAccent")
         self._load_g2p()
         write_state("onnx", detail="модель Kokoro")
         for name in VOICES:
@@ -133,19 +196,36 @@ class KokoroEngine:
         _LOGGER.info("Kokoro-ru ready, voices=%s", ", ".join(VOICES))
 
     def _ensure_files(self) -> None:
+        # Offline start: everything on disk means no network at all. The small
+        # text files are re-checked at most once a week, and only while
+        # HuggingFace answers.
+        stamp = self.root / ".ha-voice-refreshed"
+        try:
+            fresh = time.time() - stamp.stat().st_mtime < REFRESH_EVERY_S
+        except OSError:
+            fresh = False
+        online = not fresh and os.environ.get("HF_HUB_OFFLINE", "") not in ("1", "true")
+        refreshed = False
         for rel in _NEED:
             dest = self.root / rel
             have = dest.is_file() and dest.stat().st_size > 0
-            if have and rel not in _REFRESH:
+            if have and not (online and rel in _REFRESH):
                 continue
             write_state("download", detail=rel)
             _LOGGER.info("%s %s", "check" if have else "download", rel)
             try:
                 hf_hub_download(REPO, rel, local_dir=str(self.root))
+                refreshed = refreshed or have
             except Exception as err:
                 if not have:
-                    raise RuntimeError(f"не удалось скачать {rel} с HuggingFace: {err}") from err
-                _LOGGER.warning("HuggingFace недоступен (%s), беру сохранённый %s", err, rel)
+                    raise RuntimeError(
+                        f"не удалось скачать {rel} с HuggingFace: {err}. "
+                        "Загрузите архив моделей с ПК (вкладка «Озвучка»)"
+                    ) from err
+                _LOGGER.warning("HuggingFace недоступен (%s), работаю с сохранёнными файлами", err)
+                online = False
+        if refreshed:
+            stamp.touch()
         ru_dict = self.root / "espeak-data" / "ru_dict"
         if not ru_dict.is_file():
             write_state("download", detail="espeak-data/")

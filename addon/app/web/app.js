@@ -1525,6 +1525,58 @@
     await new Audio(ttsAudioUrl).play();
   }
 
+  const loadTtsModels = async () => { state.ttsModels = await api("/api/tts/models"); };
+
+  function modelsCard() {
+    const m = state.ttsModels;
+    const up = state.modelsUpload;
+    const status = !m ? `<span class="muted">проверяю…</span>`
+      : m.ready ? `<span class="ok">${icon("check")} все модели на месте (${fmtBytes(m.size)}) — Kokoro запускается без интернета</span>`
+      : `<span class="warn">${icon("alert")} не хватает моделей${m.size ? ` (есть ${fmtBytes(m.size)})` : ""} — их нужно скачать один раз</span>`;
+    return `
+      <h3>${icon("download")}Модели Kokoro офлайн</h3>
+      <p class="card-sub">Голос Kokoro и словарь ударений RUAccent скачиваются с HuggingFace один раз и дальше лежат в <span class="mono">/data/models</span> — интернет при перезапусках не нужен. Если с сервера HuggingFace не открывается, скачайте архив на ПК и загрузите сюда.</p>
+      <div class="small">${status}</div>
+      ${up ? `<div style="margin-top:10px"><div class="small">${icon("upload")} ${esc(up.name)} — ${up.done >= up.total ? "распаковываю…" : `${fmtBytes(up.done)} из ${fmtBytes(up.total)}`}</div><div class="meter" style="margin-top:6px"><div class="meter-fill" style="width:${Math.round((up.done / Math.max(1, up.total)) * 100)}%"></div></div></div>` : ""}
+      <div class="row" style="margin-top:10px;flex-wrap:wrap">
+        <label class="btn ${up ? "disabled" : ""}">${icon("upload")}Загрузить архив с ПК (.zip)<input type="file" accept=".zip" data-models="upload" hidden ${up ? "disabled" : ""}></label>
+        ${m && m.ready ? `<a class="btn ghost" href="${BASE}/api/tts/models.zip">${icon("download")}Скачать архив моделей</a>` : ""}
+      </div>
+      <details style="margin-top:10px"><summary class="small">Как сделать архив на ПК</summary>
+        <ol class="hint" style="margin:8px 0 0;padding-left:18px">
+          <li>Python 3.10+ и <span class="mono">pip install huggingface_hub</span>.</li>
+          <li>Скрипт <a href="https://github.com/Matr63/ha-voice/blob/main/scripts/kokoro_models.py" target="_blank" rel="noopener">scripts/kokoro_models.py</a> из репозитория: <span class="mono">python kokoro_models.py</span> → получится <span class="mono">ha-voice-kokoro-models.zip</span> (~1 ГБ). Зеркало: <span class="mono">--endpoint https://hf-mirror.com</span>.</li>
+          <li>Загрузите этот .zip кнопкой выше — Kokoro перезапустится сам.</li>
+        </ol>
+        <p class="small muted">Или «Скачать архив моделей» на другом сервере HA Voice, где Kokoro уже работает.</p>
+      </details>`;
+  }
+
+  function onModelsUpload(ev) {
+    const t = ev.target;
+    if (t.dataset.models !== "upload" || !t.files || !t.files[0]) return;
+    const file = t.files[0];
+    const repaint = () => { const el = $("#ttsModels"); if (el) el.innerHTML = modelsCard(); };
+    const xhr = new XMLHttpRequest();
+    state.modelsUpload = { name: file.name, done: 0, total: file.size };
+    xhr.open("POST", `${BASE}/api/tts/models`);
+    xhr.setRequestHeader("Content-Type", "application/zip");
+    xhr.upload.onprogress = (e) => { state.modelsUpload.done = e.loaded; repaint(); };
+    xhr.onloadend = async () => {
+      state.modelsUpload = null;
+      if (xhr.status >= 200 && xhr.status < 300) toast("Модели установлены, Kokoro перезапускается");
+      else {
+        let msg = `HTTP ${xhr.status || "—"}`;
+        try { msg = JSON.parse(xhr.responseText).error || msg; } catch { /* not json */ }
+        showError(new Error(msg));
+      }
+      await loadTtsModels().catch(() => {});
+      repaint();
+    };
+    xhr.send(file);
+    repaint();
+  }
+
   function renderTts() {
     const v = view("tts");
     const s = state.settings;
@@ -1548,7 +1600,7 @@
           <button type="button" class="btn" id="ttsRestart">${icon("refresh")}Перезапустить</button></div>
         <p class="card-sub">${failed ? esc(tts.error || "Процесс озвучки остановился — дополнение перезапускает его само, с паузой.") : `Этап: <b>${esc(TTS_STAGES[tts.stage] || tts.stage || "запуск")}</b>${tts.detail ? ` — ${esc(tts.detail)}` : ""}${since != null ? ` · ${since} с` : ""}. При первом запуске и после обновления дополнения скачиваются модели с HuggingFace.`}</p>
         ${tts.log && tts.log.length ? `<details ${failed ? "open" : ""}><summary class="small">Журнал Kokoro</summary><pre class="mono small" style="white-space:pre-wrap;max-height:260px;overflow:auto;margin:8px 0 0">${esc(tts.log.join("\n"))}</pre></details>` : ""}
-        <p class="small muted" style="margin-bottom:0">Если HuggingFace не открывается из вашей сети, укажите зеркало в конфигурации дополнения: <span class="mono">hf_endpoint: https://hf-mirror.com</span>.</p>
+        <p class="small muted" style="margin-bottom:0">Если HuggingFace не открывается из вашей сети: зеркало <span class="mono">hf_endpoint: https://hf-mirror.com</span> в конфигурации дополнения или архив моделей с ПК (карточка «Модели Kokoro офлайн» ниже).</p>
       </div>` : "";
     v.innerHTML = `
       ${loadCard}
@@ -1558,6 +1610,13 @@
           <p class="card-sub">Озвучка ${esc(ttsStatus)}. Ответы ассистента звучат на колонке этим голосом — Piper и карточка «Синтез речи» в Assist не нужны.</p>
           ${selectField("tts_voice", "Голос", s.tts_voice, voices)}
           ${rangeField("sat_volume", "Громкость колонки", s.sat_volume ?? 60, 0, 100, 5, "vol")}
+          ${switchField("sound_wake", "Сигнал «слушаю» — после ключевого слова", s.sound_wake, "Короткий звук: колонка начала слушать команду.")}
+          ${switchField("sound_error", "Сигнал ошибки", s.sound_error, "Звучит, если команду не расслышали или она не выполнилась.")}
+          ${rangeField("sound_volume", "Громкость сигналов", s.sound_volume ?? 60, 10, 100, 5, "vol")}
+          <div class="row" style="gap:8px;margin-bottom:6px">
+            <button type="button" class="btn ghost sm" data-earcon="wake" ${sat && sat.can_speak ? "" : "disabled"}>${icon("play")}«Слушаю»</button>
+            <button type="button" class="btn ghost sm" data-earcon="error" ${sat && sat.can_speak ? "" : "disabled"}>${icon("play")}Ошибка</button>
+          </div>
           ${saveRow()}
         </form>
         <div class="card">
@@ -1572,8 +1631,20 @@
           </div>
           <p class="small muted" style="margin-bottom:0">Kokoro также доступен как Wyoming TTS на порту ${esc(st && st.ports ? st.ports.tts : "10351")} — только если хотите использовать его в обычном Assist.</p>
         </div>
-      </div>`;
+      </div>
+      <div class="card" style="margin-top:14px" id="ttsModels">${modelsCard()}</div>`;
     bindSettingsForm($("#ttsForm"), async () => renderTts());
+    $$("[data-earcon]", v).forEach((b) =>
+      b.addEventListener("click", async () => {
+        try {
+          await postJson("/api/satellites/earcon", { sound: b.dataset.earcon });
+        } catch (err) {
+          showError(err);
+        }
+      })
+    );
+    if (!state.ttsModels) loadTtsModels().then(() => { const el = $("#ttsModels"); if (el) el.innerHTML = modelsCard(); }).catch(() => {});
+    $("#ttsModels").addEventListener("change", onModelsUpload);
     const restart = $("#ttsRestart");
     if (restart)
       restart.addEventListener("click", async () => {
@@ -2069,7 +2140,8 @@
         // repaint only while Kokoro is loading and once when it comes up
         const tts = (state.status && state.status.tts) || {};
         const key = `${tts.online}|${tts.stage}|${tts.detail}|${(tts.log || []).length}`;
-        if (!tts.online || state.ttsKey !== key) renderTts();
+        if (state.ttsKey !== key && tts.online) state.ttsModels = null;
+        if (!state.modelsUpload && (!tts.online || state.ttsKey !== key)) renderTts();
         state.ttsKey = key;
       }
     } catch (err) {

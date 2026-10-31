@@ -71,6 +71,27 @@ def rms(pcm: bytes) -> float:
     return float(np.sqrt(np.mean(audio * audio)))
 
 
+EARCON_RATE = 24000
+# (frequency Hz, duration ms) per note: rising = "I'm listening", falling = error
+EARCONS: dict[str, list[tuple[float, int]]] = {
+    "wake": [(880.0, 70), (1320.0, 110)],
+    "error": [(523.0, 120), (349.0, 220)],
+}
+
+
+def earcon(kind: str, volume_pct: int = 60) -> bytes:
+    """Short notes with a soft attack/release (no clicks), mono 16-bit."""
+    amp = 0.6 * max(0.0, min(100.0, float(volume_pct))) / 100.0
+    parts = []
+    for freq, ms in EARCONS[kind]:
+        t = np.arange(int(EARCON_RATE * ms / 1000)) / EARCON_RATE
+        tone = np.sin(2 * np.pi * freq * t) + 0.25 * np.sin(4 * np.pi * freq * t)
+        env = np.minimum(1.0, np.minimum(t / 0.008, (t[-1] - t) / 0.03 + 1e-9))
+        parts.append(tone * np.clip(env, 0.0, 1.0) * amp / 1.25)
+        parts.append(np.zeros(int(EARCON_RATE * 0.03)))
+    return float_to_pcm16(np.concatenate(parts).astype(np.float32))
+
+
 def split_stereo(pcm: bytes) -> tuple[np.ndarray, np.ndarray]:
     audio = pcm16_to_float(pcm)
     audio = audio[: audio.size - audio.size % 2].reshape(-1, 2)
