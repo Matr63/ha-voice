@@ -32,8 +32,12 @@ def custom_dir() -> Path:
     return Path(os.environ.get("WAKEWORDS_DIR", "/data/wakewords"))
 
 
+NO_MODEL = "none"
+
+
 def available_models() -> list[dict[str, str]]:
     out = [{"id": k, "label": v["label"], "kind": "builtin"} for k, v in PRETRAINED.items()]
+    out.append({"id": NO_MODEL, "label": "Выключено — только свои фразы", "kind": "off"})
     d = custom_dir()
     if d.is_dir():
         for f in sorted(d.glob("*.onnx")):
@@ -50,6 +54,26 @@ def strip_wake_word(text: str, wake_word: str) -> str:
         if low.startswith(phrase):
             return re.sub(r"^[\s,.!?:;—-]+", "", t[len(phrase):])
     return t
+
+
+def normalize(text: str) -> str:
+    """'Алекса, НЕ спи!' -> 'алекса не спи'."""
+    t = text.lower().replace("ё", "е")
+    t = re.sub(r"[^\w\s]", " ", t)
+    return " ".join(t.split())
+
+
+def phrase_list(raw: str) -> list[str]:
+    return sorted({normalize(p) for p in raw.split(",") if normalize(p)}, key=len, reverse=True)
+
+
+def match_prefix(text: str, phrases: list[str]) -> tuple[str, str] | None:
+    """('алекса', 'включи свет') when the text starts with one of the phrases."""
+    norm = normalize(text)
+    for phrase in phrases:
+        if norm == phrase or norm.startswith(phrase + " "):
+            return phrase, norm[len(phrase):].strip()
+    return None
 
 
 def _resolve_model(name: str) -> str:
@@ -192,6 +216,10 @@ class WakeDetector:
         if key == self._key or key == self._failed_key:
             return
         await self.close()
+        if s.wake_word == NO_MODEL:
+            self._key = key
+            self.error = None
+            return
         try:
             if s.wake_backend == "wyoming":
                 self._impl = WyomingWake(s.wake_uri, s.wake_word)

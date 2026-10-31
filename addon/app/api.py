@@ -136,7 +136,13 @@ def create_app(ctx: AppContext) -> web.Application:
                     "stt_empty": runtime.stt_empty,
                 },
                 "satellites": hub.list(),
-                "wake": {"word": s.wake_word, "backend": s.wake_backend, "threshold": s.wake_threshold},
+                "wake": {
+                    "word": s.wake_word,
+                    "backend": s.wake_backend,
+                    "threshold": s.wake_threshold,
+                    "phrases": s.wake_phrases,
+                },
+                "mode": hub.modes.status(),
                 "assistant": {
                     "backend": s.assistant_backend,
                     "ha_configured": ctx.ha.configured,
@@ -166,10 +172,13 @@ def create_app(ctx: AppContext) -> web.Application:
         data = await request.json()
         if not isinstance(data, dict):
             raise ValueError("Ожидался JSON-объект")
-        old_volume = settings.get().sat_volume
+        before = settings.to_dict()
         settings.update(data)
-        if settings.get().sat_volume != old_volume:
-            await hub.set_volume(settings.get().sat_volume)
+        after = settings.to_dict()
+        if any(before[k] != after[k] for k in ("sat_volume", "sat_mic_gain", "sat_led_brightness")):
+            await hub.push_board_settings()
+        if any(before[k] != after[k] for k in ("sleep_schedule", "sleep_start", "sleep_end")):
+            await hub.set_sleep(hub.modes.sleeping(), "panel")
         return web.json_response(settings.to_public_dict())
 
     async def speakers_list(_: web.Request) -> web.Response:
@@ -396,6 +405,20 @@ def create_app(ctx: AppContext) -> web.Application:
         await hub.set_volume(settings.get().sat_volume)
         return web.json_response({"volume": settings.get().sat_volume})
 
+    async def satellite_listen_switch(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        await hub.set_listen(bool(data.get("listen", True)), data.get("id") or None)
+        return web.json_response({"ok": True})
+
+    async def mode_get(_: web.Request) -> web.Response:
+        return web.json_response(hub.modes.status())
+
+    async def mode_set(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        if "sleep" not in data:
+            raise ValueError("Ожидалось поле sleep")
+        return web.json_response(await hub.set_sleep(bool(data["sleep"]), data.get("source") or "panel"))
+
     async def satellite_listen(request: web.Request) -> web.Response:
         sat = _satellite(await _json_obj(request))
         await sat.start_command("panel")
@@ -523,6 +546,9 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_post("/api/satellites/say", satellite_say)
     r.add_post("/api/satellites/volume", satellite_volume)
     r.add_post("/api/satellites/listen", satellite_listen)
+    r.add_post("/api/satellites/microphone", satellite_listen_switch)
+    r.add_get("/api/mode", mode_get)
+    r.add_post("/api/mode", mode_set)
     r.add_get("/api/assistant/log", assistant_log)
     r.add_post("/api/assistant/ask", assistant_ask)
     r.add_get("/api/assistant/agents", assistant_agents)

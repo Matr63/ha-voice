@@ -69,3 +69,21 @@ def rms(pcm: bytes) -> float:
     if audio.size == 0:
         return 0.0
     return float(np.sqrt(np.mean(audio * audio)))
+
+
+def split_stereo(pcm: bytes) -> tuple[np.ndarray, np.ndarray]:
+    audio = pcm16_to_float(pcm)
+    audio = audio[: audio.size - audio.size % 2].reshape(-1, 2)
+    return audio[:, 0], audio[:, 1]
+
+
+def apply_gain(audio: np.ndarray, gain_db: float) -> bytes:
+    """Digital gain with a soft knee above -3 dBFS instead of hard clipping."""
+    if gain_db:
+        audio = audio * (10.0 ** (gain_db / 20.0))
+        mag = np.abs(audio)
+        knee = 0.7
+        over = mag > knee
+        if over.any():
+            audio = np.where(over, np.sign(audio) * (knee + (1 - knee) * np.tanh((mag - knee) / (1 - knee))), audio)
+    return float_to_pcm16(audio)

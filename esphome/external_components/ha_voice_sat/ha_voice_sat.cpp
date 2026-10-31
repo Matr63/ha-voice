@@ -138,6 +138,19 @@ void HaVoiceSat::loop() {
   if (v >= 0)
     this->volume_trigger_.trigger(clamp(v, 0, 100) / 100.0f);
 
+  std::vector<std::string> settings;
+  {
+    std::lock_guard<std::mutex> lock(this->settings_mutex_);
+    settings.swap(this->settings_);
+  }
+  for (auto &kv : settings) {
+    size_t eq = kv.find('=');
+    if (eq == std::string::npos)
+      continue;
+    ESP_LOGI(TAG, "Setting %s", kv.c_str());
+    this->setting_trigger_.trigger(kv.substr(0, eq), kv.substr(eq + 1));
+  }
+
   this->loop_speaker_();
 }
 
@@ -364,6 +377,12 @@ void HaVoiceSat::handle_frame_() {
       if (!this->rx_small_.empty())
         this->pending_volume_.store(this->rx_small_[0]);
       break;
+    case FRAME_SET: {
+      std::lock_guard<std::mutex> lock(this->settings_mutex_);
+      if (this->settings_.size() < 16)
+        this->settings_.emplace_back(this->rx_small_.begin(), this->rx_small_.end());
+      break;
+    }
     default:
       break;
   }

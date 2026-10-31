@@ -22,11 +22,15 @@ LIMITS: dict[str, tuple[float, float]] = {
     "command_silence_ms": (300, 3000),
     "command_max_ms": (3000, 30000),
     "sat_volume": (0, 100),
+    "sat_mic_gain": (0, 36),
+    "sat_led_brightness": (0, 100),
+    "mic_boost_db": (0, 36),
 }
 
 ENUMS: dict[str, tuple[str, ...]] = {
     "wake_backend": ("local", "wyoming"),
     "assistant_backend": ("ha", "openai", "off"),
+    "mic_channel": ("auto", "left", "right", "mix"),
 }
 
 # Never sent back to the UI in clear text.
@@ -55,11 +59,23 @@ class Settings:
     tts_voice: str = "sveta"
     # satellite (Waveshare board)
     sat_volume: int = 60
+    sat_mic_gain: int = 36          # ES7210 hardware gain, dB (3 dB steps)
+    sat_led_brightness: int = 80
+    mic_boost_db: int = 18          # digital gain on the PC: Waveshare mics are quiet
+    mic_channel: str = "auto"       # which ES7210 slot to use
+    # sleep mode: by schedule and by voice
+    sleep_schedule: bool = False
+    sleep_start: str = "23:00"
+    sleep_end: str = "07:00"
+    sleep_phrases: str = "спи, спать, режим сна, спокойной ночи"
+    awake_phrases: str = "не спи, проснись, доброе утро"
     # wake word on the PC
     wake_backend: str = "local"
     wake_word: str = "alexa"
     wake_threshold: float = 0.5
     wake_uri: str = "tcp://127.0.0.1:10400"
+    # any Russian phrase, matched in the recognised text (no model training)
+    wake_phrases: str = "алекса, колонка"
     command_silence_ms: int = 800
     command_max_ms: int = 10000
     # assistant
@@ -137,6 +153,13 @@ def _coerce(name: str, value: Any, current: Any) -> Any:
         return v if v in ENUMS[name] else current
     if name in SECRETS and str(value) == SECRET_MASK:
         return current
+    if name in ("sleep_start", "sleep_end"):
+        v = str(value).strip()
+        try:
+            h, m = (int(x) for x in v.split(":"))
+        except ValueError:
+            return current
+        return f"{h:02d}:{m:02d}" if 0 <= h < 24 and 0 <= m < 60 else current
     if isinstance(current, str):
         return str(value)
     if isinstance(current, bool):

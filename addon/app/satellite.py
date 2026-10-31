@@ -20,12 +20,15 @@ import time
 from collections import deque
 from typing import Any
 
-from audio_utils import TARGET_RATE, duration_ms, normalize_pcm, rms
+import numpy as np
+
+from audio_utils import TARGET_RATE, apply_gain, duration_ms, normalize_pcm, pcm16_to_float, rms, split_stereo
+from modes import Modes
 from settings import SettingsStore
 from stt_client import transcribe
 from tts_client import synthesize_stream
 from tts_engine import resolve_voice
-from wake import WakeDetector, strip_wake_word
+from wake import WakeDetector, match_prefix, normalize, phrase_list, strip_wake_word
 
 try:
     import webrtcvad  # type: ignore
@@ -47,6 +50,7 @@ T_TTS_END = 0x11
 T_STATE = 0x12
 T_VOLUME = 0x13
 T_TTS_ABORT = 0x14
+T_SET = 0x15
 
 ST_IDLE = 0
 ST_WAKE = 1
@@ -54,6 +58,7 @@ ST_LISTENING = 2
 ST_THINKING = 3
 ST_REPLYING = 4
 ST_ERROR = 5
+ST_SLEEP = 6
 STATE_NAMES = {
     ST_IDLE: "idle",
     ST_WAKE: "wake",
@@ -61,6 +66,7 @@ STATE_NAMES = {
     ST_THINKING: "thinking",
     ST_REPLYING: "replying",
     ST_ERROR: "error",
+    ST_SLEEP: "sleep",
 }
 
 FRAME_BYTES = 640  # 20 ms at 16 kHz mono
@@ -182,6 +188,10 @@ class Satellite:
         self.mute_until = 0.0
         self.command: CommandCapture | None = None
         self.last_wake: dict[str, Any] | None = None
+        self.last_wake_ts = 0.0
+        self.ch_rms = [0.0, 0.0]      # long-term level per ES7210 slot
+        self.ch_active = 0
+        self.raw_rms = 0.0            # before digital gain
         self.diary_seg = Segmenter()
         self.wake = WakeDetector(hub.settings)
         self._tts_done = asyncio.Event()
@@ -216,6 +226,9 @@ class Satellite:
             "last_wake": self.last_wake,
             "mic_rate": self.info.get("mic_rate"),
             "mic_channels": self.info.get("mic_channels"),
+            "raw_rms": round(self.raw_rms, 4),
+            "channel_rms": [round(x, 4) for x in self.ch_rms],
+            "channel_active": ["left", "right"][self.ch_active] if self.info.get("mic_channels") == "2" else None,
         }
 
     def _spawn(self, coro: Any) -> asyncio.Task:
@@ -244,6 +257,27 @@ class Satellite:
     async def set_volume(self, percent: int) -> None:
         await self.send(T_VOLUME, bytes([max(0, min(100, int(percent)))]))
 
+    async def send_setting(self, key: str, value: Any) -> None:
+        await self.send(T_SET, f"{key}={value}".encode())
+
+    async def push_board_settings(self) -> None:
+        s = self.hub.settings.get()
+        await self.set_volume(s.sat_volume)
+        await self.send_setting("mic_gain", s.sat_mic_gain)
+        await self.send_setting("led_brightness", s.sat_led_brightness)
+
+    def idle_state(self) -> int:
+        return ST_SLEEP if self.hub.modes.sleeping() else ST_IDLE
+
+    async def go_idle(self) -> None:
+        await self.set_state(self.idle_state())
+
+    async def flash_error(self) -> None:
+        await self.set_state(ST_ERROR)
+        await asyncio.sleep(2)
+        if self.state == ST_ERROR:
+            await self.go_idle()
+
     async def ping_loop(self) -> None:
         while not self._closed:
             await asyncio.sleep(1.0)
@@ -267,8 +301,8 @@ class Satellite:
             "Satellite %s (%s) esphome %s mic %s Hz x%s",
             self.id, info.get("ip") or self.ip, info.get("esphome"), info.get("mic_rate"), info.get("mic_channels"),
         )
-        await self.set_volume(self.hub.settings.get().sat_volume)
-        await self.set_state(ST_IDLE)
+        await self.push_board_settings()
+        await self.go_idle()
 
     async def on_event(self, text: str) -> None:
         _LOGGER.debug("event %s: %s", self.id, text)
@@ -283,12 +317,42 @@ class Satellite:
         elif text.startswith("button:2"):
             if self.speaking:
                 await self.stop_speaking()
-                await self.set_state(ST_IDLE)
+                await self.go_idle()
             elif self.command is not None:
                 self.command = None
-                await self.set_state(ST_IDLE)
+                await self.go_idle()
             elif not self.busy:
                 await self.start_command("button")
+
+    def condition(self, payload: bytes, rate: int, channels: int) -> bytes:
+        """Board PCM -> 16 kHz mono with the chosen ES7210 slot and digital gain."""
+        s = self.hub.settings.get()
+        if channels == 2:
+            left, right = split_stereo(payload)
+            if not self.speaking and left.size:
+                for i, ch in enumerate((left, right)):
+                    level = float(np.sqrt(np.mean(ch * ch)))
+                    self.ch_rms[i] = level if self.ch_rms[i] == 0 else self.ch_rms[i] * 0.995 + level * 0.005
+            mode = s.mic_channel
+            if mode == "left":
+                self.ch_active, audio = 0, left
+            elif mode == "right":
+                self.ch_active, audio = 1, right
+            elif mode == "mix":
+                audio = (left + right) / 2
+            else:
+                # auto: the louder slot is the capsule (the other may be the
+                # speaker loopback or an unbiased input); switch with hysteresis
+                other = 1 - self.ch_active
+                if self.ch_rms[other] > self.ch_rms[self.ch_active] * 1.5:
+                    self.ch_active = other
+                audio = right if self.ch_active else left
+        else:
+            audio = pcm16_to_float(payload)
+        if rate != TARGET_RATE:
+            audio = pcm16_to_float(normalize_pcm(apply_gain(audio, 0), rate))
+        self.raw_rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+        return apply_gain(audio, s.mic_boost_db)
 
     async def on_audio(self, pcm: bytes, real: bool = True) -> None:
         if real:
@@ -299,7 +363,9 @@ class Satellite:
         if self.speaking or time.monotonic() < self.mute_until:
             return
         s = self.hub.settings.get()
-        if s.diary_enabled:
+        # utterances go through GigaAM for the diary and for phrase commands
+        # ("алекса ...", "не спи"), even when the diary itself is off
+        if s.diary_enabled or self.hub.text_commands_enabled():
             for seg in self.diary_seg.feed(pcm, s.diary_vad_rms, s.diary_silence_ms, s.diary_max_utterance_ms):
                 self.hub.runtime.submit(seg, source=self.id)
 
@@ -308,7 +374,7 @@ class Satellite:
             if res is CommandCapture.TIMEOUT:
                 _LOGGER.info("%s: no command after %s", self.id, self.command.reason)
                 self.command = None
-                await self.set_state(ST_IDLE)
+                await self.go_idle()
             elif res:
                 self.command = None
                 self._spawn(self.run_command(res))
@@ -319,8 +385,54 @@ class Satellite:
         score = await self.wake.feed(pcm)
         if score is not None:
             self.last_wake = {"ts": time.time(), "score": round(score, 3), "word": s.wake_word}
+            self.last_wake_ts = time.time()
+            if self.hub.modes.sleeping():
+                _LOGGER.info("%s: wake word '%s' ignored, sleep mode", self.id, s.wake_word)
+                self.last_wake["ignored"] = "sleep"
+                return
             _LOGGER.info("%s: wake word '%s' (%.2f)", self.id, s.wake_word, score)
             await self.start_command("wake")
+
+    async def on_transcript(self, text: str, match: Any, pcm: bytes) -> None:
+        """Every recognised utterance: sleep phrases and custom activation phrases."""
+        if self.speaking or self.busy or self.command is not None:
+            return
+        # the wake-word model already took this utterance
+        if time.time() - self.last_wake_ts < duration_ms(pcm) / 1000 + 8:
+            return
+        s = self.hub.settings.get()
+        hit = match_prefix(text, phrase_list(s.wake_phrases))
+        rest = hit[1] if hit else normalize(text)
+        if await self.mode_phrase(rest, explicit=bool(hit)):
+            return
+        if hit is None or self.hub.modes.sleeping():
+            return
+        self.last_wake = {"ts": time.time(), "score": 1.0, "word": hit[0], "by": "phrase"}
+        _LOGGER.info("%s: activation phrase '%s' -> %r", self.id, hit[0], rest)
+        if rest:
+            self._spawn(self.run_text(rest, match, pcm, heard=text))
+        else:
+            await self.start_command("phrase")
+
+    async def mode_phrase(self, text: str, explicit: bool = False) -> bool:
+        """'не спи' / 'спи' said as the whole utterance (or right after the wake phrase)."""
+        s = self.hub.settings.get()
+        norm = normalize(text)
+        if self.hub.modes.sleeping():
+            if norm not in phrase_list(s.awake_phrases):
+                return False
+            await self.hub.set_sleep(False, "voice")
+            self.hub.assistant.record({"satellite": self.id, "text": text, "reply": "Режим сна выключен"})
+            if self.can_speak:
+                self.say("Я здесь.")
+            return True
+        if norm in phrase_list(s.sleep_phrases) and (explicit or len(norm.split()) <= 3):
+            await self.hub.set_sleep(True, "voice")
+            self.hub.assistant.record({"satellite": self.id, "text": text, "reply": "Режим сна включён"})
+            if self.can_speak:
+                self.say("Хорошо, сплю. Скажите: не спи, чтобы разбудить.")
+            return True
+        return False
 
     async def on_silence(self, ms: int) -> None:
         """Old firmware skips quiet frames: treat a read timeout as silence."""
@@ -336,26 +448,53 @@ class Satellite:
         hub = self.hub
         s = hub.settings.get()
         self.busy = True
-        entry: dict[str, Any] = {"satellite": self.id, "duration_ms": duration_ms(pcm)}
         try:
             await self.set_state(ST_THINKING)
             match_task = asyncio.create_task(asyncio.to_thread(hub.runtime.store.match, pcm))
             raw = await transcribe(hub.stt_uri, pcm)
             match = await match_task
-            text = strip_wake_word(raw, s.wake_word)
-            speaker = match.name if match.matched else None
-            entry.update(text=text, heard=raw, speaker=speaker, score=round(float(match.score), 3))
-            if not text:
-                entry["error"] = "Пустое распознавание"
-                _LOGGER.info("%s: command STT empty (%d ms)", self.id, entry["duration_ms"])
-                hub.assistant.record(entry)
-                await self.set_state(ST_ERROR)
-                return
+        except Exception as err:
+            _LOGGER.exception("%s: command STT failed", self.id)
+            hub.assistant.record({"satellite": self.id, "error": str(err), "duration_ms": duration_ms(pcm)})
+            self.busy = False
+            await self.flash_error()
+            return
+        text = strip_wake_word(raw, s.wake_word)
+        hit = match_prefix(text, phrase_list(s.wake_phrases))
+        if hit:
+            text = hit[1]
+        self.busy = False
+        await self.run_text(text, match, pcm, heard=raw)
+
+    async def run_text(self, text: str, match: Any, pcm: bytes, heard: str = "") -> None:
+        hub = self.hub
+        s = hub.settings.get()
+        speaker = match.name if match.matched else None
+        entry: dict[str, Any] = {
+            "satellite": self.id,
+            "duration_ms": duration_ms(pcm),
+            "text": text,
+            "heard": heard or text,
+            "speaker": speaker,
+            "score": round(float(match.score), 3),
+        }
+        if not text:
+            entry["error"] = "Пустое распознавание"
+            _LOGGER.info("%s: command STT empty (%d ms)", self.id, entry["duration_ms"])
+            hub.assistant.record(entry)
+            await self.flash_error()
+            return
+        if await self.mode_phrase(text, explicit=True):
+            return
+        self.busy = True
+        try:
+            if self.state != ST_THINKING:
+                await self.set_state(ST_THINKING)
             if s.gate_require_match and hub.runtime.store.has_speakers() and not match.matched:
                 entry.update(rejected=True, error="Голос не узнан — команда отклонена")
                 _LOGGER.info("%s: command rejected, unknown voice (%.2f): %s", self.id, match.score, text)
                 hub.assistant.record(entry)
-                await self.set_state(ST_ERROR)
+                self._spawn(self.flash_error())
                 return
             result = await hub.assistant.handle(text, conv_key=self.id, speaker=speaker)
             entry.update(
@@ -369,13 +508,15 @@ class Satellite:
             _LOGGER.info("%s: «%s» -> «%s»", self.id, text, result.speech)
             if result.speech and self.can_speak:
                 self.say(result.speech, expect_reply=result.expect_reply)
+            elif result.error:
+                self._spawn(self.flash_error())
             else:
-                await self.set_state(ST_ERROR if result.error else ST_IDLE)
+                await self.go_idle()
         except Exception as err:
             _LOGGER.exception("%s: command failed", self.id)
             entry["error"] = str(err)
             hub.assistant.record(entry)
-            await self.set_state(ST_ERROR)
+            self._spawn(self.flash_error())
         finally:
             self.busy = False
 
@@ -419,8 +560,7 @@ class Satellite:
             raise
         except Exception:
             _LOGGER.exception("%s: TTS to board failed", self.id)
-            expect_reply = False
-            await self.set_state(ST_ERROR)
+            self._spawn(self.flash_error())
             return
         finally:
             self.speaking = False
@@ -430,7 +570,7 @@ class Satellite:
         if expect_reply:
             await self.start_command("follow_up")
         else:
-            await self.set_state(ST_IDLE)
+            await self.go_idle()
 
     async def close(self) -> None:
         self._closed = True
@@ -448,9 +588,13 @@ class Satellite:
 
 
 class SatelliteHub:
-    def __init__(self, settings: SettingsStore, runtime: Any, assistant: Any, stt_uri: str, tts_uri: str) -> None:
+    def __init__(
+        self, settings: SettingsStore, runtime: Any, assistant: Any, stt_uri: str, tts_uri: str, modes: Modes
+    ) -> None:
         self.settings = settings
+        self.modes = modes
         self.runtime = runtime
+        runtime.on_transcript = self._on_transcript
         self.assistant = assistant
         self.stt_uri = stt_uri
         self.tts_uri = tts_uri
@@ -481,6 +625,43 @@ class SatelliteHub:
     async def set_volume(self, percent: int) -> None:
         for sat in list(self.satellites.values()):
             await sat.set_volume(percent)
+
+    async def push_board_settings(self) -> None:
+        for sat in list(self.satellites.values()):
+            await sat.push_board_settings()
+
+    async def set_listen(self, on: bool, sat_id: str | None = None) -> None:
+        for sat in list(self.satellites.values()):
+            if sat_id in (None, sat.id):
+                await sat.send_setting("listen", 1 if on else 0)
+
+    def text_commands_enabled(self) -> bool:
+        s = self.settings.get()
+        return bool(phrase_list(s.wake_phrases) or phrase_list(s.awake_phrases) or phrase_list(s.sleep_phrases))
+
+    async def _on_transcript(self, source: str | None, text: str, match: Any, pcm: bytes) -> None:
+        sat = self.satellites.get(source or "")
+        if sat is not None and text:
+            await sat.on_transcript(text, match, pcm)
+
+    async def set_sleep(self, on: bool, source: str) -> dict[str, Any]:
+        status = self.modes.set_sleep(on, source)
+        _LOGGER.info("Sleep mode %s (%s)", "ON" if status["sleeping"] else "OFF", source)
+        await self._apply_mode()
+        return status
+
+    async def _apply_mode(self) -> None:
+        for sat in list(self.satellites.values()):
+            if sat.state in (ST_IDLE, ST_SLEEP) and sat.state != sat.idle_state():
+                await sat.go_idle()
+
+    async def mode_loop(self) -> None:
+        while True:
+            await asyncio.sleep(20)
+            try:
+                await self._apply_mode()
+            except Exception:
+                _LOGGER.exception("mode loop")
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -517,8 +698,7 @@ class SatelliteHub:
                     if not 8000 <= rate <= 48000 or bits not in (0, 16):
                         _LOGGER.warning("Unsupported audio from %s: rate=%s bits=%s", peer, rate, bits)
                         break
-                    channels = channels or 1
-                    pcm = payload if rate == TARGET_RATE and channels == 1 else normalize_pcm(payload, rate, channels)
+                    pcm = sat.condition(payload, rate, channels or 1)
                     await sat.on_audio(pcm)
                 elif ftype == T_HELLO:
                     await sat.on_hello(payload.decode("utf-8", "replace"))
@@ -538,6 +718,7 @@ class SatelliteHub:
 
     async def serve(self, host: str, port: int) -> None:
         self.runtime.start()
+        self._mode_task = asyncio.create_task(self.mode_loop())
         server = await asyncio.start_server(self.handle_client, host=host, port=port)
         _LOGGER.info("Satellite server on %s:%s", host, port)
         async with server:

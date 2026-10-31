@@ -44,6 +44,9 @@ class HaVoiceApi:
             "/api/assistant/ask", {"text": text, "speak": speak, "id": satellite}, timeout=120
         )
 
+    async def set_sleep(self, on: bool) -> dict:
+        return await self._post_json("/api/mode", {"sleep": on, "source": "ha"})
+
     async def set_volume(self, volume: int) -> dict:
         return await self._post_json("/api/satellites/volume", {"volume": int(volume)})
 

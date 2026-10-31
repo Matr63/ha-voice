@@ -14,6 +14,7 @@ from dialogue import DialogueRuntime, DialogueStore
 from firmware import FirmwareStore
 from gate_server import GateState, run_gate
 from ha_client import HaClient
+from modes import Modes
 from satellite import SatelliteHub
 from settings import SettingsStore
 from speakers import SpeakerStore
@@ -54,7 +55,8 @@ async def amain() -> None:
     tts_enabled = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
     ha = HaClient(settings)
     assistant = Assistant(settings, ha)
-    hub = SatelliteHub(settings, runtime, assistant, stt_uri, tts_uri)
+    modes = Modes(settings)
+    hub = SatelliteHub(settings, runtime, assistant, stt_uri, tts_uri, modes)
     firmware = FirmwareStore(Path(os.environ.get("FIRMWARE_DIR", "/data/firmware")))
     ctx = AppContext(
         settings=settings,

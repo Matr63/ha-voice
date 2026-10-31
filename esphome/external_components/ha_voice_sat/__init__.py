@@ -22,6 +22,7 @@ CONF_LISTENING = "listening"
 CONF_DEVICE_NAME = "device_name"
 CONF_ON_STATE = "on_state"
 CONF_ON_VOLUME = "on_volume"
+CONF_ON_SETTING = "on_setting"
 CONF_ON_TTS_START = "on_tts_start"
 CONF_ON_TTS_END = "on_tts_end"
 CONF_ON_CONNECTED = "on_connected"
@@ -39,6 +40,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_DEVICE_NAME, default=""): cv.string,
         cv.Optional(CONF_ON_STATE): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_VOLUME): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_SETTING): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_TTS_START): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_TTS_END): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(single=True),
@@ -67,6 +69,12 @@ async def to_code(config):
     if CONF_ON_VOLUME in config:
         await automation.build_automation(
             var.get_volume_trigger(), [(cg.float_, "x")], config[CONF_ON_VOLUME]
+        )
+    if CONF_ON_SETTING in config:
+        await automation.build_automation(
+            var.get_setting_trigger(),
+            [(cg.std_string, "key"), (cg.std_string, "value")],
+            config[CONF_ON_SETTING],
         )
     for key, getter in (
         (CONF_ON_TTS_START, var.get_tts_start_trigger()),

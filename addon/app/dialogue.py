@@ -9,7 +9,7 @@ import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from audio_utils import TARGET_RATE, duration_ms, to_wav
 from settings import SettingsStore
@@ -225,6 +225,8 @@ class DialogueRuntime:
         self.processed = 0
         self.dropped = 0
         self.stt_empty = 0
+        # satellite hub: phrase commands ("алекса ...", "не спи") from every utterance
+        self.on_transcript: Callable[[str | None, str, Any, bytes], Awaitable[None]] | None = None
         self.queue: asyncio.Queue[tuple[bytes, str | None]] | None = None
         self._worker_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -333,9 +335,12 @@ class DialogueRuntime:
     async def process_utterance(
         self, pcm: bytes, force: bool = False, source: str | None = None
     ) -> dict[str, Any] | None:
-        """pcm: 16 kHz mono PCM16."""
+        """pcm: 16 kHz mono PCM16. Saved when the diary is on (or forced);
+        always handed to on_transcript for phrase commands."""
         s = self.settings.get()
-        if not pcm or (not force and not s.diary_enabled):
+        save = force or s.diary_enabled
+        listen = source is not None and self.on_transcript is not None
+        if not pcm or not (save or listen):
             return None
         dur = duration_ms(pcm)
         if dur < s.diary_min_speech_ms:
@@ -344,13 +349,21 @@ class DialogueRuntime:
         async with self._lock:
             match = await asyncio.to_thread(self.store.match, pcm)
             text = await transcribe(self.stt_uri, pcm)
-            if not text:
-                self.stt_empty += 1
-                _LOGGER.info(
-                    "diary: STT empty for %d ms utterance from %s (voice %s %.2f) — not saved",
-                    dur, source or "upload", match.name if match.matched else "unknown", match.score,
-                )
-                return None
+        if not text:
+            self.stt_empty += 1
+            _LOGGER.info(
+                "diary: STT empty for %d ms utterance from %s (voice %s %.2f) — not saved",
+                dur, source or "upload", match.name if match.matched else "unknown", match.score,
+            )
+            return None
+        if listen:
+            try:
+                await self.on_transcript(source, text, match, pcm)
+            except Exception:
+                _LOGGER.exception("phrase command failed")
+        if not save:
+            return None
+        async with self._lock:
             keep = s.diary_keep_audio
             row = self.dialogue_store.add(
                 text=text,

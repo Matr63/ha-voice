@@ -47,7 +47,7 @@ esphome:
   min_version: 2026.8.0
   project:
     name: matr63.ha-voice-satellite
-    version: "2.0.0"
+    version: "2.1.0"
   on_boot:
     - priority: 375
       then:
@@ -172,6 +172,9 @@ microphone:
     pdm: false
     bits_per_sample: 16bit
     sample_rate: 16000
+    # Both ES7210 slots: which one carries the louder capsule differs between
+    # boards, so HA Voice picks the channel on the PC (and applies gain there).
+    channel: stereo
 
 speaker:
   - platform: i2s_audio
@@ -258,6 +261,20 @@ ha_voice_sat:
     - media_player.volume_set:
         id: external_media_player
         volume: !lambda return x;
+  # Board settings pushed from the HA Voice panel.
+  on_setting:
+    - lambda: |-
+        float v = atof(value.c_str());
+        if (key == "mic_gain") {
+          auto call = id(mic_gain_db).make_call();
+          call.set_value(v);
+          call.perform();
+        } else if (key == "led_brightness") {
+          id(led_level) = clamp(v / 100.0f, 0.0f, 1.0f);
+          id(ring_state).execute(id(ring_last));
+        } else if (key == "listen") {
+          if (v > 0) id(listen_switch).turn_on(); else id(listen_switch).turn_off();
+        }
   on_tts_start:
     - switch.turn_on: amp_enable
     - mixer_speaker.apply_ducking:
@@ -316,37 +333,49 @@ light:
                              (uint8_t)(current_color.blue  * b));
             t = (t + 2) % 256;
 
+globals:
+  - id: led_level            # 0..1, set from the panel ("Яркость подсветки")
+    type: float
+    restore_value: true
+    initial_value: '0.8'
+  - id: ring_last
+    type: int
+    initial_value: '-1'
+
 script:
   # -1 = no link to HA Voice, 0 idle, 1 wake word, 2 listening, 3 thinking,
-  # 4 replying, 5 error (states come from the server).
+  # 4 replying, 5 error, 6 sleep (states come from the server).
   - id: ring_state
     mode: restart
     parameters:
       state: int
     then:
       - lambda: |-
-          if (state == 0) {
+          id(ring_last) = state;
+          if (state == 0 || state == 6 || id(led_level) <= 0.01f) {
             id(status_ring).turn_off().perform();
             return;
           }
           auto call = id(status_ring).turn_on();
+          float b = 0.8f;
           if (state < 0) {
             if (!id(wifi_id).is_connected()) {
-              call.set_rgb(1.0, 0.3, 0.0); call.set_brightness(0.5); call.set_effect("Pulse Slow");
+              call.set_rgb(1.0, 0.3, 0.0); b = 0.5f; call.set_effect("Pulse Slow");
             } else {
-              call.set_rgb(1.0, 0.6, 0.0); call.set_brightness(0.4); call.set_effect("Pulse Slow");
+              call.set_rgb(1.0, 0.6, 0.0); b = 0.4f; call.set_effect("Pulse Slow");
             }
           } else if (state == 1) {
-            call.set_rgb(0.0, 0.8, 1.0); call.set_brightness(0.8); call.set_effect("None");
+            call.set_rgb(0.0, 0.8, 1.0); b = 0.8f; call.set_effect("None");
           } else if (state == 2) {
-            call.set_rgb(0.0, 0.3, 1.0); call.set_brightness(0.8); call.set_effect("Pulse Fast");
+            call.set_rgb(0.0, 0.3, 1.0); b = 0.8f; call.set_effect("Pulse Fast");
           } else if (state == 3) {
-            call.set_rgb(0.6, 0.0, 1.0); call.set_brightness(0.8); call.set_effect("Spinner");
+            call.set_rgb(0.6, 0.0, 1.0); b = 0.8f; call.set_effect("Spinner");
           } else if (state == 4) {
-            call.set_rgb(0.0, 1.0, 0.3); call.set_brightness(0.8); call.set_effect("Breathe");
+            call.set_rgb(0.0, 1.0, 0.3); b = 0.8f; call.set_effect("Breathe");
           } else {
-            call.set_rgb(1.0, 0.0, 0.0); call.set_brightness(1.0); call.set_effect("None");
+            call.set_rgb(1.0, 0.0, 0.0); b = 1.0f; call.set_effect("None");
           }
+          call.set_brightness(std::max(0.05f, b * id(led_level)));
           call.perform();
       - if:
           condition:

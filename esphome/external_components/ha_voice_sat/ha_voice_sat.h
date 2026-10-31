@@ -39,6 +39,7 @@ enum FrameType : uint8_t {
   FRAME_STATE = 0x12,      // down: 1 byte, see SatState
   FRAME_VOLUME = 0x13,     // down: 1 byte 0..100
   FRAME_TTS_ABORT = 0x14,  // down: drop queued TTS now
+  FRAME_SET = 0x15,        // down: "key=value" board setting (mic_gain, led_brightness, listen)
 };
 
 enum SatState : uint8_t {
@@ -48,6 +49,7 @@ enum SatState : uint8_t {
   STATE_THINKING = 3,
   STATE_REPLYING = 4,
   STATE_ERROR = 5,
+  STATE_SLEEP = 6,
 };
 
 static const size_t HEADER_SIZE = 16;
@@ -69,6 +71,7 @@ class HaVoiceSat : public Component {
 
   Trigger<int> *get_state_trigger() { return &this->state_trigger_; }
   Trigger<float> *get_volume_trigger() { return &this->volume_trigger_; }
+  Trigger<std::string, std::string> *get_setting_trigger() { return &this->setting_trigger_; }
   Trigger<> *get_tts_start_trigger() { return &this->tts_start_trigger_; }
   Trigger<> *get_tts_end_trigger() { return &this->tts_end_trigger_; }
   Trigger<> *get_connected_trigger() { return &this->connected_trigger_; }
@@ -113,6 +116,8 @@ class HaVoiceSat : public Component {
   std::unique_ptr<ring_buffer::RingBuffer> rx_ring_;
   std::mutex events_mutex_;
   std::vector<std::string> events_;
+  std::mutex settings_mutex_;
+  std::vector<std::string> settings_;
 
   TaskHandle_t net_task_handle_{nullptr};
   int fd_{-1};
@@ -146,6 +151,7 @@ class HaVoiceSat : public Component {
 
   Trigger<int> state_trigger_;
   Trigger<float> volume_trigger_;
+  Trigger<std::string, std::string> setting_trigger_;
   Trigger<> tts_start_trigger_;
   Trigger<> tts_end_trigger_;
   Trigger<> connected_trigger_;

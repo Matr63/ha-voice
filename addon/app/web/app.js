@@ -40,6 +40,9 @@
     speaker: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/>',
     chip: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
     robot: '<rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" x2="8" y1="16" y2="16"/><line x1="16" x2="16" y1="16" y2="16"/>',
+    moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+    settings: '<path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/>',
     home: '<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
   };
   const icon = (name, cls = "") =>
@@ -450,6 +453,7 @@
     thinking: ["warn live", "Думаю"],
     replying: ["ok live", "Отвечаю"],
     error: ["bad", "Ошибка"],
+    sleep: ["warn", "Спит"],
   };
   const BACKENDS = { ha: "Home Assistant", openai: "LLM (OpenAI-совместимый)", off: "выключен" };
   const satellite = () => (state.status && state.status.satellites && state.status.satellites[0]) || null;
@@ -603,17 +607,17 @@
             <dt>Прошивка</dt><dd class="small">${sat.proto >= 2 ? `HA Voice · ESPHome ${esc(sat.esphome || "?")}` : "room_diary (старая)"}</dd><dd></dd>
             <dt>На связи</dt><dd>${fmtUptime(sat.connected_s)}</dd><dd></dd>
           </dl>
-          <div class="field" style="margin-top:12px">
-            <label for="spVol">Громкость</label>
-            <div class="range-row"><input type="range" id="spVol" min="0" max="100" step="5" value="${st.sat_volume ?? 60}"><output>${st.sat_volume ?? 60}%</output></div>
-          </div>
-          <div class="row" style="flex-wrap:wrap">
+          <div class="row" style="flex-wrap:wrap;margin-top:12px">
             <input class="input" id="spSay" placeholder="Сказать на колонке…" maxlength="400" style="flex:1;min-width:180px">
             <button class="btn primary" id="spSayBtn" ${sat.can_speak ? "" : "disabled"}>${icon("speaker")}Сказать</button>
             <button class="btn" id="spListen" title="Как будто сказали ключевое слово">${icon("mic")}Слушать команду</button>
           </div>` : ""}
         </div>
         ${firmwareCard(sat)}
+      </div>
+      <div class="grid grid-2" style="margin-top:14px">
+        ${boardSettingsCard(sat, st)}
+        ${sleepCard(s.mode, st)}
       </div>
       <div class="grid grid-4" style="margin-top:14px">
         ${statCard("Голосов записано", s.speakers, s.speakers ? "узнаются по голосу" : "пока никого")}
@@ -636,13 +640,79 @@
         </div>
       </div>`;
     ensureEspWebTools();
+    const bf = $("#boardForm");
+    if (bf) bindSettingsForm(bf, async () => renderSpeaker());
+    const sf = $("#sleepForm");
+    if (sf) bindSettingsForm(sf, async () => renderSpeaker());
+  }
+
+  function boardSettingsCard(sat, st) {
+    const stereo = sat && sat.channel_rms && sat.mic_channels === "2";
+    const chLevels = stereo
+      ? `<div class="hint">Уровень каналов: левый ${sat.channel_rms[0].toFixed(4)} · правый ${sat.channel_rms[1].toFixed(4)} · сейчас используется <b>${sat.channel_active === "right" ? "правый" : "левый"}</b></div>`
+      : `<div class="hint">Прошивка шлёт один канал — выбор канала появится после обновления прошивки колонки.</div>`;
+    const raw = sat ? sat.raw_rms : 0;
+    return `
+      <form class="card" id="boardForm" autocomplete="off">
+        <h3>${icon("settings")}Настройки колонки</h3>
+        <p class="card-sub">Применяются к плате сразу, без перепрошивки.${sat ? ` Микрофон: до усиления ${raw.toFixed(4)}, после — ${sat.live_rms.toFixed(4)}.` : ""}</p>
+        ${rangeField("sat_volume", "Громкость динамика", st.sat_volume ?? 60, 0, 100, 5, "vol")}
+        ${rangeField("sat_mic_gain", "Усиление микрофона на плате (ES7210)", st.sat_mic_gain ?? 36, 0, 36, 3, "db", "Аппаратное усиление. На Waveshare микрофоны тихие — держите 30–36 дБ.")}
+        ${rangeField("mic_boost_db", "Цифровое усиление на ПК", st.mic_boost_db ?? 18, 0, 36, 1, "db", "Поднимает уровень для распознавания, записи голосов и дневника. Если речь «хрипит» — уменьшите. Порог громкости речи в «Настройках» сравнивается с уровнем после усиления.")}
+        ${selectField("mic_channel", "Канал микрофона", st.mic_channel || "auto", [["auto", "Автоматически (громкий)"], ["left", "Левый"], ["right", "Правый"], ["mix", "Смесь двух"]])}
+        ${chLevels}
+        ${rangeField("sat_led_brightness", "Яркость подсветки", st.sat_led_brightness ?? 80, 0, 100, 5, "vol", "0 — кольцо не светится совсем.")}
+        <div class="row" style="margin-top:6px;flex-wrap:wrap">
+          <button type="button" class="btn" data-mic="1" ${sat ? "" : "disabled"}>${icon("mic")}Микрофон вкл</button>
+          <button type="button" class="btn" data-mic="0" ${sat ? "" : "disabled"}>${icon("x")}Микрофон выкл</button>
+          <span class="spacer"></span>
+          <button type="submit" class="btn primary">${icon("check")}Сохранить</button>
+        </div>
+      </form>`;
+  }
+
+  function sleepCard(mode, st) {
+    mode = mode || { sleeping: false };
+    const src = { voice: "голосом", panel: "из панели", ha: "из Home Assistant", schedule: "по расписанию", default: "" }[mode.source] || "";
+    const until = mode.until ? ` до ${esc(mode.until.slice(11, 16))}` : "";
+    return `
+      <form class="card" id="sleepForm" autocomplete="off">
+        <div class="row between">
+          <h3>${icon("moon")}Режим сна</h3>
+          <span class="pill"><span class="dot ${mode.sleeping ? "warn" : "ok"}"></span>${mode.sleeping ? "Спит" : "Активна"}${src ? ` · ${src}` : ""}${until}</span>
+        </div>
+        <p class="card-sub">Во сне колонка продолжает слушать (дневник пишется), но не реагирует на ключевое слово и не светится. Разбудить — фразой ниже или кнопкой. Средняя кнопка на плате работает всегда.</p>
+        <div class="row" style="margin-bottom:10px">
+          <button type="button" class="btn ${mode.sleeping ? "primary" : ""}" data-sleep="${mode.sleeping ? 0 : 1}">${icon(mode.sleeping ? "sun" : "moon")}${mode.sleeping ? "Разбудить" : "Уснуть"}</button>
+        </div>
+        ${switchField("sleep_schedule", "По расписанию", st.sleep_schedule)}
+        <div class="row" style="gap:10px">
+          <div class="field" style="flex:1"><label for="f_sleep_start">Засыпать в</label><input class="input" type="time" id="f_sleep_start" name="sleep_start" value="${esc(st.sleep_start || "23:00")}"></div>
+          <div class="field" style="flex:1"><label for="f_sleep_end">Просыпаться в</label><input class="input" type="time" id="f_sleep_end" name="sleep_end" value="${esc(st.sleep_end || "07:00")}"></div>
+        </div>
+        ${textField("sleep_phrases", "Фразы «уснуть»", st.sleep_phrases, "Через запятую. Срабатывают, если сказаны целиком (или после фразы активации).")}
+        ${textField("awake_phrases", "Фразы «проснуться»", st.awake_phrases, "Работают во сне без ключевого слова: «не спи», «проснись».")}
+        ${saveRow()}
+      </form>`;
   }
 
   async function onSpeakerClick(ev) {
     const t = ev.target;
     const fw = t.closest("[data-fw]");
+    const mic = t.closest("[data-mic]");
+    const sleep = t.closest("[data-sleep]");
     try {
-      if (t.closest("#spSayBtn")) {
+      if (mic) {
+        await postJson("/api/satellites/microphone", { listen: mic.dataset.mic === "1" });
+        toast(mic.dataset.mic === "1" ? "Микрофон включён" : "Микрофон выключен");
+        await poll();
+        renderSpeaker();
+      } else if (sleep) {
+        const res = await postJson("/api/mode", { sleep: sleep.dataset.sleep === "1" });
+        toast(res.sleeping ? "Колонка спит" : "Колонка проснулась");
+        await poll();
+        renderSpeaker();
+      } else if (t.closest("#spSayBtn")) {
         const text = $("#spSay").value.trim();
         if (!text) return;
         await postJson("/api/satellites/say", { text });
@@ -672,10 +742,7 @@
   async function onSpeakerChange(ev) {
     const t = ev.target;
     try {
-      if (t.id === "spVol") {
-        state.settings = await postJson("/api/settings", { sat_volume: Number(t.value) });
-        toast(`Громкость ${t.value}%`);
-      } else if (t.dataset.fw === "upload" && t.files && t.files[0]) {
+      if (t.dataset.fw === "upload" && t.files && t.files[0]) {
         const file = t.files[0];
         const kind = /factory/i.test(file.name) ? "factory" : "ota";
         state.firmware = await api(`/api/firmware/upload/${kind}`, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file });
@@ -1308,6 +1375,7 @@
     ms: (x) => `${x} мс`,
     sec: (x) => `${Math.round(x / 1000)} с`,
     vol: (x) => `${x}%`,
+    db: (x) => `${x} дБ`,
   };
   const switchField = (name, label, checked, hint) =>
     `<div class="field"><label class="switch"><input type="checkbox" name="${name}" ${checked ? "checked" : ""}><span class="track"></span>${esc(label)}</label>${hint ? `<div class="hint">${esc(hint)}</div>` : ""}</div>`;
@@ -1522,9 +1590,10 @@
           ${saveRow()}
         </form>
         <form class="card" id="wwForm" autocomplete="off">
-          <h3>${icon("mic")}Ключевое слово</h3>
-          <p class="card-sub">openWakeWord работает на ПК и слушает колонку всегда, независимо от дневника.</p>
-          ${selectField("wake_word", "Слово", s.wake_word, wake.length ? wake : [[s.wake_word, s.wake_word]], "Своё слово: положите обученную модель <span class='mono'>.onnx</span> в папку <span class='mono'>wakewords</span> дополнения и перезапустите.")}
+          <h3>${icon("mic")}Фраза активации</h3>
+          <p class="card-sub">Два способа, работают вместе. Модель openWakeWord реагирует мгновенно, но знает только готовые английские слова. Свои фразы — любые русские слова: они ищутся в распознанном тексте, поэтому срабатывают после того, как вы договорили (≈1 с).</p>
+          ${textField("wake_phrases", "Свои фразы (по тексту)", s.wake_phrases, "Через запятую, например: <span class='mono'>алекса, колонка, дом</span>. «Колонка, включи свет» выполнится целиком; просто «колонка» — колонка начнёт слушать команду. Пусто — выключено.")}
+          ${selectField("wake_word", "Модель openWakeWord", s.wake_word, wake.length ? wake : [[s.wake_word, s.wake_word]], "Своё слово: положите обученную модель <span class='mono'>.onnx</span> в папку <span class='mono'>wakewords</span> дополнения и перезапустите.")}
           ${rangeField("wake_threshold", "Чувствительность", s.wake_threshold, 0.2, 0.9, 0.05, "pct", "Ниже — откликается легче (и чаще ошибается).", ["чутче", "строже"])}
           ${rangeField("command_silence_ms", "Пауза — конец команды", s.command_silence_ms, 300, 2000, 100, "ms")}
           ${selectField("wake_backend", "Где работает", s.wake_backend, [["local", "В этом дополнении (рекомендуется)"], ["wyoming", "Внешний Wyoming openWakeWord"]])}
@@ -1747,7 +1816,6 @@
   view("speaker").addEventListener("click", onSpeakerClick);
   view("speaker").addEventListener("change", onSpeakerChange);
   view("speaker").addEventListener("input", (ev) => {
-    if (ev.target.id === "spVol") ev.target.nextElementSibling.textContent = `${ev.target.value}%`;
   });
   view("speaker").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && ev.target.id === "spSay") $("#spSayBtn").click();
