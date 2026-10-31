@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from audio_utils import TARGET_RATE, duration_ms, to_wav
+from audio_utils import TARGET_RATE, duration_ms, rms, to_wav
 from settings import SettingsStore
 from speakers import SpeakerStore
 from stt_client import transcribe
@@ -239,6 +239,8 @@ class DialogueRuntime:
         self._capture_buf = bytearray()
         self._capture_pcm: bytes | None = None
         self._capture_started_at: float | None = None
+        # one board only: with two boards their chunks would interleave (2x long, "slow")
+        self._capture_source: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -255,7 +257,7 @@ class DialogueRuntime:
     def queued(self) -> int:
         return self.queue.qsize() if self.queue else 0
 
-    def capture_start(self, seconds: float = 8.0) -> dict[str, Any]:
+    def capture_start(self, seconds: float = 8.0, source: str | None = None) -> dict[str, Any]:
         if self.pcm_clients <= 0:
             raise ValueError("Колонка не подключена к HA Voice. Проверьте, что она в сети и включён «Слушать».")
         seconds = max(2.0, min(20.0, float(seconds)))
@@ -264,6 +266,7 @@ class DialogueRuntime:
         self._capture_started_at = now
         self._capture_buf = bytearray()
         self._capture_pcm = None
+        self._capture_source = source  # None: the first board that sends audio
         return self.capture_status()
 
     def capture_stop(self) -> dict[str, Any]:
@@ -299,6 +302,7 @@ class DialogueRuntime:
             "duration_ms": done_ms if pcm else buf_ms,
             "pcm_clients": self.pcm_clients,
             "live_rms": round(self.live_rms, 4),
+            "source": self._capture_source,
         }
 
     def capture_pcm(self) -> bytes | None:
@@ -306,9 +310,14 @@ class DialogueRuntime:
             self._finish_capture()
         return self._capture_pcm
 
-    def feed_capture(self, pcm: bytes) -> None:
+    def feed_capture(self, pcm: bytes, source: str | None = None) -> None:
         if self._capture_until is None:
             return
+        if self._capture_source is None:
+            self._capture_source = source
+        elif source != self._capture_source:
+            return
+        self.live_rms = rms(pcm)  # the level meter in the recording dialog
         now = time.time()
         if now >= self._capture_until:
             self._finish_capture()

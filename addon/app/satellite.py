@@ -510,7 +510,7 @@ class Satellite:
         if real:
             self.last_audio_at = time.time()
             self.live_rms = rms(pcm)
-            self.hub.runtime.feed_capture(pcm)
+            self.hub.runtime.feed_capture(pcm, self.id)
         # the board hears its own reply: ignore the mic while speaking
         if self.speaking or time.monotonic() < self.mute_until:
             return

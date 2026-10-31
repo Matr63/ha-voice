@@ -1,5 +1,5 @@
 name: HA Voice
-version: "2.2.6"
+version: "2.2.7"
 slug: ha_voice
 description: >-
   Голосовой ассистент на ПК для колонки Waveshare: плата — микрофон и динамик,

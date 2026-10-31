@@ -159,10 +159,11 @@ respeaker_xvf3800:
   i2c_id: internal_i2c
   address: 0x2C
   # Mute key on the board: the DSP mutes the mics by itself, the switch mirrors it.
+  # Hidden: "on = muted" read backwards; the "Микрофон" switch below shows it as on = works.
   mute_switch:
     id: mic_mute_switch
-    name: "Микрофон выключен (кнопка)"
-    icon: mdi:microphone-off
+    name: "Mic mute"
+    internal: true
     update_interval: 1s
     on_turn_on:
       - script.execute:
@@ -208,9 +209,6 @@ microphone:
     microphone:
       microphone: i2s_mics_raw
       channels: [0, 1]
-      # must match the I2S stream: with the default (16) the decimator reported
-      # 16-bit while passing 32-bit samples, and the server heard audio 2x slow
-      bits_per_sample: 32
 
 speaker:
   - platform: i2s_audio
@@ -408,6 +406,16 @@ interval:
           id(respeaker).set_led_ring(colors);
 
 switch:
+  # On = the mics work. Same state as the mute key on the board (red marks on the ring when off).
+  - platform: template
+    id: mic_switch
+    name: "Микрофон"
+    icon: mdi:microphone
+    lambda: return !id(mic_mute_switch).state;
+    turn_on_action:
+      - switch.turn_off: mic_mute_switch
+    turn_off_action:
+      - switch.turn_on: mic_mute_switch
   - platform: template
     id: listen_switch
     name: "Слушать"

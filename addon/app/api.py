@@ -385,7 +385,10 @@ def create_app(ctx: AppContext) -> web.Application:
 
     async def capture_start(request: web.Request) -> web.Response:
         data = await _json_obj(request)
-        return web.json_response(runtime.capture_start(float(data.get("seconds", 8))))
+        source = data.get("id") or None
+        if source and hub.get(source) is None:
+            raise ValueError("Эта колонка не подключена")
+        return web.json_response(runtime.capture_start(float(data.get("seconds", 8)), source))
 
     async def capture_get(_: web.Request) -> web.Response:
         return web.json_response(runtime.capture_status())

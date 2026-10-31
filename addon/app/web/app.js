@@ -1300,6 +1300,7 @@
       <div class="small muted">Встаньте у колонки и говорите обычным голосом. Можно прочитать:</div>
       <div class="phrase">${esc(randomPhrase())}</div>
       ${existing ? "" : `<div class="field" style="margin:0"><label for="vName">Имя</label><input class="input" id="vName" maxlength="40" placeholder="Например: Папа"></div>`}
+      ${satellites().length > 1 ? `<div class="field" style="margin:0"><label for="cSat">Колонка</label><select class="input" id="cSat">${satellites().map((x) => `<option value="${esc(x.id)}" ${x.id === satId() ? "selected" : ""}>${esc(x.name)}${x.room ? ` · ${esc(x.room)}` : ""}</option>`).join("")}</select><div class="hint">Записывайте с той колонки, у которой обычно говорите.</div></div>` : ""}
       <div class="meter"><div class="meter-fill" id="cFill"></div></div>
       <div class="ain-status muted" id="cStatus">Нажмите «Начать запись»</div>
       <audio id="cAudio" controls hidden style="width:100%"></audio>
@@ -1376,7 +1377,8 @@
           try {
             ready = false;
             $("#cAudio", dlg).hidden = true;
-            await postJson("/api/capture/start", { seconds });
+            const cs = $("#cSat", dlg);
+            await postJson("/api/capture/start", { seconds, id: cs ? cs.value : satId() });
             $("#cStart", dlg).hidden = true;
             $("#cStop", dlg).hidden = false;
             $("#cAgain", dlg).hidden = true;
