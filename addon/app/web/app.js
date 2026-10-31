@@ -4,7 +4,8 @@
   const BASE = String(window.HV_BASE || "").replace(/\/+$/, "");
   const PAGE = 50;
   const POLL_MS = 4000;
-  const TABS = ["overview", "diary", "voices", "assist", "test", "settings"];
+  const TABS = ["speaker", "diary", "voices", "tts", "assistant", "settings"];
+  const TAB_ALIASES = { overview: "speaker", assist: "assistant", test: "voices" };
   const SECURE = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -37,6 +38,9 @@
     link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
     flask: '<path d="M9 2h6"/><path d="M10 2v6L4 19a2 2 0 0 0 1.8 3h12.4a2 2 0 0 0 1.8-3L14 8V2"/><path d="M7 15h10"/>',
     speaker: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/>',
+    chip: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
+    robot: '<rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" x2="8" y1="16" y2="16"/><line x1="16" x2="16" y1="16" y2="16"/>',
+    home: '<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
   };
   const icon = (name, cls = "") =>
     `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ""}</svg>`;
@@ -408,7 +412,7 @@
 
   /* ---------------- state ---------------- */
   const state = {
-    tab: "overview",
+    tab: "speaker",
     status: null,
     statsToday: null,
     statsAll: null,
@@ -416,6 +420,11 @@
     speakers: [],
     settings: null,
     gate: { events: [] },
+    firmware: null,
+    assistantLog: [],
+    agents: null,
+    wakeModels: null,
+    ha: null,
     diary: { items: [], total: 0, q: "", speaker: "", day: "", seen: new Set(), seeded: false },
     playingId: null,
     modalOpen: false,
@@ -424,7 +433,6 @@
   const loadSpeakers = async () => { state.speakers = (await api("/api/speakers")).speakers || []; };
   const loadStatsAll = async () => { state.statsAll = await api("/api/stats"); };
   const loadSettings = async () => { state.settings = await api("/api/settings"); };
-  const loadGate = async () => { state.gate = await api("/api/gate/events?limit=150"); };
   async function loadOverviewData() {
     const [today, recent] = await Promise.all([
       api(`/api/stats?since=${encodeURIComponent(startOfTodayIso())}`),
@@ -435,6 +443,17 @@
   }
 
   /* ---------------- header ---------------- */
+  const SAT_STATES = {
+    idle: ["ok", "Жду ключевое слово"],
+    wake: ["ok live", "Услышала ключевое слово"],
+    listening: ["ok live", "Слушаю команду"],
+    thinking: ["warn live", "Думаю"],
+    replying: ["ok live", "Отвечаю"],
+    error: ["bad", "Ошибка"],
+  };
+  const BACKENDS = { ha: "Home Assistant", openai: "LLM (OpenAI-совместимый)", off: "выключен" };
+  const satellite = () => (state.status && state.status.satellites && state.status.satellites[0]) || null;
+
   function renderPills() {
     const el = $("#pills");
     const s = state.status;
@@ -442,110 +461,165 @@
       el.innerHTML = pill("bad", "Нет связи с сервисом");
       return;
     }
-    const stt = s.stt.online ? pill("ok", `STT · ${s.stt.model}`) : pill("warn live", "STT загружается…");
-    const gate = !s.gate.active
-      ? pill("warn", "Фильтр ТВ: нет голосов")
-      : s.gate.require_match
-        ? pill("ok", "Фильтр ТВ включён")
-        : pill("warn", "Фильтр ТВ выключен");
+    const sat = satellite();
+    let col;
+    if (!sat) col = pill("bad", "Колонка не подключена");
+    else if (!sat.listening) col = pill("warn", "Колонка: микрофон выключен");
+    else {
+      const [dot, text] = SAT_STATES[sat.state] || ["ok", sat.state];
+      col = pill(dot, `Колонка · ${text}`);
+    }
+    const stt = s.stt.online ? pill("ok", "GigaAM") : pill("warn live", "GigaAM загружается…");
     let tts;
-    if (!s.tts || !s.tts.enabled) tts = pill("", "TTS выключен");
-    else if (s.tts.online) tts = pill("ok", `TTS · Kokoro ${s.tts.voice || ""}`);
-    else tts = pill("warn live", "TTS загружается…");
-    let diary;
-    if (!s.diary.enabled) diary = pill("", "Дневник выключен");
-    else if (s.diary.pcm_clients > 0) diary = pill("ok live", "Дневник слушает");
-    else diary = pill("warn", "Дневник: нет звука с ESP");
-    el.innerHTML = stt + tts + gate + diary;
+    if (!s.tts || !s.tts.enabled) tts = pill("", "Kokoro выключен");
+    else if (s.tts.online) tts = pill("ok", `Kokoro · ${s.tts.voice || ""}`);
+    else tts = pill("warn live", "Kokoro загружается…");
+    const a = s.assistant || {};
+    const asst = a.backend === "off" ? pill("", "Ассистент выключен") : pill(a.ha_configured || a.backend === "openai" ? "ok" : "warn", `Ассистент · ${BACKENDS[a.backend] || a.backend}`);
+    el.innerHTML = col + stt + tts + asst;
     $("#footer").textContent = `HA Voice ${s.version} · работает ${fmtUptime(s.uptime_s)}`;
   }
 
-  /* ---------------- overview ---------------- */
+  /* ---------------- speaker (board) ---------------- */
   function recentItem(u) {
     return `<div class="utt"><div class="utt-time">${fmtTime(u.ts)}</div><div><div class="utt-head">${speakerChip(u.speaker_id, u.speaker_name)}</div><div class="utt-text">${esc(u.text)}</div></div><div></div></div>`;
   }
 
-  function renderOverview() {
-    const v = view("overview");
+  const fmtBytes = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} МБ` : `${Math.round(n / 1024)} КБ`);
+  const loadFirmware = async () => { state.firmware = await api("/api/firmware"); };
+
+  function firmwareCard(sat) {
+    const fw = state.firmware || { files: {}, ota: {} };
+    const f = fw.files || {};
+    const fileRow = (kind, label) => {
+      const x = f[kind];
+      return `<dt>${esc(label)}</dt><dd class="small">${x ? `${fmtBytes(x.size)} · ${x.source === "github" ? "с GitHub" : "загружен вручную"} · ${fmtAgoTs(new Date(x.ts * 1000).toISOString())}` : `<span class="muted">нет</span>`}</dd>
+        <dd>${x ? `<a class="btn ghost icon sm" href="${BASE}/api/firmware/${kind}.bin" title="Скачать">${icon("download")}</a>` : ""}</dd>`;
+    };
+    const job = sat ? (fw.ota || {})[sat.ip] : null;
+    let jobLine = "";
+    if (job) {
+      if (job.status === "uploading") jobLine = `<div class="small warn" style="margin-top:8px">${icon("refresh", "spin")} Прошиваю ${esc(job.ip)}… не выключайте колонку (1–2 мин)</div>`;
+      else if (job.status === "done") jobLine = `<div class="small ok" style="margin-top:8px">${icon("check")} Прошито, колонка перезагружается и сама подключится</div>`;
+      else jobLine = `<div class="small bad" style="margin-top:8px">${icon("alert")} ${esc(job.error || "ошибка")}</div>`;
+    }
+    const webSerial = window.isSecureContext && "serial" in navigator;
+    return `
+      <div class="card">
+        <h3>${icon("chip")}Прошивка колонки</h3>
+        <p class="card-sub">Первый раз — по USB. Дальше — по Wi‑Fi кнопкой «Обновить по сети», кабель не нужен.</p>
+        <dl class="kv">
+          ${fileRow("factory", "factory.bin (USB)")}
+          ${fileRow("ota", "ota.bin (по сети)")}
+        </dl>
+        <div class="row" style="margin-top:10px;flex-wrap:wrap">
+          <button class="btn" data-fw="fetch">${icon("refresh")}Скачать последнюю</button>
+          <label class="btn ghost">${icon("upload")}Свой .bin<input type="file" accept=".bin" data-fw="upload" hidden></label>
+          <button class="btn primary" data-fw="ota" ${sat && sat.proto >= 2 && f.ota ? "" : "disabled"} title="${sat ? "" : "Колонка не подключена"}">${icon("upload")}Обновить по сети</button>
+        </div>
+        ${jobLine}
+        <details style="margin-top:12px">
+          <summary class="small">Первая прошивка по USB</summary>
+          <ol class="hint" style="margin:8px 0 0;padding-left:18px">
+            <li>Подключите плату Waveshare кабелем USB‑C к компьютеру.</li>
+            ${webSerial ? `<li>Нажмите <b>«Прошить по USB»</b> ниже и выберите порт.</li>` : `<li>Скачайте <b>factory.bin</b>, откройте <a href="https://web.esphome.io" target="_blank" rel="noopener">web.esphome.io</a> в Chrome/Edge → Connect → Install → выберите файл.</li>`}
+            <li>После прошивки задайте Wi‑Fi: на том же сайте (Improv) или подключитесь к сети <b>HA-Voice-Setup</b> с телефона.</li>
+            <li>Колонка сама найдёт HA Voice (по умолчанию <span class="mono">homeassistant.local</span>). Другой адрес — сущность «Сервер HA Voice» у устройства в HA или веб‑страница платы.</li>
+          </ol>
+          ${webSerial && f.factory ? `<div style="margin-top:10px"><esp-web-install-button manifest="${BASE}/api/firmware/manifest.json"><button slot="activate" class="btn primary">${icon("chip")}Прошить по USB</button></esp-web-install-button></div>` : ""}
+        </details>
+      </div>`;
+  }
+
+  let espToolsLoaded = false;
+  function ensureEspWebTools() {
+    if (espToolsLoaded || !(window.isSecureContext && "serial" in navigator)) return;
+    espToolsLoaded = true;
+    const sc = document.createElement("script");
+    sc.type = "module";
+    sc.src = "https://unpkg.com/esp-web-tools@10.1.0/dist/web/install-button.js?module";
+    document.head.appendChild(sc);
+  }
+
+  function renderSpeaker() {
+    const v = view("speaker");
     const s = state.status;
     if (!s) {
       v.innerHTML = banner("bad", "Сервис недоступен", "Проверьте, что дополнение запущено, и откройте его журнал.");
       return;
     }
+    const sat = satellite();
+    const st = state.settings || {};
     const today = state.statsToday || { period: 0, period_unknown: 0 };
-    const host = location.hostname;
-    const p = s.ports || {};
-    const fresh = s.diary.last_audio_age_s != null && s.diary.last_audio_age_s < 5;
-    const vad = state.settings ? state.settings.diary_vad_rms : null;
-
+    const fresh = sat && sat.last_audio_age_s != null && sat.last_audio_age_s < 5;
+    const vad = st.diary_vad_rms;
     const banners = [];
-    if (!s.stt.online)
-      banners.push(banner("info", "Модель распознавания загружается", "При первом запуске скачиваются веса GigaAM. Обычно это 1–5 минут."));
-    if (!s.gate.active)
+    if (!s.stt.online) banners.push(banner("info", "Модель распознавания загружается", "При первом запуске скачиваются веса GigaAM. Обычно это 1–5 минут."));
+    if (!sat)
       banners.push(
         banner(
           "warn",
-          "Голоса ещё не записаны",
-          "Пока нет ни одного голоса, Assist выполняет любые команды — в том числе с ТВ.",
-          `<button class="btn sm primary" data-goto="voices">${icon("userPlus")}Добавить голос</button>`
+          "Колонка не подключена",
+          `Прошейте Waveshare прошивкой HA Voice (карточка «Прошивка» ниже) и подключите к Wi‑Fi. Она сама подключится к этому серверу на порт <b>${esc(s.ports.pcm)}</b>.`
         )
       );
-    if (s.tts && s.tts.enabled && !s.tts.online)
-      banners.push(banner("info", "Озвучка Kokoro-ru загружается", "Первый запуск скачивает модель. Пока можно оставить Piper в Assist."));
-    if (s.diary.dropped > 0)
-      banners.push(banner("warn", "Дневник не успевает", `Пропущено реплик: ${s.diary.dropped}. Процессор не справляется — увеличьте «Минимальную длину реплики» или перенесите сервис на более мощную машину.`));
+    else if (sat.proto < 2)
+      banners.push(banner("warn", "Старая прошивка (room_diary)", "Дневник работает, но колонка не умеет отвечать голосом и не показывает состояние. Обновите прошивку по USB."));
+    if (sat && sat.wake_error) banners.push(banner("bad", "Ключевое слово не загрузилось", esc(sat.wake_error)));
+    if (s.diary.dropped > 0) banners.push(banner("warn", "Дневник не успевает", `Пропущено реплик: ${s.diary.dropped}. Процессор не справляется.`));
 
-    let mic;
-    if (!s.diary.enabled) mic = "Дневник выключен";
-    else if (!s.diary.pcm_clients) mic = "Устройство не подключено к порту дневника";
-    else if (!fresh) mic = "Подключено, тишина";
-    else mic = s.diary.live_rms >= (vad ?? 1) ? "Слышу речь" : "Слышу фон";
-
+    let mic = "—";
+    if (sat) {
+      if (!sat.listening) mic = "Микрофон выключен переключателем «Слушать»";
+      else if (!fresh) mic = "Подключено, звука нет";
+      else mic = sat.live_rms >= (vad ?? 1) ? "Слышу речь" : "Слышу фон";
+    }
+    const [dot, stateText] = sat ? SAT_STATES[sat.state] || ["", sat.state] : ["bad", "нет связи"];
+    const wakeLabel = (s.wake && s.wake.word) || "alexa";
     const last = s.last_utterance;
+    const lastCmd = (s.assistant || {}).last;
     const steps = [
       [s.stt.online, "Модель GigaAM загружена", "Загружается при первом запуске."],
-      [s.gate.accepted + s.gate.rejected > 0, `Home Assistant подключён к порту ${p.gate}`, "Wyoming Protocol → этот хост и порт, затем выберите его как «Распознавание речи»."],
-      [!(s.tts && s.tts.enabled) || s.tts.online, s.tts && s.tts.enabled ? `Kokoro-ru на порту ${p.tts}` : "Озвучка Kokoro выключена", "Wyoming Protocol → этот хост и порт TTS. В ассистенте «Синтез речи» = Kokoro или Piper."],
-      [s.speakers > 0, "Записан хотя бы один голос", "Вкладка «Голоса» или «Кто это?» в дневнике."],
-      [s.diary.pcm_clients > 0, "Waveshare передаёт звук в дневник", "Пакет esphome/room_diary_package.yaml и переключатель «Room diary»."],
-    ];
-
-    const conn = [
-      ["Assist STT (фильтр голосов)", `${host}:${p.gate}`],
-      ["Assist TTS (Kokoro-ru)", `${host}:${p.tts}`],
-      ["STT без фильтра", `${host}:${p.stt}`],
-      ["Дневник ESP (PCM)", `${host}:${p.pcm}`],
-      ["API интеграции HA Voice", `${host}:${p.api}`],
+      [!(s.tts && s.tts.enabled) || s.tts.online, "Kokoro готов отвечать голосом", "Скачивается при первом запуске."],
+      [!!sat, "Колонка подключена", "Прошивка HA Voice + Wi‑Fi, см. «Прошивка колонки»."],
+      [s.speakers > 0, "Записан хотя бы один голос", "Вкладка «Голоса» → «Записать с колонки»."],
+      [(s.assistant || {}).backend === "off" || (s.assistant || {}).ha_configured, "Есть доступ к Home Assistant", "На HAOS — автоматически; в compose — адрес и токен в «Настройках»."],
     ];
 
     v.innerHTML = `
       ${banners.join("")}
-      <div class="grid grid-4">
-        ${statCard("Голосов записано", s.speakers, s.speakers ? "узнаются по голосу" : "пока никого")}
-        ${statCard("Реплик сегодня", today.period, `из них неизвестных: ${today.period_unknown}`)}
-        ${statCard("Assist: принято", s.gate.accepted, "с момента запуска")}
-        ${statCard("Assist: отклонено", s.gate.rejected, "чужие голоса и ТВ")}
-      </div>
-      <div class="grid grid-2" style="margin-top:14px">
+      <div class="grid grid-2">
         <div class="card">
-          <h3>${icon("wave")}Микрофон дневника</h3>
-          <div class="meter"><div class="meter-fill" style="width:${fresh ? levelPct(s.diary.live_rms) : 0}%"></div></div>
+          <div class="row between"><h3>${icon("speaker")}${esc(sat ? sat.name : "Колонка")}</h3><span class="pill"><span class="dot ${dot}"></span>${esc(stateText)}</span></div>
+          <div class="meter" style="margin-top:8px"><div class="meter-fill" style="width:${fresh ? levelPct(sat.live_rms) : 0}%"></div></div>
           <div class="row between small" style="margin-top:8px">
             <span>${esc(mic)}</span>
-            <span class="mono muted">${fresh ? s.diary.live_rms.toFixed(3) : "—"}${vad != null ? ` / порог ${vad.toFixed(3)}` : ""}</span>
+            <span class="mono muted">${fresh ? sat.live_rms.toFixed(3) : "—"}${vad != null ? ` / порог ${Number(vad).toFixed(3)}` : ""}</span>
           </div>
-          <div style="margin-top:14px">
-            <div class="stat-label">Последняя реплика</div>
-            ${last ? `<div class="utt-head" style="margin-top:6px">${speakerChip(last.speaker_id, last.speaker_name)}<span class="utt-meta">${fmtAgoTs(last.ts)}</span></div><div>${esc(last.text)}</div>` : `<div class="muted small" style="margin-top:4px">Пока ничего не записано</div>`}
-          </div>
-        </div>
-        <div class="card">
-          <h3>${icon("link")}Подключение</h3>
-          <dl class="kv">
-            ${conn.map(([k, val]) => `<dt>${esc(k)}</dt><dd class="mono">${esc(val)}</dd><dd><button class="btn ghost icon sm" data-copy="${esc(val)}" title="Скопировать">${icon("copy")}</button></dd>`).join("")}
+          ${sat ? `
+          <dl class="kv" style="margin-top:12px">
+            <dt>Адрес</dt><dd class="mono">${esc(sat.ip)}</dd><dd><a class="btn ghost icon sm" href="http://${esc(sat.ip)}" target="_blank" rel="noopener" title="Веб-страница платы">${icon("link")}</a></dd>
+            <dt>Ключевое слово</dt><dd>${esc(wakeLabel)} · уверенность ${pct(sat.wake_score)}</dd><dd></dd>
+            <dt>Прошивка</dt><dd class="small">${sat.proto >= 2 ? `HA Voice · ESPHome ${esc(sat.esphome || "?")}` : "room_diary (старая)"}</dd><dd></dd>
+            <dt>На связи</dt><dd>${fmtUptime(sat.connected_s)}</dd><dd></dd>
           </dl>
-          <p class="small muted" style="margin-bottom:0">Wyoming Protocol: STT порт <b>${esc(p.gate)}</b>, TTS порт <b>${esc(p.tts)}</b>. В ассистенте распознавание = HA Voice, синтез = Kokoro-ru <i>или</i> Piper.</p>
+          <div class="field" style="margin-top:12px">
+            <label for="spVol">Громкость</label>
+            <div class="range-row"><input type="range" id="spVol" min="0" max="100" step="5" value="${st.sat_volume ?? 60}"><output>${st.sat_volume ?? 60}%</output></div>
+          </div>
+          <div class="row" style="flex-wrap:wrap">
+            <input class="input" id="spSay" placeholder="Сказать на колонке…" maxlength="400" style="flex:1;min-width:180px">
+            <button class="btn primary" id="spSayBtn" ${sat.can_speak ? "" : "disabled"}>${icon("speaker")}Сказать</button>
+            <button class="btn" id="spListen" title="Как будто сказали ключевое слово">${icon("mic")}Слушать команду</button>
+          </div>` : ""}
         </div>
+        ${firmwareCard(sat)}
+      </div>
+      <div class="grid grid-4" style="margin-top:14px">
+        ${statCard("Голосов записано", s.speakers, s.speakers ? "узнаются по голосу" : "пока никого")}
+        ${statCard("Реплик сегодня", today.period, `из них неизвестных: ${today.period_unknown}`)}
+        ${statCard("Пустых распознаваний", s.diary.stt_empty || 0, "речь без текста, см. журнал")}
+        ${statCard("Ассистент", BACKENDS[(s.assistant || {}).backend] || "—", "меняется во вкладке «Ассистент»")}
       </div>
       <div class="grid grid-2" style="margin-top:14px">
         <div class="card">
@@ -553,12 +627,64 @@
           <ul class="checklist">
             ${steps.map(([done, title, hint]) => `<li><span class="check ${done ? "done" : ""}">${icon("check")}</span><div><div>${esc(title)}</div>${done ? "" : `<div class="small muted">${esc(hint)}</div>`}</div></li>`).join("")}
           </ul>
+          ${lastCmd ? `<div class="stat-label" style="margin-top:12px">Последняя команда</div><div style="margin-top:4px">«${esc(lastCmd.text || "")}»${lastCmd.reply ? ` → ${esc(lastCmd.reply)}` : ""}</div>` : ""}
+          ${last ? `<div class="stat-label" style="margin-top:12px">Последняя реплика</div><div class="utt-head" style="margin-top:6px">${speakerChip(last.speaker_id, last.speaker_name)}<span class="utt-meta">${fmtAgoTs(last.ts)}</span></div><div>${esc(last.text)}</div>` : ""}
         </div>
         <div class="card">
-          <div class="row between"><h3>${icon("book")}Последние реплики</h3><button class="btn sm ghost" data-goto="diary">Весь дневник →</button></div>
-          ${state.recent.length ? state.recent.map(recentItem).join("") : emptyBox("book", "Реплик пока нет. Включите дневник и поговорите рядом с устройством.")}
+          <div class="row between"><h3>${icon("book")}Дневник</h3><button class="btn sm ghost" data-goto="diary">Весь дневник →</button></div>
+          ${state.recent.length ? state.recent.map(recentItem).join("") : emptyBox("book", "Реплик пока нет. Поговорите рядом с колонкой.")}
         </div>
       </div>`;
+    ensureEspWebTools();
+  }
+
+  async function onSpeakerClick(ev) {
+    const t = ev.target;
+    const fw = t.closest("[data-fw]");
+    try {
+      if (t.closest("#spSayBtn")) {
+        const text = $("#spSay").value.trim();
+        if (!text) return;
+        await postJson("/api/satellites/say", { text });
+        toast("Говорю на колонке");
+      } else if (t.closest("#spListen")) {
+        await postJson("/api/satellites/listen", {});
+        toast("Колонка слушает команду");
+      } else if (fw && fw.dataset.fw === "fetch") {
+        fw.disabled = true;
+        fw.innerHTML = `${icon("refresh", "spin")}Скачиваю…`;
+        state.firmware = await postJson("/api/firmware/fetch", {});
+        toast("Прошивка скачана");
+        renderSpeaker();
+      } else if (fw && fw.dataset.fw === "ota") {
+        const sat = satellite();
+        if (!(await confirmDialog("Обновить прошивку по сети?", `Колонка ${sat ? sat.ip : ""} перезагрузится примерно через минуту.`, "Обновить"))) return;
+        await postJson("/api/firmware/ota", { id: sat && sat.id });
+        await loadFirmware();
+        renderSpeaker();
+      }
+    } catch (err) {
+      showError(err);
+      if (fw && fw.dataset.fw === "fetch") renderSpeaker();
+    }
+  }
+
+  async function onSpeakerChange(ev) {
+    const t = ev.target;
+    try {
+      if (t.id === "spVol") {
+        state.settings = await postJson("/api/settings", { sat_volume: Number(t.value) });
+        toast(`Громкость ${t.value}%`);
+      } else if (t.dataset.fw === "upload" && t.files && t.files[0]) {
+        const file = t.files[0];
+        const kind = /factory/i.test(file.name) ? "factory" : "ota";
+        state.firmware = await api(`/api/firmware/upload/${kind}`, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file });
+        toast(`${kind}.bin загружен`);
+        renderSpeaker();
+      }
+    } catch (err) {
+      showError(err);
+    }
   }
 
   /* ---------------- diary ---------------- */
@@ -678,7 +804,7 @@
     if (!d.items.length) {
       list.innerHTML = emptyBox(
         "book",
-        filtered ? "Ничего не найдено — измените фильтры." : "Реплик пока нет. Включите запись и поговорите рядом с устройством."
+        filtered ? "Ничего не найдено — измените фильтры." : "Реплик пока нет. Поговорите рядом с колонкой."
       );
     } else {
       let html = "";
@@ -831,7 +957,7 @@
 
   /* ---------------- voices ---------------- */
   function renderVoices() {
-    const v = view("voices");
+    const v = $("#voicesMain");
     const counts = Object.fromEntries(((state.statsAll && state.statsAll.by_speaker) || []).map((x) => [x.speaker_id, x]));
     const cards = state.speakers
       .map((s) => {
@@ -849,7 +975,7 @@
             <div class="small muted">${c ? `${c.count} ${plural(c.count, "реплика", "реплики", "реплик")} в дневнике · последняя ${fmtAgoTs(c.last_ts)}` : "В дневнике пока нет реплик"}</div>
             <div>${enough ? badge("ok", "check", "Образцов достаточно") : badge("warn", "alert", "Мало образцов — добавьте ещё 2–3")}</div>
             <div class="voice-actions">
-              <button class="btn sm" data-act="sample">${icon("mic")}Ещё с ESP</button>
+              <button class="btn sm" data-act="sample">${icon("mic")}Ещё с колонки</button>
               <button class="btn sm ghost" data-act="rename">${icon("edit")}Переименовать</button>
               <span class="spacer"></span>
               <button class="btn sm ghost icon danger" data-act="delete" title="Удалить голос">${icon("trash")}</button>
@@ -862,17 +988,17 @@
     v.innerHTML = `
       ${banner(
         espOk ? "info" : "warn",
-        espOk ? "Лучший способ — запись с Waveshare" : "Waveshare ещё не шлёт звук в дневник",
+        espOk ? "Лучший способ — запись с колонки" : "Колонка не подключена",
         espOk
-          ? "Нажмите «Записать с ESP» — плата пишет 8 с тем же микрофоном, что слышит команды. После записи можно прослушать и сохранить."
-          : "Включите переключатель Room diary у устройства Waveshare. На Обзоре должно быть «Дневник слушает»."
+          ? "Нажмите «Записать с колонки» — 8 секунд тем же микрофоном, что слышит команды. После записи можно прослушать и сохранить."
+          : "Подключите колонку (вкладка «Колонка»). Пока можно загрузить файл или записать в браузере."
       )}
       <div class="row" style="margin-bottom:14px">
-        <button class="btn primary" data-act="esp"${espOk ? "" : " disabled"}>${icon("mic")}Записать с ESP</button>
+        <button class="btn primary" data-act="esp"${espOk ? "" : " disabled"}>${icon("mic")}Записать с колонки</button>
         <button class="btn" data-act="add">${icon("upload")}Файл / браузер</button>
       </div>
       <div class="grid grid-2">
-        ${cards || emptyBox("user", "Голосов пока нет — запишите первый с ESP.")}
+        ${cards || emptyBox("user", "Голосов пока нет — запишите первый с колонки.")}
       </div>`;
   }
 
@@ -904,7 +1030,7 @@
     const body = document.createElement("div");
     body.className = "stack";
     body.innerHTML = `
-      <div class="small muted">Встаньте у Waveshare и говорите обычным голосом. Можно прочитать:</div>
+      <div class="small muted">Встаньте у колонки и говорите обычным голосом. Можно прочитать:</div>
       <div class="phrase">${esc(randomPhrase())}</div>
       ${existing ? "" : `<div class="field" style="margin:0"><label for="vName">Имя</label><input class="input" id="vName" maxlength="40" placeholder="Например: Папа"></div>`}
       <div class="meter"><div class="meter-fill" id="cFill"></div></div>
@@ -976,7 +1102,7 @@
     };
 
     openModal({
-      title: existing ? `Образец с ESP: ${existing.name}` : "Запись голоса с ESP",
+      title: existing ? `Образец с колонки: ${existing.name}` : "Запись голоса с колонки",
       body,
       onOpen: (dlg) => {
         $("#cStart", dlg).addEventListener("click", async () => {
@@ -1115,66 +1241,13 @@
     });
   }
 
-  /* ---------------- assist ---------------- */
-  const REASONS = {
-    match: "Голос узнан",
-    unknown_voice: "Чужой голос или ТВ",
-    no_speakers: "Голоса не записаны — без проверки",
-    filter_off: "Фильтр выключен — без проверки",
-  };
-
-  function renderAssist() {
-    const v = view("assist");
-    const s = state.status;
-    const g = state.gate;
-    const events = (g.events || [])
-      .map((e) => {
-        const b = !e.accepted
-          ? badge("bad", "x", "Отклонено")
-          : e.reason === "match"
-            ? badge("ok", "check", "Принято")
-            : badge("warn", "info", "Без проверки");
-        const who = e.speaker_id
-          ? `${speakerChip(e.speaker_id, e.speaker_name, !e.matched)}<span class="utt-meta">${pct(e.score)}</span>`
-          : "";
-        const text = e.text ? esc(e.text) : `<span class="muted">${e.accepted ? "— пусто" : "распознаётся…"}</span>`;
-        return `
-          <div class="event">
-            <div class="utt-time">${fmtTime(e.ts)}</div>
-            <div>${b}<div class="utt-meta" style="margin-top:4px">${esc(REASONS[e.reason] || e.reason)}</div></div>
-            <div><div class="utt-head">${who}<span class="utt-meta">${fmtDur(e.duration_ms)}</span></div><div class="event-text">${text}</div></div>
-          </div>`;
-      })
-      .join("");
-
-    const filter = !s
-      ? "—"
-      : !s.gate.active
-        ? "нет голосов"
-        : s.gate.require_match
-          ? "включён"
-          : "выключен";
-    v.innerHTML = `
-      <div class="grid grid-4">
-        ${statCard("Принято", g.accepted ?? 0, "с момента запуска")}
-        ${statCard("Отклонено", g.rejected ?? 0, "чужие голоса и ТВ")}
-        ${statCard("Порог узнавания", s ? pct(s.gate.threshold) : "—", "меняется в «Настройках»")}
-        ${statCard("Фильтр", filter, "отклонять незнакомые голоса")}
-      </div>
-      <div class="card" style="margin-top:14px">
-        <div class="row between"><h3>${icon("shield")}Журнал команд Assist</h3><button class="btn sm ghost" data-goto="test">${icon("flask")}Проверить запись</button></div>
-        <p class="card-sub">STT — порт ${esc(s ? s.ports.gate : "")}. Озвучка ответа — порт ${esc(s && s.ports.tts ? s.ports.tts : "10351")} (Kokoro-ru) либо Piper в Assist. Отклонённые команды не выполняются.</p>
-        ${events || emptyBox("shield", "Команд пока не было. Скажите ключевое слово рядом с Waveshare.")}
-      </div>`;
-  }
-
   /* ---------------- test ---------------- */
   function ensureTest() {
-    const v = view("test");
+    const v = $("#voicesTest");
     if (v.dataset.ready) return;
     v.dataset.ready = "1";
     v.innerHTML = `
-      <div class="grid grid-2">
+      <div class="grid grid-2" style="margin-top:14px">
         <div class="card">
           <h3>${icon("flask")}Проверить запись</h3>
           <p class="card-sub">Загрузите или запишите фразу — покажу, что распознает GigaAM и узнает ли голос. Чтобы проверить ТВ, загрузите кусок передачи.</p>
@@ -1219,7 +1292,7 @@
       <h3>Результат</h3>
       <div class="field"><label>Распознанный текст</label><div class="phrase">${res.text ? esc(res.text) : "— ничего не распознано"}</div></div>
       <div class="row">
-        ${res.assist_accepted ? badge("ok", "check", "Assist выполнил бы команду") : badge("bad", "x", "Assist отклонил бы команду")}
+        ${res.assist_accepted ? badge("ok", "check", "Команда была бы выполнена") : badge("bad", "x", "Команда была бы отклонена")}
         <span class="small muted">${fmtDur(res.duration_ms)} · порог ${pct(th)}</span>
       </div>
       <div class="stack" style="margin-top:14px">
@@ -1228,12 +1301,13 @@
       </div>`;
   }
 
-  /* ---------------- settings ---------------- */
+  /* ---------------- shared form helpers ---------------- */
   const FMT = {
     pct: (x) => `${Math.round(x * 100)}%`,
     rms: (x) => Number(x).toFixed(3),
     ms: (x) => `${x} мс`,
     sec: (x) => `${Math.round(x / 1000)} с`,
+    vol: (x) => `${x}%`,
   };
   const switchField = (name, label, checked, hint) =>
     `<div class="field"><label class="switch"><input type="checkbox" name="${name}" ${checked ? "checked" : ""}><span class="track"></span>${esc(label)}</label>${hint ? `<div class="hint">${esc(hint)}</div>` : ""}</div>`;
@@ -1244,7 +1318,52 @@
       ${scale ? `<div class="range-scale"><span>${esc(scale[0])}</span><span>${esc(scale[1])}</span></div>` : ""}
       ${hint ? `<div class="hint">${esc(hint)}</div>` : ""}
     </div>`;
+  const textField = (name, label, value, hint, attrs = "") => `
+    <div class="field">
+      <label for="f_${name}">${esc(label)}</label>
+      <input class="input" id="f_${name}" name="${name}" value="${esc(value ?? "")}" autocomplete="off" ${attrs}>
+      ${hint ? `<div class="hint">${hint}</div>` : ""}
+    </div>`;
+  const selectField = (name, label, value, options, hint) => `
+    <div class="field">
+      <label for="f_${name}">${esc(label)}</label>
+      <select class="input" id="f_${name}" name="${name}">${options
+        .map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(value) ? "selected" : ""}>${esc(l)}</option>`)
+        .join("")}</select>
+      ${hint ? `<div class="hint">${hint}</div>` : ""}
+    </div>`;
 
+  // Every settings form posts only its own fields; the server merges them.
+  function bindSettingsForm(form, after) {
+    form.addEventListener("input", (e) => {
+      if (e.target.type === "range" && e.target.dataset.fmt) e.target.nextElementSibling.textContent = FMT[e.target.dataset.fmt](Number(e.target.value));
+    });
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const payload = {};
+      for (const el of form.elements) {
+        if (!el.name) continue;
+        if (el.type === "checkbox") payload[el.name] = el.checked;
+        else if (el.type === "number" || el.type === "range") payload[el.name] = Number(el.value);
+        else payload[el.name] = el.value;
+      }
+      const btn = $("button[type=submit]", form);
+      if (btn) btn.disabled = true;
+      try {
+        state.settings = await postJson("/api/settings", payload);
+        toast("Сохранено");
+        await poll();
+        if (after) await after();
+      } catch (err) {
+        showError(err);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+  }
+  const saveRow = () => `<div class="row" style="margin-top:6px"><span class="spacer"></span><button type="submit" class="btn primary">${icon("check")}Сохранить</button></div>`;
+
+  /* ---------------- tts (Kokoro) ---------------- */
   let ttsAudioUrl = null;
   async function playTts(text, voice) {
     const res = await fetch(BASE + "/api/tts", {
@@ -1262,10 +1381,204 @@
     const blob = await res.blob();
     if (ttsAudioUrl) URL.revokeObjectURL(ttsAudioUrl);
     ttsAudioUrl = URL.createObjectURL(blob);
-    const audio = new Audio(ttsAudioUrl);
-    await audio.play();
+    await new Audio(ttsAudioUrl).play();
   }
 
+  function renderTts() {
+    const v = view("tts");
+    const s = state.settings;
+    const st = state.status;
+    if (!s) {
+      v.innerHTML = emptyBox("alert", "Не удалось загрузить настройки");
+      return;
+    }
+    const tts = (st && st.tts) || {};
+    const sat = satellite();
+    const voices = (tts.voices || [{ id: "sveta", label: "Света" }, { id: "masha", label: "Маша" }, { id: "dima", label: "Дима" }]).map((x) => [
+      x.id,
+      `${x.label}${x.gender ? (x.gender === "female" ? " · жен." : " · муж.") : ""}`,
+    ]);
+    const ttsStatus = !tts.enabled ? "выключена в конфигурации дополнения" : tts.online ? "готова" : "загружается";
+    v.innerHTML = `
+      <div class="grid grid-2">
+        <form class="card" id="ttsForm" autocomplete="off">
+          <h3>${icon("speaker")}Голос ответов — Kokoro-ru</h3>
+          <p class="card-sub">Озвучка ${esc(ttsStatus)}. Ответы ассистента звучат на колонке этим голосом — Piper и карточка «Синтез речи» в Assist не нужны.</p>
+          ${selectField("tts_voice", "Голос", s.tts_voice, voices)}
+          ${rangeField("sat_volume", "Громкость колонки", s.sat_volume ?? 60, 0, 100, 5, "vol")}
+          ${saveRow()}
+        </form>
+        <div class="card">
+          <h3>${icon("play")}Проверка</h3>
+          <div class="field">
+            <label for="ttsText">Текст</label>
+            <input class="input" id="ttsText" value="Привет! Я колонка HA Voice. Чем помочь?" maxlength="400">
+          </div>
+          <div class="row" style="flex-wrap:wrap">
+            <button type="button" class="btn primary" id="ttsBoard" ${sat && sat.can_speak && tts.online ? "" : "disabled"}>${icon("speaker")}На колонке</button>
+            <button type="button" class="btn" id="ttsBrowser" ${tts.online ? "" : "disabled"}>${icon("play")}В браузере</button>
+          </div>
+          <p class="small muted" style="margin-bottom:0">Kokoro также доступен как Wyoming TTS на порту ${esc(st && st.ports ? st.ports.tts : "10351")} — только если хотите использовать его в обычном Assist.</p>
+        </div>
+      </div>`;
+    bindSettingsForm($("#ttsForm"), async () => renderTts());
+    const voice = () => $("#f_tts_voice").value;
+    $("#ttsBrowser").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        await playTts($("#ttsText").value.trim(), voice());
+      } catch (err) {
+        showError(err);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    $("#ttsBoard").addEventListener("click", async () => {
+      try {
+        await postJson("/api/satellites/say", { text: $("#ttsText").value.trim(), voice: voice() });
+        toast("Говорю на колонке");
+      } catch (err) {
+        showError(err);
+      }
+    });
+  }
+
+  /* ---------------- assistant ---------------- */
+  async function loadAssistant() {
+    const jobs = [api("/api/assistant/log?limit=100").then((r) => { state.assistantLog = r.log || []; })];
+    if (!state.wakeModels) jobs.push(api("/api/wake/models").then((r) => { state.wakeModels = r.models || []; }));
+    if (!state.agents)
+      jobs.push(
+        api("/api/assistant/agents")
+          .then((r) => { state.agents = r.agents || []; })
+          .catch(() => { state.agents = [{ id: "", name: "Home Assistant (встроенный)" }]; })
+      );
+    await Promise.all(jobs);
+  }
+
+  function logItem(e) {
+    const who = e.speaker ? `<span class="chip" style="--h:${hue(e.speaker)}">${esc(e.speaker)}</span>` : "";
+    const b = e.rejected
+      ? badge("bad", "x", "Отклонено")
+      : e.error && !e.reply
+        ? badge("bad", "alert", "Ошибка")
+        : (e.actions || []).length
+          ? badge("ok", "check", "Выполнено")
+          : badge("", "info", "Ответ");
+    const actions = (e.actions || [])
+      .map((a) => `<span class="mono small">${esc(a.service || a.type || "")} ${esc(Array.isArray(a.target) ? a.target.join(", ") : a.target || "")}</span>`)
+      .join(" · ");
+    return `
+      <div class="event">
+        <div class="utt-time">${fmtTime(e.ts)}</div>
+        <div>${b}<div class="utt-meta" style="margin-top:4px">${esc(e.satellite === "panel" ? "из панели" : e.satellite || "")}</div></div>
+        <div>
+          <div class="utt-head">${who}${e.duration_ms ? `<span class="utt-meta">${fmtDur(e.duration_ms)}</span>` : ""}</div>
+          <div class="event-text">«${esc(e.text || e.heard || "—")}»</div>
+          ${e.reply ? `<div class="small" style="margin-top:4px">${icon("speaker")} ${esc(e.reply)}</div>` : ""}
+          ${actions ? `<div style="margin-top:4px">${actions}</div>` : ""}
+          ${e.error ? `<div class="small bad" style="margin-top:4px">${esc(e.error)}</div>` : ""}
+        </div>
+      </div>`;
+  }
+
+  function renderAssistantLog() {
+    const el = $("#asLog");
+    if (el) el.innerHTML = state.assistantLog.length ? state.assistantLog.map(logItem).join("") : emptyBox("robot", `Команд пока не было. Скажите «${esc(((state.status || {}).wake || {}).word || "alexa")}» рядом с колонкой.`);
+  }
+
+  function renderAssistant() {
+    const v = view("assistant");
+    const s = state.settings;
+    if (!s) {
+      v.innerHTML = emptyBox("alert", "Не удалось загрузить настройки");
+      return;
+    }
+    const wake = (state.wakeModels || []).map((m) => [m.id, `${m.label}${m.kind === "custom" ? " (своё)" : ""}`]);
+    const agents = (state.agents || []).map((a) => [a.id, a.name]);
+    if (s.ha_agent_id && !agents.some(([id]) => id === s.ha_agent_id)) agents.push([s.ha_agent_id, s.ha_agent_id]);
+    const backend = s.assistant_backend;
+    v.innerHTML = `
+      <div class="grid grid-2">
+        <form class="card" id="asForm" autocomplete="off">
+          <h3>${icon("robot")}Мозг ассистента</h3>
+          <p class="card-sub">Фраза после ключевого слова распознаётся здесь (GigaAM), выполняется в Home Assistant, ответ звучит голосом Kokoro.</p>
+          ${selectField("assistant_backend", "Кто отвечает", backend, [
+            ["ha", "Агент Home Assistant (встроенные команды или ваш ИИ в HA)"],
+            ["openai", "LLM: Ollama / OpenAI-совместимый, с управлением домом"],
+            ["off", "Никто — только дневник"],
+          ])}
+          <div data-show="ha">
+            ${selectField("ha_agent_id", "Агент разговора HA", s.ha_agent_id, agents, "Встроенный понимает «включи свет на кухне» без интернета. Агент с ИИ (OpenAI, Ollama, Gemini) настраивается в HA.")}
+          </div>
+          <div data-show="openai">
+            ${textField("llm_url", "Адрес API", s.llm_url, "Ollama на этом ПК: <span class='mono'>http://127.0.0.1:11434/v1</span> (в compose — <span class='mono'>http://host.docker.internal:11434/v1</span>)")}
+            ${textField("llm_model", "Модель", s.llm_model, "Нужна модель с tool calling, например qwen2.5:7b или llama3.1:8b.")}
+            ${textField("llm_api_key", "API-ключ", s.llm_api_key, "Для Ollama не нужен.", 'type="password"')}
+            ${textField("assistant_domains", "Что доступно ассистенту", s.assistant_domains, "Домены через запятую. Управлять можно светом, розетками, шторами и т.п.; датчики — только читать.")}
+            <div class="field"><label for="f_llm_prompt">Дополнительные указания</label><textarea class="input" id="f_llm_prompt" name="llm_prompt" rows="3" placeholder="Например: обращайся ко мне на «ты», детскую называй комнатой Маши">${esc(s.llm_prompt || "")}</textarea></div>
+          </div>
+          ${saveRow()}
+        </form>
+        <form class="card" id="wwForm" autocomplete="off">
+          <h3>${icon("mic")}Ключевое слово</h3>
+          <p class="card-sub">openWakeWord работает на ПК и слушает колонку всегда, независимо от дневника.</p>
+          ${selectField("wake_word", "Слово", s.wake_word, wake.length ? wake : [[s.wake_word, s.wake_word]], "Своё слово: положите обученную модель <span class='mono'>.onnx</span> в папку <span class='mono'>wakewords</span> дополнения и перезапустите.")}
+          ${rangeField("wake_threshold", "Чувствительность", s.wake_threshold, 0.2, 0.9, 0.05, "pct", "Ниже — откликается легче (и чаще ошибается).", ["чутче", "строже"])}
+          ${rangeField("command_silence_ms", "Пауза — конец команды", s.command_silence_ms, 300, 2000, 100, "ms")}
+          ${selectField("wake_backend", "Где работает", s.wake_backend, [["local", "В этом дополнении (рекомендуется)"], ["wyoming", "Внешний Wyoming openWakeWord"]])}
+          <div data-show-wake="wyoming">${textField("wake_uri", "Адрес Wyoming", s.wake_uri, "Аддон openWakeWord на HAOS: <span class='mono'>tcp://core-openwakeword:10400</span>")}</div>
+          ${saveRow()}
+        </form>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h3>${icon("flask")}Проверить фразу</h3>
+        <div class="row" style="flex-wrap:wrap">
+          <input class="input" id="asText" placeholder="включи свет на кухне" maxlength="300" style="flex:1;min-width:200px">
+          <label class="switch"><input type="checkbox" id="asSpeak" checked><span class="track"></span>Ответить на колонке</label>
+          <button class="btn primary" id="asAsk">${icon("robot")}Спросить</button>
+        </div>
+        <div id="asResult" class="small" style="margin-top:8px"></div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div class="row between"><h3>${icon("shield")}Журнал команд</h3><span class="small muted">фильтр голосов: ${s.gate_require_match ? "чужим отказывать" : "выключен"}</span></div>
+        <div id="asLog"></div>
+      </div>`;
+
+    const syncShow = () => {
+      const b = $("#f_assistant_backend").value;
+      $$("[data-show]", v).forEach((el) => { el.hidden = el.dataset.show !== b; });
+      $$("[data-show-wake]", v).forEach((el) => { el.hidden = el.dataset.showWake !== $("#f_wake_backend").value; });
+    };
+    $("#f_assistant_backend").addEventListener("change", syncShow);
+    $("#f_wake_backend").addEventListener("change", syncShow);
+    syncShow();
+    bindSettingsForm($("#asForm"));
+    bindSettingsForm($("#wwForm"));
+    $("#asAsk").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      const text = $("#asText").value.trim();
+      if (!text) return;
+      btn.disabled = true;
+      $("#asResult").innerHTML = `${icon("refresh", "spin")} Думаю…`;
+      try {
+        const res = await postJson("/api/assistant/ask", { text, speak: $("#asSpeak").checked });
+        const r = res.result;
+        $("#asResult").innerHTML = r.error && !r.speech ? `<span class="bad">${esc(r.error)}</span>` : `${icon("speaker")} ${esc(r.speech || "(без ответа)")}`;
+        state.assistantLog.unshift(res.entry);
+        renderAssistantLog();
+      } catch (err) {
+        $("#asResult").textContent = "";
+        showError(err);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    renderAssistantLog();
+  }
+
+  /* ---------------- settings ---------------- */
   function renderSettings() {
     const v = view("settings");
     const s = state.settings;
@@ -1274,66 +1587,43 @@
       v.innerHTML = emptyBox("alert", "Не удалось загрузить настройки");
       return;
     }
-    const tts = (st && st.tts) || {};
-    const voiceOpts = (tts.voices || [
-      { id: "sveta", label: "Света" },
-      { id: "masha", label: "Маша" },
-      { id: "dima", label: "Дима" },
-    ])
-      .map((x) => `<option value="${esc(x.id)}" ${x.id === s.tts_voice ? "selected" : ""}>${esc(x.label)}</option>`)
-      .join("");
-    const ttsStatus = !tts.enabled
-      ? "выключена в конфигурации дополнения"
-      : tts.online
-        ? "онлайн"
-        : "загружается или недоступна";
+    const ha = state.ha;
+    const haLine = !ha ? "проверяю…" : ha.ok ? `подключено · Home Assistant ${esc(ha.version || "")}` : esc(ha.error || "нет доступа");
     v.innerHTML = `
-      <div class="card" style="margin-bottom:14px">
-        <h3>${icon("speaker")}Озвучка Kokoro-ru</h3>
-        <p class="card-sub">${esc(ttsStatus)} · порт ${esc(st && st.ports ? st.ports.tts : "10351")}. Piper можно оставить — в Assist выбирается один синтез.</p>
-        <div class="field">
-          <label for="ttsText">Проверка</label>
-          <div class="row">
-            <input class="input" id="ttsText" value="Привет. Это проверка озвучки Kokoro." maxlength="400">
-            <button type="button" class="btn primary" id="ttsPlay" ${tts.online ? "" : "disabled"}>${icon("play")}Произнести</button>
-          </div>
-        </div>
-        <ol class="hint" style="margin:8px 0 0;padding-left:18px">
-          <li>Настройки → Устройства и службы → Wyoming Protocol → добавить <b>${esc((typeof location !== "undefined" ? location.hostname : "127.0.0.1") + ":" + (st && st.ports ? st.ports.tts : "10351"))}</b></li>
-          <li>Голосовые ассистенты → ваш Assist → Синтез речи = Kokoro-ru <i>или</i> Piper</li>
-        </ol>
+      <div class="grid grid-2">
+        <form class="card" id="haForm" autocomplete="off">
+          <h3>${icon("home")}Home Assistant</h3>
+          <p class="card-sub">Только как «дом»: датчики и сервисы для ассистента. Сейчас: <b>${haLine}</b></p>
+          ${textField("ha_url", "Адрес", s.ha_url, "Пусто — на HAOS дополнение подключается само. Для docker compose: <span class='mono'>http://homeassistant.local:8123</span>", 'placeholder="автоматически (HAOS)"')}
+          ${textField("ha_token", "Долгосрочный токен", s.ha_token, "Профиль HA → Безопасность → Долгосрочные токены доступа.", 'type="password" placeholder="автоматически (HAOS)"')}
+          ${saveRow()}
+        </form>
+        <form class="card" id="gateForm" autocomplete="off">
+          <h3>${icon("shield")}Чьи команды выполнять</h3>
+          ${switchField("gate_require_match", "Отказывать незнакомым голосам и ТВ", s.gate_require_match, "Пока не записан ни один голос, выполняются все команды.")}
+          ${rangeField("gate_threshold", "Порог узнавания голоса", s.gate_threshold, 0.3, 0.9, 0.01, "pct", "Ниже — легче пропускает (ТВ может проскочить). Выше — строже. Начните с 55–65%.", ["мягче", "строже"])}
+          ${saveRow()}
+        </form>
       </div>
-      <form id="sForm" autocomplete="off">
+      <form class="card" id="diaryForm" autocomplete="off" style="margin-top:14px">
+        <h3>${icon("book")}Дневник и распознавание речи</h3>
         <div class="grid grid-2">
-          <div class="card">
-            <h3>${icon("shield")}Фильтр команд Assist</h3>
-            ${switchField("gate_require_match", "Отклонять чужие голоса и ТВ", s.gate_require_match, "Если выключить — все команды выполняются, а в журнале только отмечается, кто говорил.")}
-            ${rangeField("gate_threshold", "Порог узнавания голоса", s.gate_threshold, 0.3, 0.9, 0.01, "pct", "Ниже — легче пропускает (ТВ может проскочить). Выше — строже (может не узнать вас издалека). Начните с 55–65% и проверьте на вкладке «Проверка».", ["мягче", "строже"])}
-            <div class="field">
-              <label for="f_tts_voice">Голос Kokoro по умолчанию</label>
-              <select class="input" id="f_tts_voice" name="tts_voice">${voiceOpts}</select>
-              <div class="hint">Света / Маша — женские, Дима — мужской. В Assist можно выбрать тот же голос в карточке Wyoming TTS.</div>
-            </div>
-          </div>
-          <div class="card">
-            <h3>${icon("book")}Дневник комнаты</h3>
-            ${switchField("diary_enabled", "Записывать и расшифровывать речь", s.diary_enabled)}
-            ${rangeField("diary_vad_rms", "Порог громкости речи", s.diary_vad_rms, 0.002, 0.06, 0.001, "rms", "Если в дневник попадает шум — увеличьте; если тихая речь теряется — уменьшите. Ориентир — индикатор микрофона на «Обзоре».", ["чувствительнее", "грубее"])}
+          <div>
+            ${switchField("diary_enabled", "Записывать и расшифровывать речь", s.diary_enabled, "Ключевое слово работает и при выключенном дневнике.")}
+            ${rangeField("diary_vad_rms", "Порог громкости речи", s.diary_vad_rms, 0.002, 0.06, 0.001, "rms", "Шум попадает в дневник — увеличьте; тихая речь теряется — уменьшите. Ориентир — индикатор на вкладке «Колонка».", ["чувствительнее", "грубее"])}
             ${rangeField("diary_silence_ms", "Пауза, разделяющая реплики", s.diary_silence_ms, 300, 3000, 100, "ms")}
+          </div>
+          <div>
             ${rangeField("diary_min_speech_ms", "Минимальная длина реплики", s.diary_min_speech_ms, 200, 3000, 100, "ms", "Короче — не расшифровывается (кашель, стук).")}
             ${rangeField("diary_max_utterance_ms", "Максимальная длина реплики", s.diary_max_utterance_ms, 3000, 30000, 1000, "sec")}
             <div class="field">
               <label for="f_keep">Хранить аудио последних реплик</label>
               <input class="input" type="number" id="f_keep" name="diary_keep_audio" min="0" max="20000" step="50" value="${s.diary_keep_audio}">
-              <div class="hint">Нужно для прослушивания и «Кто это?». 0 — не хранить. ≈ 30–300 КБ на реплику.</div>
+              <div class="hint">Нужно для прослушивания и «Кто это?». 0 — не хранить.</div>
             </div>
           </div>
         </div>
-        <div class="row" style="margin-top:14px">
-          <span class="spacer"></span>
-          <button type="button" class="btn" id="sReset">Отменить изменения</button>
-          <button type="submit" class="btn primary" id="sSave">${icon("check")}Сохранить</button>
-        </div>
+        ${saveRow()}
       </form>
       <div class="card" style="margin-top:14px">
         <h3>${icon("info")}О сервисе</h3>
@@ -1341,51 +1631,19 @@
           <dt>Версия</dt><dd>${esc(st ? st.version : window.HV_VERSION)}</dd><dd></dd>
           <dt>Модель STT</dt><dd class="mono">${esc(st ? st.stt.model : "—")}</dd><dd></dd>
           <dt>Работает</dt><dd>${st ? fmtUptime(st.uptime_s) : "—"}</dd><dd></dd>
-          <dt>Порты</dt><dd class="mono">${st ? `STT ${st.ports.gate} · TTS ${st.ports.tts} · GigaAM ${st.ports.stt} · PCM ${st.ports.pcm} · API ${st.ports.api}` : "—"}</dd><dd></dd>
+          <dt>Колонка</dt><dd class="mono">${st ? `${location.hostname}:${st.ports.pcm}` : "—"}</dd><dd></dd>
+          <dt>Необязательно для Assist</dt><dd class="mono small">${st ? `Wyoming STT ${st.ports.gate} · TTS ${st.ports.tts}` : "—"}</dd><dd></dd>
         </dl>
-        <p class="small muted" style="margin-bottom:0">Настройки, сохранённые здесь, важнее параметров в конфигурации дополнения. Модель и устройство (CPU/GPU) меняются в конфигурации дополнения.</p>
+        <p class="small muted" style="margin-bottom:0">Настройки, сохранённые здесь, важнее параметров в конфигурации дополнения. Модель GigaAM и CPU/GPU меняются в конфигурации дополнения.</p>
       </div>`;
-
-    const form = $("#sForm");
-    form.addEventListener("input", (e) => {
-      if (e.target.type === "range") e.target.nextElementSibling.textContent = FMT[e.target.dataset.fmt](Number(e.target.value));
-    });
-    $("#sReset").addEventListener("click", () => renderSettings());
-    $("#ttsPlay").addEventListener("click", async () => {
-      const btn = $("#ttsPlay");
-      const text = $("#ttsText").value.trim();
-      if (!text) return;
-      btn.disabled = true;
-      try {
-        await playTts(text, $("#f_tts_voice") ? $("#f_tts_voice").value : s.tts_voice);
-      } catch (err) {
-        showError(err);
-      } finally {
-        btn.disabled = false;
-      }
-    });
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const payload = {};
-      for (const el of form.elements) {
-        if (!el.name) continue;
-        if (el.type === "checkbox") payload[el.name] = el.checked;
-        else if (el.type === "number" || el.type === "range") payload[el.name] = Number(el.value);
-        else payload[el.name] = el.value;
-      }
-      const btn = $("#sSave");
-      btn.disabled = true;
-      try {
-        state.settings = await postJson("/api/settings", payload);
-        toast("Настройки сохранены");
-        await poll();
-        renderSettings();
-      } catch (err) {
-        showError(err);
-      } finally {
-        btn.disabled = false;
-      }
-    });
+    const reload = async () => {
+      state.ha = await api("/api/ha").catch((err) => ({ ok: false, error: err.message }));
+      renderSettings();
+    };
+    bindSettingsForm($("#haForm"), reload);
+    bindSettingsForm($("#gateForm"));
+    bindSettingsForm($("#diaryForm"));
+    if (!ha) reload();
   }
 
   /* ---------------- routing & polling ---------------- */
@@ -1397,10 +1655,9 @@
   async function refreshTab() {
     try {
       switch (state.tab) {
-        case "overview":
-          if (!state.settings) await loadSettings();
-          await loadOverviewData();
-          renderOverview();
+        case "speaker":
+          await Promise.all([state.settings ? null : loadSettings(), loadOverviewData(), loadFirmware()]);
+          renderSpeaker();
           break;
         case "diary":
           ensureDiaryShell();
@@ -1410,13 +1667,15 @@
           break;
         case "voices":
           await refreshVoices();
-          break;
-        case "assist":
-          await loadGate();
-          renderAssist();
-          break;
-        case "test":
           ensureTest();
+          break;
+        case "tts":
+          await loadSettings();
+          renderTts();
+          break;
+        case "assistant":
+          await Promise.all([loadSettings(), loadAssistant()]);
+          renderAssistant();
           break;
         case "settings":
           await loadSettings();
@@ -1429,7 +1688,8 @@
   }
 
   function setTab(tab) {
-    if (!TABS.includes(tab)) tab = "overview";
+    tab = TAB_ALIASES[tab] || tab;
+    if (!TABS.includes(tab)) tab = "speaker";
     state.tab = tab;
     $$("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
     $$(".view").forEach((v) => v.classList.toggle("active", v.dataset.view === tab));
@@ -1446,16 +1706,23 @@
     renderPills();
   }
 
+  // Do not repaint a tab while the user is typing or dragging in it.
+  const editing = (name) => {
+    const el = document.activeElement;
+    return el && view(name).contains(el) && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName);
+  };
+
   async function tick() {
     await poll();
     if (state.modalOpen || document.hidden) return;
     try {
-      if (state.tab === "overview") {
-        await loadOverviewData();
-        renderOverview();
-      } else if (state.tab === "assist") {
-        await loadGate();
-        renderAssist();
+      if (state.tab === "speaker" && !editing("speaker")) {
+        const fw = state.firmware && Object.values(state.firmware.ota || {}).some((j) => j.status === "uploading");
+        await Promise.all([loadOverviewData(), fw ? loadFirmware() : null]);
+        renderSpeaker();
+      } else if (state.tab === "assistant") {
+        state.assistantLog = (await api("/api/assistant/log?limit=100")).log || [];
+        renderAssistantLog();
       } else if (state.tab === "diary" && state.diary.items.length <= PAGE && state.playingId == null) {
         await loadDiary();
       }
@@ -1477,8 +1744,16 @@
     const b = ev.target.closest("button[data-tab]");
     if (b) setTab(b.dataset.tab);
   });
-  view("voices").addEventListener("click", onVoicesClick);
-  view("voices").addEventListener("keydown", (ev) => {
+  view("speaker").addEventListener("click", onSpeakerClick);
+  view("speaker").addEventListener("change", onSpeakerChange);
+  view("speaker").addEventListener("input", (ev) => {
+    if (ev.target.id === "spVol") ev.target.nextElementSibling.textContent = `${ev.target.value}%`;
+  });
+  view("speaker").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && ev.target.id === "spSay") $("#spSayBtn").click();
+  });
+  $("#voicesMain").addEventListener("click", onVoicesClick);
+  $("#voicesMain").addEventListener("keydown", (ev) => {
     if ((ev.key === "Enter" || ev.key === " ") && ev.target.closest('[data-act="add"]')) {
       ev.preventDefault();
       openAddVoice();
@@ -1491,7 +1766,7 @@
 
   (async () => {
     await poll();
-    setTab(location.hash.slice(1) || "overview");
+    setTab(location.hash.slice(1) || "speaker");
     setInterval(tick, POLL_MS);
   })();
 })();

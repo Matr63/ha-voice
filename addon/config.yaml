@@ -1,10 +1,10 @@
-name: HA Voice (GigaAM)
-version: "1.2.0"
+name: HA Voice
+version: "2.0.0"
 slug: ha_voice
 description: >-
-  GigaAM STT, Kokoro-ru TTS, speaker enrollment, room diary.
+  Голосовой ассистент на ПК для колонки Waveshare: плата — микрофон и динамик,
+  здесь — wake word, GigaAM, узнавание голосов, дневник, ИИ для дома и Kokoro.
   Первая установка 10–30+ мин (torch) — смотрите Log дополнения, строки [ha-voice N/6].
-  После старта: Wyoming STT :10350, TTS :10351, UI Ingress :8088.
 url: https://github.com/Matr63/ha-voice
 arch:
   - amd64
@@ -16,20 +16,24 @@ ingress: true
 ingress_port: 8088
 panel_icon: mdi:microphone-message
 panel_title: HA Voice
+homeassistant_api: true
+discovery:
+  - ha_voice
 ports:
+  10500/tcp: 10500
+  8088/tcp: 8088
   10305/tcp: 10305
   10350/tcp: 10350
   10351/tcp: 10351
-  10500/tcp: 10500
-  8088/tcp: 8088
 ports_description:
-  10305/tcp: Wyoming STT (GigaAM) — optional direct
-  10350/tcp: Wyoming STT через speaker gate (рекомендуется для Assist)
-  10351/tcp: Wyoming TTS Kokoro-ru (синтез речи)
-  10500/tcp: PCM дневник с ESPHome
-  8088/tcp: API / UI
+  10500/tcp: Колонка HA Voice (прошивка спутника)
+  8088/tcp: API / UI (интеграция HA Voice)
+  10305/tcp: Wyoming STT GigaAM — необязательно
+  10350/tcp: Wyoming STT через фильтр голосов — необязательно, для Assist
+  10351/tcp: Wyoming TTS Kokoro-ru — необязательно, для Assist
 map:
   - addon_config:rw
+  - homeassistant_config:rw
   - media:rw
 options:
   stt_model: gigaam-v3-e2e-rnnt

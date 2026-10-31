@@ -4,42 +4,50 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import HaVoiceCoordinator
+from .entity import HaVoiceEntity
+
+SATELLITE_STATES = ["offline", "idle", "wake", "listening", "thinking", "replying", "error"]
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    coordinator: HaVoiceCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     async_add_entities(
         [
-            HaVoiceLastSpeaker(coordinator, entry),
-            HaVoiceLastText(coordinator, entry),
-            HaVoiceSpeakerCount(coordinator, entry),
+            SatelliteState(coordinator, entry),
+            LastSpeaker(coordinator, entry),
+            LastText(coordinator, entry),
+            LastCommand(coordinator, entry),
+            SpeakerCount(coordinator, entry),
         ]
     )
 
 
-class _Base(CoordinatorEntity[HaVoiceCoordinator], SensorEntity):
-    _attr_has_entity_name = True
+class SatelliteState(HaVoiceEntity, SensorEntity):
+    _attr_name = "Колонка"
+    _attr_icon = "mdi:speaker-wireless"
+    _attr_device_class = "enum"
+    _attr_options = SATELLITE_STATES
 
-    def __init__(self, coordinator: HaVoiceCoordinator, entry: ConfigEntry, key: str) -> None:
-        super().__init__(coordinator)
-        self._entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_{key}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": "HA Voice",
-            "manufacturer": "ha-voice",
-            "model": "GigaAM diary",
-        }
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "satellite_state")
+
+    @property
+    def native_value(self):
+        sat = self.satellite
+        return sat.get("state", "idle") if sat else "offline"
+
+    @property
+    def extra_state_attributes(self):
+        sat = self.satellite or {}
+        return {k: sat.get(k) for k in ("id", "ip", "listening", "live_rms", "can_speak")}
 
 
-class HaVoiceLastSpeaker(_Base):
-    _attr_name = "Last speaker"
+class LastSpeaker(HaVoiceEntity, SensorEntity):
+    _attr_name = "Последний говорящий"
     _attr_icon = "mdi:account-voice"
 
     def __init__(self, coordinator, entry):
@@ -50,9 +58,9 @@ class HaVoiceLastSpeaker(_Base):
         return (self.coordinator.data.get("diary") or {}).get("last_speaker")
 
 
-class HaVoiceLastText(_Base):
-    _attr_name = "Last transcript"
-    _attr_icon = "mdi:text"
+class LastText(HaVoiceEntity, SensorEntity):
+    _attr_name = "Дневник"
+    _attr_icon = "mdi:notebook-outline"
 
     def __init__(self, coordinator, entry):
         super().__init__(coordinator, entry, "last_text")
@@ -62,9 +70,32 @@ class HaVoiceLastText(_Base):
         text = (self.coordinator.data.get("diary") or {}).get("last_text") or ""
         return text[:255]
 
+    @property
+    def extra_state_attributes(self):
+        diary = self.coordinator.data.get("diary") or {}
+        return {"speaker": diary.get("last_speaker"), "ts": diary.get("last_ts")}
 
-class HaVoiceSpeakerCount(_Base):
-    _attr_name = "Enrolled speakers"
+
+class LastCommand(HaVoiceEntity, SensorEntity):
+    _attr_name = "Последняя команда"
+    _attr_icon = "mdi:robot-outline"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "last_command")
+
+    @property
+    def native_value(self):
+        last = (self.status.get("assistant") or {}).get("last") or {}
+        return (last.get("text") or "")[:255] or None
+
+    @property
+    def extra_state_attributes(self):
+        last = (self.status.get("assistant") or {}).get("last") or {}
+        return {k: last.get(k) for k in ("reply", "speaker", "ts", "error", "backend")}
+
+
+class SpeakerCount(HaVoiceEntity, SensorEntity):
+    _attr_name = "Голосов"
     _attr_icon = "mdi:account-group"
 
     def __init__(self, coordinator, entry):

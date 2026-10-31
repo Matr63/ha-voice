@@ -1,0 +1,6 @@
+DOMAIN = "ha_voice"
+CONF_HOST = "host"
+CONF_PORT = "port"
+CONF_BASE_URL = "base_url"
+DEFAULT_PORT = 8088
+DEFAULT_SCAN_INTERVAL = 10

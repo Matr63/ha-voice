@@ -28,12 +28,12 @@ class HaVoiceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             status = await self.api.status()
             diary = await self.api.diary()
             speakers = await self.api.speakers()
-            dialogues = await self.api.dialogues(limit=10)
-            return {
-                "status": status,
-                "diary": diary,
-                "speakers": speakers,
-                "dialogues": dialogues,
-            }
         except Exception as err:
             raise UpdateFailed(str(err)) from err
+        satellites = status.get("satellites") or []
+        return {
+            "status": status,
+            "diary": diary,
+            "speakers": speakers,
+            "satellite": satellites[0] if satellites else None,
+        }

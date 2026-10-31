@@ -1,0 +1,75 @@
+say:
+  name: Сказать на колонке
+  description: Озвучить текст голосом Kokoro на колонке HA Voice
+  fields:
+    text:
+      required: true
+      example: Ужин готов
+      selector:
+        text:
+    voice:
+      example: sveta
+      selector:
+        select:
+          options: [sveta, masha, dima]
+    satellite:
+      description: id колонки (по умолчанию первая подключённая)
+      selector:
+        text:
+
+ask:
+  name: Спросить ассистента
+  description: Передать фразу ассистенту HA Voice, как будто её сказали колонке
+  fields:
+    text:
+      required: true
+      example: включи свет на кухне
+      selector:
+        text:
+    speak:
+      default: true
+      selector:
+        boolean:
+    satellite:
+      selector:
+        text:
+
+set_volume:
+  name: Громкость колонки
+  fields:
+    volume:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+
+enroll_speaker:
+  name: Enroll speaker
+  description: Добавить/обновить голос (PCM16 mono, base64)
+  fields:
+    name:
+      required: true
+      example: папа
+      selector:
+        text:
+    audio_b64:
+      required: true
+      selector:
+        text:
+    rate:
+      default: 16000
+      selector:
+        number:
+          min: 8000
+          max: 48000
+
+set_diary:
+  name: Дневник
+  description: Включить/выключить расшифровку речи в дневник
+  fields:
+    enabled:
+      required: true
+      selector:
+        boolean:

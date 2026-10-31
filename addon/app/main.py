@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Speaker gate (Wyoming) + room-diary PCM server + HTTP API/UI in one process."""
+"""HA Voice brain: satellite server (:10500), assistant, diary, optional Wyoming gate, HTTP API/UI."""
 from __future__ import annotations
 
 import asyncio
@@ -7,9 +7,14 @@ import logging
 import os
 from pathlib import Path
 
+import ha_install
 from api import AppContext, start_api
-from dialogue import DialogueRuntime, DialogueStore, run_pcm_server
+from assistant import Assistant
+from dialogue import DialogueRuntime, DialogueStore
+from firmware import FirmwareStore
 from gate_server import GateState, run_gate
+from ha_client import HaClient
+from satellite import SatelliteHub
 from settings import SettingsStore
 from speakers import SpeakerStore
 from version import __version__
@@ -47,11 +52,19 @@ async def amain() -> None:
 
     tts_uri = os.environ.get("TTS_CLIENT_URI", "tcp://127.0.0.1:10351")
     tts_enabled = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    ha = HaClient(settings)
+    assistant = Assistant(settings, ha)
+    hub = SatelliteHub(settings, runtime, assistant, stt_uri, tts_uri)
+    firmware = FirmwareStore(Path(os.environ.get("FIRMWARE_DIR", "/data/firmware")))
     ctx = AppContext(
         settings=settings,
         store=store,
         runtime=runtime,
         gate=gate_state,
+        hub=hub,
+        assistant=assistant,
+        ha=ha,
+        firmware=firmware,
         stt_uri=stt_uri,
         stt_model=os.environ.get("STT_MODEL", "gigaam-v3-e2e-rnnt"),
         tts_uri=tts_uri,
@@ -69,7 +82,8 @@ async def amain() -> None:
 
     await asyncio.gather(
         run_gate(gate_uri, upstream, store, settings, gate_state),
-        run_pcm_server("0.0.0.0", pcm_port, runtime),
+        hub.serve("0.0.0.0", pcm_port),
+        ha_install.run(api_port),
     )
 
 

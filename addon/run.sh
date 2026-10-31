@@ -139,10 +139,10 @@ if [ "${TTS_ENABLED}" = "true" ]; then
   python3 /app/tts_server.py --uri "${TTS_URI}" --voice "${TTS_VOICE}" >"${TTS_LOG}" 2>&1 &
   TTS_PID=$!
 else
-  echo "[ha-voice] TTS disabled (tts_enabled=false) — use Piper in Assist if needed"
+  echo "[ha-voice] TTS disabled (tts_enabled=false) — колонка не сможет отвечать голосом"
 fi
 
-echo "[ha-voice] starting speaker gate + diary API (Wyoming :10350, UI :8088, PCM :10500)"
+echo "[ha-voice] starting HA Voice (колонка :10500, UI :8088, Wyoming STT :10350 — необязательно)"
 python3 /app/main.py >"${GATE_LOG}" 2>&1 &
 GATE_PID=$!
 

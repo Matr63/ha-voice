@@ -1,30 +1,26 @@
-"""Room diary: PCM ingest → VAD → speaker match → STT → SQLite/JSONL (+ audio clips)."""
+"""Room diary: utterances (cut by the satellite VAD) → speaker match → STT → SQLite/JSONL (+ audio clips)."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import sqlite3
-import struct
 import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from audio_utils import TARGET_RATE, duration_ms, normalize_pcm, rms, to_wav
+from audio_utils import TARGET_RATE, duration_ms, to_wav
 from settings import SettingsStore
 from speakers import SpeakerStore
 from stt_client import transcribe
 
 _LOGGER = logging.getLogger("ha-voice.dialogue")
 
-# Frame: b"HV01" + rate(u32 BE) + nbytes(u32 BE) + PCM16 mono
-MAGIC = b"HV01"
-MAX_FRAME_BYTES = 64000
 UNKNOWN = "__unknown__"
 
-_COLUMNS = "id, ts, speaker_id, speaker_name, score, text, duration_ms, has_audio"
+_COLUMNS = "id, ts, speaker_id, speaker_name, score, text, duration_ms, has_audio, source"
 
 
 class DialogueStore:
@@ -59,6 +55,8 @@ class DialogueStore:
             cols = {row[1] for row in conn.execute("PRAGMA table_info(utterances)")}
             if "has_audio" not in cols:
                 conn.execute("ALTER TABLE utterances ADD COLUMN has_audio INTEGER NOT NULL DEFAULT 0")
+            if "source" not in cols:
+                conn.execute("ALTER TABLE utterances ADD COLUMN source TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_utt_ts ON utterances(ts)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_utt_speaker ON utterances(speaker_id)")
 
@@ -73,13 +71,14 @@ class DialogueStore:
         score: float,
         duration: int,
         pcm: bytes | None,
+        source: str | None = None,
     ) -> dict[str, Any]:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         with closing(self._connect()) as conn, conn:
             cur = conn.execute(
-                "INSERT INTO utterances (ts, speaker_id, speaker_name, score, text, duration_ms, has_audio)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (ts, speaker_id, speaker_name or "unknown", score, text, duration, 1 if pcm else 0),
+                "INSERT INTO utterances (ts, speaker_id, speaker_name, score, text, duration_ms, has_audio, source)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (ts, speaker_id, speaker_name or "unknown", score, text, duration, 1 if pcm else 0, source),
             )
             utt_id = int(cur.lastrowid)
         if pcm:
@@ -93,6 +92,7 @@ class DialogueStore:
             "text": text,
             "duration_ms": duration,
             "has_audio": bool(pcm),
+            "source": source,
         }
         with (self.root_dir / f"{ts[:10]}.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps({k: v for k, v in row.items() if k != "has_audio"}, ensure_ascii=False) + "\n")
@@ -224,7 +224,8 @@ class DialogueRuntime:
         self.live_rms = 0.0
         self.processed = 0
         self.dropped = 0
-        self.queue: asyncio.Queue[bytes] | None = None
+        self.stt_empty = 0
+        self.queue: asyncio.Queue[tuple[bytes, str | None]] | None = None
         self._worker_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._capture_until: float | None = None
@@ -249,7 +250,7 @@ class DialogueRuntime:
 
     def capture_start(self, seconds: float = 8.0) -> dict[str, Any]:
         if self.pcm_clients <= 0:
-            raise ValueError("ESP не подключён к порту дневника. Включите переключатель Room diary.")
+            raise ValueError("Колонка не подключена к HA Voice. Проверьте, что она в сети и включён «Слушать».")
         seconds = max(2.0, min(20.0, float(seconds)))
         now = time.time()
         self._capture_until = now + seconds
@@ -298,7 +299,7 @@ class DialogueRuntime:
             self._finish_capture()
         return self._capture_pcm
 
-    def _feed_capture(self, pcm: bytes) -> None:
+    def feed_capture(self, pcm: bytes) -> None:
         if self._capture_until is None:
             return
         now = time.time()
@@ -309,11 +310,11 @@ class DialogueRuntime:
         if len(self._capture_buf) + len(pcm) <= TARGET_RATE * 2 * 25:
             self._capture_buf.extend(pcm)
 
-    def submit(self, pcm: bytes) -> None:
+    def submit(self, pcm: bytes, source: str | None = None) -> None:
         if self.queue is None:
             return
         try:
-            self.queue.put_nowait(pcm)
+            self.queue.put_nowait((pcm, source))
         except asyncio.QueueFull:
             self.dropped += 1
             _LOGGER.warning("Diary queue full, utterance dropped")
@@ -321,15 +322,17 @@ class DialogueRuntime:
     async def _worker(self) -> None:
         assert self.queue is not None
         while True:
-            pcm = await self.queue.get()
+            pcm, source = await self.queue.get()
             try:
-                await self.process_utterance(pcm)
+                await self.process_utterance(pcm, source=source)
             except Exception:
                 _LOGGER.exception("Diary processing failed")
             finally:
                 self.queue.task_done()
 
-    async def process_utterance(self, pcm: bytes, force: bool = False) -> dict[str, Any] | None:
+    async def process_utterance(
+        self, pcm: bytes, force: bool = False, source: str | None = None
+    ) -> dict[str, Any] | None:
         """pcm: 16 kHz mono PCM16."""
         s = self.settings.get()
         if not pcm or (not force and not s.diary_enabled):
@@ -342,6 +345,11 @@ class DialogueRuntime:
             match = await asyncio.to_thread(self.store.match, pcm)
             text = await transcribe(self.stt_uri, pcm)
             if not text:
+                self.stt_empty += 1
+                _LOGGER.info(
+                    "diary: STT empty for %d ms utterance from %s (voice %s %.2f) — not saved",
+                    dur, source or "upload", match.name if match.matched else "unknown", match.score,
+                )
                 return None
             keep = s.diary_keep_audio
             row = self.dialogue_store.add(
@@ -351,6 +359,7 @@ class DialogueRuntime:
                 score=round(float(match.score), 3),
                 duration=dur,
                 pcm=pcm if keep > 0 else None,
+                source=source,
             )
             self.processed += 1
             if keep > 0 and self.processed % 20 == 0:
@@ -358,103 +367,3 @@ class DialogueRuntime:
             self.last_utterance = row
             _LOGGER.info("diary [%s %.2f] %s", row["speaker_name"], match.score, text)
             return row
-
-
-class PcmSession:
-    """Energy VAD over the framed stream. The ESP may skip silent frames,
-    so a read timeout also counts as silence."""
-
-    def __init__(self, runtime: DialogueRuntime) -> None:
-        self.runtime = runtime
-        self.buf = bytearray()
-        self.in_speech = False
-        self.silence_ms = 0
-        self.speech_ms = 0
-
-    def feed(self, pcm: bytes, rate: int = TARGET_RATE) -> None:
-        # pcm уже нормализован в handle_pcm_client
-        s = self.runtime.settings.get()
-        level = rms(pcm)
-        frame_ms = duration_ms(pcm)
-
-        if level >= s.diary_vad_rms:
-            if not self.in_speech:
-                self.in_speech = True
-                self.buf = bytearray()
-                self.speech_ms = 0
-            self.buf.extend(pcm)
-            self.speech_ms += frame_ms
-            self.silence_ms = 0
-            if self.speech_ms >= s.diary_max_utterance_ms:
-                self.flush()
-            return
-
-        if self.in_speech:
-            self.buf.extend(pcm)
-            self.silence_ms += frame_ms
-            if self.silence_ms >= s.diary_silence_ms:
-                self.flush()
-
-    def flush(self) -> None:
-        if self.in_speech and self.buf:
-            self.runtime.submit(bytes(self.buf))
-        self.buf = bytearray()
-        self.in_speech = False
-        self.silence_ms = 0
-        self.speech_ms = 0
-
-
-async def handle_pcm_client(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    runtime: DialogueRuntime,
-) -> None:
-    peer = writer.get_extra_info("peername")
-    _LOGGER.info("PCM client connected %s", peer)
-    runtime.pcm_clients += 1
-    session = PcmSession(runtime)
-    try:
-        while True:
-            timeout = runtime.settings.get().diary_silence_ms / 1000.0
-            try:
-                hdr = await asyncio.wait_for(reader.readexactly(12), timeout)
-            except asyncio.TimeoutError:
-                session.flush()
-                runtime.live_rms = 0.0
-                continue
-            if hdr[:4] != MAGIC:
-                _LOGGER.warning("Bad PCM magic from %s", peer)
-                break
-            rate, nbytes = struct.unpack(">II", hdr[4:12])
-            if nbytes <= 0 or nbytes > MAX_FRAME_BYTES or not 8000 <= rate <= 48000:
-                _LOGGER.warning("Bad PCM frame from %s: rate=%s bytes=%s", peer, rate, nbytes)
-                break
-            pcm = await reader.readexactly(nbytes)
-            if rate != TARGET_RATE:
-                pcm = normalize_pcm(pcm, rate)
-            runtime.live_rms = rms(pcm)
-            runtime.last_audio_at = time.time()
-            runtime._feed_capture(pcm)
-            if runtime.enabled:
-                session.feed(pcm)
-    except asyncio.IncompleteReadError:
-        pass
-    except Exception:
-        _LOGGER.exception("PCM client error")
-    finally:
-        session.flush()
-        runtime.pcm_clients = max(0, runtime.pcm_clients - 1)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        _LOGGER.info("PCM client disconnected %s", peer)
-
-
-async def run_pcm_server(host: str, port: int, runtime: DialogueRuntime) -> None:
-    runtime.start()
-    server = await asyncio.start_server(lambda r, w: handle_pcm_client(r, w, runtime), host=host, port=port)
-    _LOGGER.info("Diary PCM server on %s:%s", host, port)
-    async with server:
-        await server.serve_forever()
