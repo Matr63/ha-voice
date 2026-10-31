@@ -14,7 +14,10 @@ COPY addon/app/gate-requirements.txt /app/requirements.txt
 COPY addon/app/tts-requirements.txt /app/tts-requirements.txt
 RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r /app/requirements.txt \
  && pip install --no-cache-dir -r /app/tts-requirements.txt \
- && pip install --no-cache-dir --force-reinstall "numpy>=1.26.0,<2"
+ && pip install --no-cache-dir --no-deps "openwakeword==0.6.0" \
+ && pip install --no-cache-dir "tqdm>=4" "scikit-learn>=1,<2" "requests>=2" \
+ && pip install --no-cache-dir --force-reinstall "numpy>=1.26.0,<2" \
+ && python -c "import openwakeword.utils as u; u.download_models(model_names=['alexa','hey_jarvis','hey_mycroft','hey_rhasspy'])"
 
 COPY addon/app/ /app/
 COPY services/speaker_gate/entrypoint.sh /app/entrypoint.sh
@@ -26,6 +29,8 @@ ENV SPEAKERS_DIR=/data/speakers
 ENV DIALOGUES_DIR=/data/dialogues
 ENV DIALOGUE_DB=/data/dialogues/dialogue.db
 ENV WEB_ROOT=/app/web
+ENV FIRMWARE_DIR=/data/firmware
+ENV WAKEWORDS_DIR=/data/wakewords
 ENV HF_HOME=/data/models
 ENV GATE_URI=tcp://0.0.0.0:10350
 ENV API_HOST=0.0.0.0

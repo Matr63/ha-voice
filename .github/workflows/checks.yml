@@ -1,0 +1,22 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Integration copy for the add-on is in sync
+        run: python scripts/sync_integration.py --check
+      - name: Compile + pyflakes
+        run: |
+          pip install pyflakes
+          python -m compileall -q addon/app custom_components
+          python -m pyflakes addon/app custom_components

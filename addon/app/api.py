@@ -10,15 +10,20 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
+from assistant import Assistant, result_dict
 from audio_utils import decode_body, duration_ms, to_wav
 from dialogue import DialogueRuntime
+from firmware import KINDS, FirmwareStore
 from gate_server import GateState
+from ha_client import HaClient, HaError
+from satellite import SatelliteHub
 from settings import SettingsStore
 from speakers import SpeakerStore
 from stt_client import port_open, transcribe
 from tts_client import synthesize_wav
 from tts_engine import VOICES, resolve_voice
 from version import __version__
+from wake import available_models
 
 _LOGGER = logging.getLogger("ha-voice.api")
 
@@ -31,6 +36,10 @@ class AppContext:
     store: SpeakerStore
     runtime: DialogueRuntime
     gate: GateState
+    hub: SatelliteHub
+    assistant: Assistant
+    ha: HaClient
+    firmware: FirmwareStore
     stt_uri: str
     stt_model: str
     tts_uri: str
@@ -50,7 +59,7 @@ async def errors_middleware(request: web.Request, handler: Handler) -> web.Strea
         response = await handler(request)
     except web.HTTPException:
         raise
-    except ValueError as err:
+    except (ValueError, HaError) as err:
         return _err(str(err))
     except KeyError:
         return _err("Не найдено", 404)
@@ -75,6 +84,13 @@ async def _read_audio(request: web.Request) -> bytes:
 def create_app(ctx: AppContext) -> web.Application:
     app = web.Application(client_max_size=64 * 1024 * 1024, middlewares=[errors_middleware])
     store, runtime, settings, dstore = ctx.store, ctx.runtime, ctx.settings, ctx.runtime.dialogue_store
+    hub, assistant, firmware = ctx.hub, ctx.assistant, ctx.firmware
+    background: set[asyncio.Task] = set()
+
+    def spawn(coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        background.add(task)
+        task.add_done_callback(background.discard)
 
     async def index(request: web.Request) -> web.Response:
         base = request.headers.get("X-Ingress-Path", "").rstrip("/")
@@ -83,7 +99,15 @@ def create_app(ctx: AppContext) -> web.Application:
         return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
 
     async def health(_: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "diary_enabled": runtime.enabled, "version": __version__})
+        return web.json_response(
+            {
+                "ok": True,
+                "diary_enabled": runtime.enabled,
+                "version": __version__,
+                "satellites": len(hub.satellites),
+                "product": "ha_voice",
+            }
+        )
 
     async def status(_: web.Request) -> web.Response:
         s = settings.get()
@@ -109,6 +133,14 @@ def create_app(ctx: AppContext) -> web.Application:
                     "last_audio_age_s": last_audio_age,
                     "queued": runtime.queued(),
                     "dropped": runtime.dropped,
+                    "stt_empty": runtime.stt_empty,
+                },
+                "satellites": hub.list(),
+                "wake": {"word": s.wake_word, "backend": s.wake_backend, "threshold": s.wake_threshold},
+                "assistant": {
+                    "backend": s.assistant_backend,
+                    "ha_configured": ctx.ha.configured,
+                    "last": assistant.log[0] if assistant.log else None,
                 },
                 "speakers": len(store.list_speakers()),
                 "diary_enabled": s.diary_enabled,
@@ -128,14 +160,17 @@ def create_app(ctx: AppContext) -> web.Application:
         return web.json_response(await asyncio.to_thread(dstore.stats, request.query.get("since") or None))
 
     async def settings_get(_: web.Request) -> web.Response:
-        return web.json_response(settings.to_dict())
+        return web.json_response(settings.to_public_dict())
 
     async def settings_set(request: web.Request) -> web.Response:
         data = await request.json()
         if not isinstance(data, dict):
             raise ValueError("Ожидался JSON-объект")
+        old_volume = settings.get().sat_volume
         settings.update(data)
-        return web.json_response(settings.to_dict())
+        if settings.get().sat_volume != old_volume:
+            await hub.set_volume(settings.get().sat_volume)
+        return web.json_response(settings.to_public_dict())
 
     async def speakers_list(_: web.Request) -> web.Response:
         return web.json_response({"speakers": store.list_speakers()})
@@ -334,6 +369,126 @@ def create_app(ctx: AppContext) -> web.Application:
         runtime.capture_clear()
         return web.json_response(meta)
 
+    # ---------------------------------------------------------- satellite
+    def _satellite(data: dict[str, Any]):
+        sat = hub.get(data.get("id") or None)
+        if sat is None:
+            raise ValueError("Колонка не подключена")
+        return sat
+
+    async def satellites_list(_: web.Request) -> web.Response:
+        return web.json_response({"satellites": hub.list()})
+
+    async def satellite_say(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        text = (data.get("text") or "").strip()
+        if not text:
+            raise ValueError("Введите текст")
+        sat = _satellite(data)
+        if not sat.can_speak:
+            raise ValueError("Эта прошивка не умеет говорить — обновите колонку до прошивки HA Voice")
+        sat.say(text, data.get("voice") or None)
+        return web.json_response({"ok": True, "satellite": sat.id})
+
+    async def satellite_volume(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        settings.update({"sat_volume": data.get("volume", settings.get().sat_volume)})
+        await hub.set_volume(settings.get().sat_volume)
+        return web.json_response({"volume": settings.get().sat_volume})
+
+    async def satellite_listen(request: web.Request) -> web.Response:
+        sat = _satellite(await _json_obj(request))
+        await sat.start_command("panel")
+        return web.json_response({"ok": True})
+
+    # ---------------------------------------------------------- assistant
+    async def assistant_log(request: web.Request) -> web.Response:
+        return web.json_response({"log": assistant.history(int(request.query.get("limit", "100")))})
+
+    async def assistant_ask(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        text = (data.get("text") or "").strip()
+        if not text:
+            raise ValueError("Введите фразу")
+        result = await assistant.handle(text, conv_key="panel")
+        entry = assistant.record(
+            {
+                "satellite": "panel",
+                "text": text,
+                "reply": result.speech,
+                "backend": result.backend,
+                "actions": result.actions,
+                "expect_reply": result.expect_reply,
+                "error": result.error,
+            }
+        )
+        if data.get("speak") and result.speech:
+            sat = hub.get(data.get("id") or None)
+            if sat is not None and sat.can_speak:
+                sat.say(result.speech)
+                entry["spoken_on"] = sat.id
+        return web.json_response({"result": result_dict(result), "entry": entry})
+
+    async def assistant_agents(_: web.Request) -> web.Response:
+        return web.json_response({"agents": await ctx.ha.agents()})
+
+    async def ha_status(_: web.Request) -> web.Response:
+        return web.json_response(await ctx.ha.ping())
+
+    async def wake_models(_: web.Request) -> web.Response:
+        return web.json_response({"models": available_models()})
+
+    # ----------------------------------------------------------- firmware
+    async def firmware_info(_: web.Request) -> web.Response:
+        return web.json_response(await asyncio.to_thread(firmware.info))
+
+    async def firmware_fetch(_: web.Request) -> web.Response:
+        return web.json_response(await firmware.fetch_latest())
+
+    async def firmware_upload(request: web.Request) -> web.Response:
+        kind = request.match_info["kind"]
+        if kind not in KINDS:
+            return _err("Тип прошивки: factory или ota", 404)
+        body = await request.read()
+        return web.json_response(await asyncio.to_thread(firmware.save, kind, body))
+
+    async def firmware_file(request: web.Request) -> web.StreamResponse:
+        kind = request.match_info["kind"]
+        path = firmware.path(kind)
+        if not path.is_file():
+            return _err("Файла прошивки ещё нет — нажмите «Скачать последнюю»", 404)
+        disposition = 'attachment; filename="%s"' % KINDS[kind]
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": disposition,
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    async def firmware_manifest(_: web.Request) -> web.Response:
+        # ESP Web Tools resolves "factory.bin" relative to this manifest URL
+        return web.json_response(
+            {
+                "name": "HA Voice satellite",
+                "version": __version__,
+                "new_install_prompt_erase": True,
+                "builds": [{"chipFamily": "ESP32-S3", "parts": [{"path": "factory.bin", "offset": 0}]}],
+            }
+        )
+
+    async def firmware_ota(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        ip = (data.get("ip") or "").strip()
+        if not ip:
+            ip = _satellite(data).to_dict()["ip"]
+        if not firmware.path("ota").is_file():
+            raise ValueError("Нет ota.bin — скачайте или загрузите прошивку")
+        firmware.ota_jobs[ip] = {"ip": ip, "status": "uploading", "started": time.time(), "error": None}
+        spawn(firmware.ota(ip))
+        return web.json_response(firmware.ota_jobs[ip])
+
     r = app.router
     r.add_get("/", index)
     r.add_get("/api/health", health)
@@ -364,6 +519,21 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_get("/api/capture/audio", capture_audio)
     r.add_post("/api/capture/enroll", capture_enroll)
     r.add_post("/api/tts", tts_speak)
+    r.add_get("/api/satellites", satellites_list)
+    r.add_post("/api/satellites/say", satellite_say)
+    r.add_post("/api/satellites/volume", satellite_volume)
+    r.add_post("/api/satellites/listen", satellite_listen)
+    r.add_get("/api/assistant/log", assistant_log)
+    r.add_post("/api/assistant/ask", assistant_ask)
+    r.add_get("/api/assistant/agents", assistant_agents)
+    r.add_get("/api/ha", ha_status)
+    r.add_get("/api/wake/models", wake_models)
+    r.add_get("/api/firmware", firmware_info)
+    r.add_post("/api/firmware/fetch", firmware_fetch)
+    r.add_get("/api/firmware/manifest.json", firmware_manifest)
+    r.add_get("/api/firmware/{kind}.bin", firmware_file)
+    r.add_post("/api/firmware/ota", firmware_ota)
+    r.add_post("/api/firmware/upload/{kind}", firmware_upload)
     r.add_static("/static/", ctx.web_root, show_index=False)
     return app
 

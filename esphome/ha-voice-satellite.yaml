@@ -1,0 +1,459 @@
+###############################################################################
+# HA Voice satellite - Waveshare ESP32-S3-AUDIO-Board
+#
+# The board is only ears and mouth: it streams the microphone to HA Voice on the
+# PC (TCP :10500) and plays back what HA Voice says (Kokoro TTS). Wake word,
+# speech recognition, speaker id, the room diary and the assistant all run on
+# the PC. No voice_assistant / micro_wake_word / Assist pipeline here.
+#
+# First flash: USB (web flasher or `esphome run`). After that: OTA over Wi-Fi
+# from the HA Voice panel ("Обновить по сети") or `esphome run --device <ip>`.
+# Wi-Fi: Improv (USB serial or Bluetooth) or the "HA-Voice-Setup" hotspot.
+#
+# Hardware sections are taken from waveshare/base/core.yaml (pins, the two I2S
+# buses over shared clock pins, ES7210/ES8311, LED ring, TCA9555 buttons).
+###############################################################################
+
+substitutions:
+  name: ha-voice-sat
+  friendly_name: "HA Voice"
+  # Where HA Voice runs. On Home Assistant OS the add-on is reachable as
+  # homeassistant.local; with docker compose put the PC's IP here or change it
+  # later in HA (entity "Сервер HA Voice") without reflashing.
+  ha_voice_host: homeassistant.local
+  ha_voice_port: '10500'
+
+  volume_min: '0.4'
+  volume_max: '0.8'
+
+  i2s_mclk: GPIO12
+  i2s_bclk: GPIO13
+  i2s_lrclk: GPIO14
+  i2s_din: GPIO15
+  i2s_dout: GPIO16
+  i2c_sda: GPIO11
+  i2c_scl: GPIO10
+  led_pin: GPIO38
+  led_num: '7'
+  amp_ctrl: '8'
+  key1_exio: '9'
+  key2_exio: '10'
+  key3_exio: '11'
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true   # one prebuilt .bin for every board
+  min_version: 2026.8.0
+  project:
+    name: matr63.ha-voice-satellite
+    version: "2.0.0"
+  on_boot:
+    - priority: 375
+      then:
+        - script.execute:
+            id: ring_state
+            state: -1
+    - priority: -100
+      then:
+        - lambda: |-
+            id(adc_mic).set_mic_gain(id(mic_gain_db).state);
+
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
+      CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+external_components:
+  - source:
+      type: local
+      path: external_components
+    components: [ha_voice_sat]
+
+# No credentials in the firmware: set Wi-Fi with Improv or the setup hotspot.
+wifi:
+  id: wifi_id
+  power_save_mode: none       # audio streaming hates Wi-Fi power saving
+  ap:
+    ssid: "HA-Voice-Setup"
+  on_connect:
+    - script.execute:
+        id: ring_state
+        state: -1
+  on_disconnect:
+    - script.execute:
+        id: ring_state
+        state: -1
+
+captive_portal:
+improv_serial:
+improv_ble:
+  authorizer: none
+
+logger:
+  level: INFO
+
+# Optional: lets Home Assistant see the board (volume, mic gain, host). The
+# satellite works without it, so never reboot for a missing HA connection.
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+  - platform: web_server     # HA Voice panel pushes ota.bin to http://<ip>/update
+
+web_server:
+  port: 80
+  version: 3
+
+i2c:
+  - id: internal_i2c
+    sda: ${i2c_sda}
+    scl: ${i2c_scl}
+    frequency: 100kHz
+
+tca9555:
+  id: ioexp
+  i2c_id: internal_i2c
+  address: 0x20
+
+# Two I2S buses over shared BCLK/LRCLK: mic = master (always capturing),
+# speaker = slave. See waveshare/base/core.yaml for the full story.
+i2s_audio:
+  - id: i2s_input
+    i2s_mclk_pin: ${i2s_mclk}
+    i2s_bclk_pin:
+      number: ${i2s_bclk}
+      allow_other_uses: true
+    i2s_lrclk_pin:
+      number: ${i2s_lrclk}
+      allow_other_uses: true
+  - id: i2s_output
+    i2s_bclk_pin:
+      number: ${i2s_bclk}
+      allow_other_uses: true
+    i2s_lrclk_pin:
+      number: ${i2s_lrclk}
+      allow_other_uses: true
+
+audio_adc:
+  - platform: es7210
+    id: adc_mic
+    i2c_id: internal_i2c
+    mic_gain: 24db
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    i2c_id: internal_i2c
+
+microphone:
+  - platform: i2s_audio
+    id: i2s_mics
+    i2s_audio_id: i2s_input
+    i2s_din_pin: ${i2s_din}
+    adc_type: external
+    pdm: false
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_audio_speaker
+    i2s_audio_id: i2s_output
+    i2s_dout_pin: ${i2s_dout}
+    i2s_mode: secondary
+    dac_type: external
+    audio_dac: es8311_dac
+    timeout: never
+    buffer_duration: 100ms
+
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_audio_speaker
+    num_channels: 1
+    source_speakers:
+      - id: tts_mixing_input
+        timeout: never
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+
+  # HA Voice TTS (Kokoro 24 kHz) gets its own input, so it never fights the
+  # media player's announcement pipeline.
+  - platform: resampler
+    id: tts_resampling_speaker
+    output_speaker: tts_mixing_input
+    buffer_duration: 500ms
+  - platform: resampler
+    id: announcement_resampling_speaker
+    output_speaker: announcement_mixing_input
+  - platform: resampler
+    id: media_resampling_speaker
+    output_speaker: media_mixing_input
+
+media_player:
+  - platform: speaker
+    id: external_media_player
+    name: None
+    internal: false
+    volume_increment: 0.05
+    volume_min: ${volume_min}
+    volume_max: ${volume_max}
+    announcement_pipeline:
+      speaker: announcement_resampling_speaker
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+    media_pipeline:
+      speaker: media_resampling_speaker
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+    on_state:
+      - if:
+          condition:
+            or:
+              - media_player.is_announcing:
+              - media_player.is_playing:
+          then:
+            - switch.turn_on: amp_enable
+
+ha_voice_sat:
+  id: sat
+  host: ${ha_voice_host}
+  port: ${ha_voice_port}
+  microphone: i2s_mics
+  speaker: tts_resampling_speaker
+  on_connected:
+    - script.execute:
+        id: ring_state
+        state: 0
+  on_disconnected:
+    - script.execute:
+        id: ring_state
+        state: -1
+  on_state:
+    - script.execute:
+        id: ring_state
+        state: !lambda return x;
+  on_volume:
+    - media_player.volume_set:
+        id: external_media_player
+        volume: !lambda return x;
+  on_tts_start:
+    - switch.turn_on: amp_enable
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 20
+        duration: 0.0s
+  on_tts_end:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 0
+        duration: 1.0s
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_ring
+    name: "Status Ring"
+    pin: ${led_pin}
+    num_leds: ${led_num}
+    chipset: WS2812
+    channel_colors: RGB
+    default_transition_length: 150ms
+    effects:
+      - pulse:
+          name: "Pulse Slow"
+          min_brightness: 30%
+          max_brightness: 100%
+          transition_length: 2000ms
+          update_interval: 3000ms
+      - pulse:
+          name: "Pulse Fast"
+          min_brightness: 30%
+          max_brightness: 100%
+          transition_length: 300ms
+          update_interval: 600ms
+      - addressable_lambda:
+          name: "Spinner"
+          update_interval: 90ms
+          lambda: |-
+            static int pos = 0;
+            const int n = it.size();
+            it.all() = Color(0, 0, 0);
+            it[pos % n] = current_color;
+            it[(pos + 1) % n] = Color((uint8_t)(current_color.red   * 0.35f),
+                                      (uint8_t)(current_color.green * 0.35f),
+                                      (uint8_t)(current_color.blue  * 0.35f));
+            pos = (pos + 1) % n;
+      - addressable_lambda:
+          name: "Breathe"
+          update_interval: 32ms
+          lambda: |-
+            static uint16_t t = 0;
+            float b = (sinf(t * 3.14159265f / 128.0f) + 1.0f) * 0.5f;
+            b = 0.12f + b * 0.88f;
+            it.all() = Color((uint8_t)(current_color.red   * b),
+                             (uint8_t)(current_color.green * b),
+                             (uint8_t)(current_color.blue  * b));
+            t = (t + 2) % 256;
+
+script:
+  # -1 = no link to HA Voice, 0 idle, 1 wake word, 2 listening, 3 thinking,
+  # 4 replying, 5 error (states come from the server).
+  - id: ring_state
+    mode: restart
+    parameters:
+      state: int
+    then:
+      - lambda: |-
+          if (state == 0) {
+            id(status_ring).turn_off().perform();
+            return;
+          }
+          auto call = id(status_ring).turn_on();
+          if (state < 0) {
+            if (!id(wifi_id).is_connected()) {
+              call.set_rgb(1.0, 0.3, 0.0); call.set_brightness(0.5); call.set_effect("Pulse Slow");
+            } else {
+              call.set_rgb(1.0, 0.6, 0.0); call.set_brightness(0.4); call.set_effect("Pulse Slow");
+            }
+          } else if (state == 1) {
+            call.set_rgb(0.0, 0.8, 1.0); call.set_brightness(0.8); call.set_effect("None");
+          } else if (state == 2) {
+            call.set_rgb(0.0, 0.3, 1.0); call.set_brightness(0.8); call.set_effect("Pulse Fast");
+          } else if (state == 3) {
+            call.set_rgb(0.6, 0.0, 1.0); call.set_brightness(0.8); call.set_effect("Spinner");
+          } else if (state == 4) {
+            call.set_rgb(0.0, 1.0, 0.3); call.set_brightness(0.8); call.set_effect("Breathe");
+          } else {
+            call.set_rgb(1.0, 0.0, 0.0); call.set_brightness(1.0); call.set_effect("None");
+          }
+          call.perform();
+      - if:
+          condition:
+            lambda: return state == 5;
+          then:
+            - delay: 2s
+            - light.turn_off: status_ring
+
+switch:
+  - platform: template
+    id: listen_switch
+    name: "Слушать"
+    icon: mdi:ear-hearing
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - ha_voice_sat.set_listening:
+          listening: true
+    on_turn_off:
+      - ha_voice_sat.set_listening:
+          listening: false
+
+  - platform: gpio
+    id: amp_enable
+    name: Amplifier
+    icon: mdi:speaker
+    entity_category: config
+    pin:
+      tca9555: ioexp
+      number: ${amp_ctrl}
+      inverted: false
+    restore_mode: ALWAYS_OFF
+
+text:
+  - platform: template
+    id: ha_voice_host_text
+    name: "Сервер HA Voice"
+    icon: mdi:server-network
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ${ha_voice_host}
+    on_value:
+      - lambda: |-
+          if (!x.empty()) id(sat).set_host(x);
+
+number:
+  - platform: template
+    id: mic_gain_db
+    name: "Mic gain (ES7210)"
+    icon: mdi:microphone-settings
+    entity_category: config
+    unit_of_measurement: dB
+    min_value: 0
+    max_value: 36
+    step: 3
+    restore_value: true
+    initial_value: 24
+    mode: slider
+    optimistic: true
+    set_action:
+      - lambda: id(adc_mic).set_mic_gain(x);
+
+binary_sensor:
+  - platform: template
+    name: "HA Voice connected"
+    icon: mdi:lan-connect
+    entity_category: diagnostic
+    lambda: return id(sat).is_connected();
+
+  - platform: gpio
+    name: "Key1"
+    pin:
+      tca9555: ioexp
+      number: ${key1_exio}
+      inverted: true
+    on_press:
+      - media_player.volume_down: external_media_player
+
+  # Middle key: talk without the wake word / stop the reply (server decides).
+  - platform: gpio
+    name: "Key2"
+    pin:
+      tca9555: ioexp
+      number: ${key2_exio}
+      inverted: true
+    on_press:
+      - ha_voice_sat.send_event:
+          event: "button:2"
+
+  - platform: gpio
+    name: "Key3"
+    pin:
+      tca9555: ioexp
+      number: ${key3_exio}
+      inverted: true
+    on_press:
+      - media_player.volume_up: external_media_player
+
+sensor:
+  - platform: wifi_signal
+    name: "Wi-Fi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: config

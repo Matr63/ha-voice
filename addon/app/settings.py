@@ -18,7 +18,25 @@ LIMITS: dict[str, tuple[float, float]] = {
     "diary_min_speech_ms": (100, 5000),
     "diary_max_utterance_ms": (2000, 60000),
     "diary_keep_audio": (0, 20000),
+    "wake_threshold": (0.1, 0.95),
+    "command_silence_ms": (300, 3000),
+    "command_max_ms": (3000, 30000),
+    "sat_volume": (0, 100),
 }
+
+ENUMS: dict[str, tuple[str, ...]] = {
+    "wake_backend": ("local", "wyoming"),
+    "assistant_backend": ("ha", "openai", "off"),
+}
+
+# Never sent back to the UI in clear text.
+SECRETS = ("llm_api_key", "ha_token")
+SECRET_MASK = "••••••"
+
+DEFAULT_DOMAINS = (
+    "light,switch,fan,cover,climate,media_player,scene,script,input_boolean,"
+    "vacuum,humidifier,sensor,binary_sensor,weather"
+)
 
 
 TTS_VOICES = ("sveta", "masha", "dima")
@@ -35,6 +53,31 @@ class Settings:
     diary_max_utterance_ms: int = 15000
     diary_keep_audio: int = 500
     tts_voice: str = "sveta"
+    # satellite (Waveshare board)
+    sat_volume: int = 60
+    # wake word on the PC
+    wake_backend: str = "local"
+    wake_word: str = "alexa"
+    wake_threshold: float = 0.5
+    wake_uri: str = "tcp://127.0.0.1:10400"
+    command_silence_ms: int = 800
+    command_max_ms: int = 10000
+    # assistant
+    assistant_backend: str = "ha"
+    ha_agent_id: str = ""
+    llm_url: str = "http://127.0.0.1:11434/v1"
+    llm_model: str = "qwen2.5:7b"
+    llm_api_key: str = ""
+    llm_prompt: str = ""
+    assistant_domains: str = DEFAULT_DOMAINS
+    # Home Assistant access (empty = Supervisor token on HAOS)
+    ha_url: str = ""
+    ha_token: str = ""
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    return raw.strip() if raw and raw.strip() else default
 
 
 def _env_voice(name: str, default: str) -> str:
@@ -71,6 +114,17 @@ def _defaults_from_env() -> Settings:
         diary_max_utterance_ms=_env_num("DIALOGUE_MAX_UTTERANCE_MS", d.diary_max_utterance_ms, int),
         diary_keep_audio=_env_num("DIALOGUE_KEEP_AUDIO", d.diary_keep_audio, int),
         tts_voice=_env_voice("TTS_VOICE", d.tts_voice),
+        wake_backend=_env_str("WAKE_BACKEND", d.wake_backend),
+        wake_word=_env_str("WAKE_WORD", d.wake_word),
+        wake_threshold=_env_num("WAKE_THRESHOLD", d.wake_threshold, float),
+        wake_uri=_env_str("WAKE_URI", d.wake_uri),
+        assistant_backend=_env_str("ASSISTANT_BACKEND", d.assistant_backend),
+        ha_agent_id=_env_str("HA_AGENT_ID", d.ha_agent_id),
+        llm_url=_env_str("LLM_URL", d.llm_url),
+        llm_model=_env_str("LLM_MODEL", d.llm_model),
+        llm_api_key=_env_str("LLM_API_KEY", d.llm_api_key),
+        ha_url=_env_str("HA_URL", d.ha_url),
+        ha_token=_env_str("HA_TOKEN", d.ha_token),
     )
 
 
@@ -78,6 +132,11 @@ def _coerce(name: str, value: Any, current: Any) -> Any:
     if name == "tts_voice":
         v = str(value).strip().lower()
         return v if v in TTS_VOICES else current
+    if name in ENUMS:
+        v = str(value).strip().lower()
+        return v if v in ENUMS[name] else current
+    if name in SECRETS and str(value) == SECRET_MASK:
+        return current
     if isinstance(current, str):
         return str(value)
     if isinstance(current, bool):
@@ -124,6 +183,13 @@ class SettingsStore:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self._value)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        data = asdict(self._value)
+        for key in SECRETS:
+            if data.get(key):
+                data[key] = SECRET_MASK
+        return data
 
     def update(self, data: dict[str, Any]) -> Settings:
         with self._lock:

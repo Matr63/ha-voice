@@ -51,9 +51,16 @@ RUN echo "[ha-voice 5/6] pip: resemblyzer (speaker gate)..." \
  && echo "[ha-voice 5b/6] pip: Kokoro-ru TTS (ruaccent/misaki)..." \
  && pip3 install --break-system-packages --no-cache-dir -r /app/tts-requirements.txt \
  && pip3 install --break-system-packages --no-cache-dir --force-reinstall "numpy>=1.26.0,<2" \
- && echo "[ha-voice 5b/6] TTS deps done"
+ && echo "[ha-voice 5b/6] TTS deps done" \
+ && echo "[ha-voice 5c/6] pip: openWakeWord (wake word на ПК, ONNX)..." \
+ && pip3 install --break-system-packages --no-cache-dir --no-deps "openwakeword==0.6.0" \
+ && pip3 install --break-system-packages --no-cache-dir "tqdm>=4" "scikit-learn>=1,<2" "requests>=2" \
+ && pip3 install --break-system-packages --no-cache-dir --force-reinstall "numpy>=1.26.0,<2" \
+ && python3 -c "import openwakeword.utils as u; u.download_models(model_names=['alexa','hey_jarvis','hey_mycroft','hey_rhasspy'])" \
+ && echo "[ha-voice 5c/6] openWakeWord done"
 
 COPY app/ /app/
+COPY integration/ /app/integration/
 COPY run.sh /run.sh
 RUN echo "[ha-voice 6/6] copy app + chmod" \
  && sed -i 's/\r$//' /run.sh \
@@ -65,6 +72,8 @@ ENV SPEAKERS_DIR=/data/speakers
 ENV DIALOGUES_DIR=/data/dialogues
 ENV DIALOGUE_DB=/data/dialogues/dialogue.db
 ENV WEB_ROOT=/app/web
+ENV FIRMWARE_DIR=/data/firmware
+ENV WAKEWORDS_DIR=/data/wakewords
 ENV PYTHONUNBUFFERED=1
 
 # bash явно — без проблем с CRLF shebang

@@ -3,18 +3,22 @@
     "step": {
       "user": {
         "title": "HA Voice",
-        "description": "Хост API (add-on localhost или IP отдельного сервера) и порт 8088",
+        "description": "HA Voice не найден автоматически. Укажите хост дополнения (127.0.0.1 на HAOS) или IP машины с docker compose и порт 8088.",
         "data": {
           "host": "Хост",
           "port": "Порт"
         }
+      },
+      "confirm": {
+        "title": "HA Voice",
+        "description": "Найден HA Voice: {url}. Подключить?"
       }
     },
     "error": {
-      "cannot_connect": "Не удалось подключиться к API"
+      "cannot_connect": "Не удалось подключиться к HA Voice"
     },
     "abort": {
-      "already_configured": "Уже настроено"
+      "already_configured": "HA Voice уже подключён"
     }
   }
 }

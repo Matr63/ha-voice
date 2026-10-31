@@ -16,27 +16,27 @@
         </div>
         <div>
           <div class="brand-title">HA Voice</div>
-          <div class="brand-sub">GigaAM · Kokoro-ru · узнавание голосов</div>
+          <div class="brand-sub">колонка · wake word · GigaAM · Kokoro · ассистент</div>
         </div>
       </div>
       <div class="pills" id="pills"></div>
     </header>
 
     <nav class="tabs" id="tabs" role="tablist">
-      <button type="button" data-tab="overview">Обзор</button>
+      <button type="button" data-tab="speaker">Колонка</button>
       <button type="button" data-tab="diary">Дневник</button>
       <button type="button" data-tab="voices">Голоса</button>
-      <button type="button" data-tab="assist">Assist</button>
-      <button type="button" data-tab="test">Проверка</button>
+      <button type="button" data-tab="tts">Озвучка</button>
+      <button type="button" data-tab="assistant">Ассистент</button>
       <button type="button" data-tab="settings">Настройки</button>
     </nav>
 
     <main>
-      <section class="view" data-view="overview"></section>
+      <section class="view" data-view="speaker"></section>
       <section class="view" data-view="diary"></section>
-      <section class="view" data-view="voices"></section>
-      <section class="view" data-view="assist"></section>
-      <section class="view" data-view="test"></section>
+      <section class="view" data-view="voices"><div id="voicesMain"></div><div id="voicesTest"></div></section>
+      <section class="view" data-view="tts"></section>
+      <section class="view" data-view="assistant"></section>
       <section class="view" data-view="settings"></section>
     </main>
 

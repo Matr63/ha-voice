@@ -1,38 +1,78 @@
 # Установка HA Voice
 
-## A. Отдельный сервер (Docker Compose)
+Плата Waveshare — только микрофон и динамик. Всё остальное — ключевое слово,
+распознавание (GigaAM), кто говорит, дневник, ИИ для дома и голос ответа (Kokoro) —
+работает на ПК в HA Voice. Home Assistant нужен только как «дом»: датчики и сервисы.
 
-1. Скопируйте `.env.example` → `.env`, укажите `HA_VOICE_HOST`.
+```
+Waveshare ──PCM 16 кГц──▶ HA Voice (ПК) ──состояния/сервисы──▶ Home Assistant
+          ◀──Kokoro PCM──
+```
+
+Wyoming, пайплайн Assist и Piper для этого **не нужны**.
+
+## A. Add-on на HAOS / Supervised (рекомендуется)
+
+1. **Настройки → Дополнения → Магазин → ⋮ → Репозитории** → `https://github.com/Matr63/ha-voice`.
+2. Установите **HA Voice** (первая сборка 10–30+ мин из‑за torch; прогресс — в **Журнале**, строки `[ha-voice N/6]`).
+3. **Запустить**. Первый старт качает веса GigaAM и Kokoro‑ru (`waiting STT…` / `waiting TTS…`).
+4. Дополнение само кладёт интеграцию в `custom_components` и показывает уведомление —
+   **перезапустите Home Assistant**. Затем **Настройки → Устройства и службы** →
+   «Обнаружено: HA Voice» (или «Добавить интеграцию → HA Voice» — адрес найдётся сам).
+5. Откройте панель **HA Voice** → вкладка **Колонка** → «Скачать последнюю» прошивку.
+
+## B. Отдельный сервер (Docker Compose)
+
+1. `.env.example` → `.env`: `HA_URL` и `HA_TOKEN` (Профиль HA → Безопасность → Долгосрочные токены).
 2. `docker compose up -d --build`
-3. В Home Assistant: **Настройки → Устройства и службы → Wyoming Protocol** → `IP:10350` (распознавание) и `IP:10351` (озвучка Kokoro-ru).
-4. Пайплайн Assist: **Распознавание речи** = HA Voice (10350). **Синтез речи** = Kokoro-ru (10351) **или** Piper — что удобнее.
-5. Скопируйте `custom_components/ha_voice` в `/config/custom_components/ha_voice`, перезапустите HA.
-6. Добавьте интеграцию **HA Voice** → host/IP сервера, порт `8088`.
-7. UI enrollment: `http://IP:8088/` — запишите голоса домочадцев.
-8. Опционально openWakeWord: `docker compose --profile oww up -d`.
+3. Панель: `http://IP:8088/`.
+4. Интеграция: скопируйте `custom_components/ha_voice` в `/config/custom_components/`, перезапустите HA,
+   добавьте **HA Voice** и укажите `IP`, порт `8088`.
+5. Ollama на этом же ПК: вкладка **Ассистент** → «LLM», адрес
+   `http://host.docker.internal:11434/v1`, модель с tool calling (qwen2.5:7b, llama3.1:8b).
 
-## B. Add-on на HAOS / Supervised
+## C. Колонка Waveshare ESP32‑S3‑AUDIO
 
-1. **Настройки → Дополнения → Репозитории** → `https://github.com/Matr63/ha-voice`.
-2. Установите **HA Voice (GigaAM)** (первая сборка 10–30+ мин из‑за torch). HA должен иметь доступ в интернет к **Docker Hub** (`auth.docker.io`) и `ghcr.io` / `download.pytorch.org`. Ошибка `TLS handshake timeout` на `docker:*-cli` — сеть/DNS/firewall, не код add-on; повторите Install позже или поставьте через compose на другой машине.
-3. Лог: карточка дополнения → **Журнал** / **Log** (`[ha-voice 1/6]` …). Либо **Настройки → Система → Журналы**.
-4. На спиннере в Store прогресс-бара нет — ограничение Home Assistant.
-5. После установки **Запустить**. Первый старт качает веса GigaAM и Kokoro-ru — смотрите **Log** (`waiting STT…` / `waiting TTS…`).
-6. Wyoming Protocol → `127.0.0.1:10350` (STT) и `127.0.0.1:10351` (TTS Kokoro-ru).
-7. Assist → распознавание = HA Voice; синтез = Kokoro-ru **или** Piper (можно переключать без удаления дополнений).
-8. Ingress — enrollment, дневник, проверка озвучки.
-9. Скопируйте `custom_components/ha_voice` в `/config/custom_components/`, host `127.0.0.1`, порт `8088`.
+Один файл прошивки: [esphome/ha-voice-satellite.yaml](esphome/ha-voice-satellite.yaml).
+Готовые `factory.bin` / `ota.bin` собирает CI (релиз `firmware-latest`), панель скачивает их сама.
 
-## C. Waveshare ESP + дневник комнаты
+1. **Первый раз — USB.** Панель → **Колонка** → «Первая прошивка по USB»:
+   кнопка «Прошить по USB» (Chrome/Edge по HTTPS) или `factory.bin` через
+   [web.esphome.io](https://web.esphome.io).
+2. **Wi‑Fi:** там же через Improv, или с телефона подключитесь к точке **HA-Voice-Setup**.
+3. Колонка сама подключается к `homeassistant.local:10500`. Другой адрес (compose) —
+   сущность **«Сервер HA Voice»** у устройства в HA или веб‑страница платы `http://<ip>/`.
+4. **Дальше — по сети:** Панель → **Колонка** → «Обновить по сети». Кабель не нужен.
 
-1. В `waveshare-va.yaml` добавьте package из `esphome/room_diary_package.yaml`.
-2. В substitutions укажите `ha_voice_host` (IP сервера/HA). Микрофон Waveshare: `i2s_mics`.
-3. `external_components` path = каталог `ha-voice/esphome/external_components`.
-4. Прошейте устройство. В HA включите switch **Room diary**.
+Собрать самому: `cd esphome && esphome run ha-voice-satellite.yaml`
+(свой адрес: `esphome -s ha_voice_host 192.168.1.50 run ha-voice-satellite.yaml`).
+
+На колонке один переключатель **«Слушать»** (по умолчанию включён) — выключает микрофон
+целиком. Средняя кнопка — сказать команду без ключевого слова / остановить ответ.
+
+## Что где настраивается (всё в панели HA Voice)
+
+| Вкладка | Что |
+|---|---|
+| Колонка | статус платы, уровень микрофона, громкость, «сказать», прошивка USB/OTA |
+| Дневник | живая расшифровка всего, что слышит колонка |
+| Голоса | запись голосов с колонки, проверка записи |
+| Озвучка | голос Kokoro (Света / Маша / Дима), проверка на колонке |
+| Ассистент | ключевое слово, кто отвечает (агент HA или LLM), журнал команд |
+| Настройки | доступ к HA, фильтр чужих голосов, пороги дневника |
+
+## Необязательно: Assist / Wyoming
+
+Порты `10350` (STT через фильтр голосов) и `10351` (Kokoro TTS) по‑прежнему открыты —
+если хотите использовать HA Voice в обычном Assist на других устройствах.
+
+## Старая прошивка room_diary
+
+Платы с пакетом `room_diary_package.yaml` продолжают писать дневник (протокол `HV01`),
+но не умеют отвечать голосом. Перепрошейте их на `ha-voice-satellite.yaml`.
 
 ## Перенос на другой сервер
 
 1. Остановите compose/add-on.
-2. Скопируйте том `data/` (`models`, `speakers`, `dialogues`).
-3. Поднимите compose на новой машине.
-4. В Wyoming и интеграции HA Voice смените host/IP.
+2. Скопируйте том `data/` (`models`, `speakers`, `dialogues`, `config`, `firmware`).
+3. Поднимите на новой машине, поменяйте «Сервер HA Voice» у колонки и адрес в интеграции.

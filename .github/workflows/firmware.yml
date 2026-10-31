@@ -1,0 +1,71 @@
+name: Satellite firmware
+
+# Builds esphome/ha-voice-satellite.yaml and publishes factory.bin (first USB
+# flash) and ota.bin (Wi-Fi update from the HA Voice panel). A push to main
+# refreshes the "firmware-latest" release that the add-on downloads from.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "esphome/**"
+      - ".github/workflows/firmware.yml"
+  pull_request:
+    paths:
+      - "esphome/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ESPHome
+        run: pip install esphome
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ runner.os }}-${{ hashFiles('esphome/ha-voice-satellite.yaml') }}
+          restore-keys: platformio-${{ runner.os }}-
+
+      - name: Compile
+        working-directory: esphome
+        run: esphome compile ha-voice-satellite.yaml
+
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          # ESP-IDF builds land in build/, older PlatformIO builds in .pioenvs/<name>/
+          factory=$(find esphome/.esphome/build/ha-voice-sat -name firmware.factory.bin | head -1)
+          ota=$(find esphome/.esphome/build/ha-voice-sat -name firmware.ota.bin | head -1)
+          test -n "$factory" && test -n "$ota"
+          cp "$factory" dist/ha-voice-satellite.factory.bin
+          cp "$ota" dist/ha-voice-satellite.ota.bin
+          (cd dist && sha256sum *.bin > SHA256SUMS)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ha-voice-satellite
+          path: dist/
+
+      - name: Publish firmware-latest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete firmware-latest --yes --cleanup-tag || true
+          gh release create firmware-latest dist/* \
+            --title "Satellite firmware (latest)" \
+            --notes "Built from ${GITHUB_SHA::7}. factory.bin - first USB flash, ota.bin - update over Wi-Fi." \
+            --prerelease

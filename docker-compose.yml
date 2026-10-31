@@ -61,11 +61,27 @@ services:
       TTS_VOICE: ${TTS_VOICE:-sveta}
       TTS_URI: tcp://0.0.0.0:10351
       TTS_CLIENT_URI: tcp://127.0.0.1:10351
+      # Home Assistant as "the house": states and services for the assistant
+      HA_URL: ${HA_URL:-}
+      HA_TOKEN: ${HA_TOKEN:-}
+      ASSISTANT_BACKEND: ${ASSISTANT_BACKEND:-ha}
+      HA_AGENT_ID: ${HA_AGENT_ID:-}
+      LLM_URL: ${LLM_URL:-http://host.docker.internal:11434/v1}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      # wake word runs in this container (openWakeWord, ONNX)
+      WAKE_WORD: ${WAKE_WORD:-alexa}
+      WAKE_BACKEND: ${WAKE_BACKEND:-local}
+      WAKE_URI: ${WAKE_URI:-tcp://openwakeword:10400}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ${DATA_DIR:-./data}/speakers:/data/speakers
       - ${DATA_DIR:-./data}/dialogues:/data/dialogues
       - ${DATA_DIR:-./data}/config:/data/config
       - ${DATA_DIR:-./data}/models:/data/models
+      - ${DATA_DIR:-./data}/firmware:/data/firmware
+      - ${DATA_DIR:-./data}/wakewords:/data/wakewords
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8088/api/health',timeout=2)"]
       interval: 30s
@@ -73,6 +89,8 @@ services:
       retries: 5
       start_period: 60s
 
+  # Optional: only for WAKE_BACKEND=wyoming. By default the wake word runs
+  # inside speaker_gate, so this profile stays off.
   openwakeword:
     image: rhasspy/wyoming-openwakeword:latest
     container_name: ha-voice-openwakeword
