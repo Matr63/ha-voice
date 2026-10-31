@@ -192,6 +192,8 @@ def create_app(ctx: AppContext) -> web.Application:
                     "backend": s.assistant_backend,
                     "ha_configured": ctx.ha.configured,
                     "last": assistant.log[0] if assistant.log else None,
+                    "busy": assistant.busy,
+                    "typical_s": assistant.typical_s(),
                 },
                 "speakers": len(store.list_speakers()),
                 "diary_enabled": s.diary_enabled,
@@ -506,10 +508,11 @@ def create_app(ctx: AppContext) -> web.Application:
         if not text:
             raise ValueError("Введите текст")
         sat = _satellite(data)
-        if not sat.can_speak:
-            raise ValueError("Эта прошивка не умеет говорить — обновите колонку до прошивки HA Voice")
-        sat.say(text, data.get("voice") or None)
-        return web.json_response({"ok": True, "satellite": sat.id})
+        out = sat.voice_out()
+        if out is None:
+            raise ValueError("Нет колонки с динамиком: отметьте «Динамик» у колонки или обновите прошивку")
+        out.say(text, data.get("voice") or None)
+        return web.json_response({"ok": True, "satellite": out.id})
 
     async def satellite_earcon(request: web.Request) -> web.Response:
         data = await _json_obj(request)
@@ -517,9 +520,9 @@ def create_app(ctx: AppContext) -> web.Application:
         if sound not in ("wake", "error"):
             raise ValueError("Сигнал: wake или error")
         sat = _satellite(data)
-        if not sat.can_speak:
-            raise ValueError("Эта прошивка не умеет воспроизводить звук")
-        await sat.play_earcon(sound)
+        if sat.voice_out() is None:
+            raise ValueError("Нет колонки с динамиком: отметьте «Динамик» у колонки или обновите прошивку")
+        await sat.earcon(sound)
         return web.json_response({"ok": True})
 
     def _sound_kind(request: web.Request) -> str:
@@ -610,9 +613,10 @@ def create_app(ctx: AppContext) -> web.Application:
         )
         if data.get("speak") and result.speech:
             sat = hub.get(data.get("id") or None)
-            if sat is not None and sat.can_speak:
-                sat.say(result.speech)
-                entry["spoken_on"] = sat.id
+            out = sat.voice_out() if sat is not None else None
+            if out is not None:
+                out.say(result.speech)
+                entry["spoken_on"] = out.id
         return web.json_response({"result": result_dict(result), "entry": entry})
 
     async def assistant_agents(_: web.Request) -> web.Response:

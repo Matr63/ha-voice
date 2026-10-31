@@ -86,6 +86,7 @@ PING_EVERY_S = 5.0
 # after STT, so the window covers the recognition queue too
 CLAIM_WINDOW_S = 3.5
 WAKE_AUDIO_S = 1.5
+RATE_CHECK_S = 4.0
 WAKE_AUDIO_CHUNKS = 64   # board frames are 20-60 ms; trimmed to WAKE_AUDIO_S on use
 # the TV comes back by itself if a board never returns to idle
 DUCK_MAX_S = 90.0
@@ -206,6 +207,7 @@ class Satellite:
         self.busy = False
         self.mute_until = 0.0
         self.command: CommandCapture | None = None
+        self.thinking_since: float | None = None
         self.room = ""                # HA area: context for "включи свет" without a room
         self.room_source = ""         # "ha" (the board's device in HA) or "manual"
         self.ha_device_id: str | None = None
@@ -214,6 +216,11 @@ class Satellite:
         self.ch_rms = [0.0, 0.0]      # long-term level per ES7210 slot
         self.ch_active = 0
         self.raw_rms = 0.0            # before digital gain
+        # A board can label its stream wrongly (XVF3800 decimator: 32-bit samples
+        # announced as 16-bit). Counting bytes against the clock tells: twice the
+        # announced byte rate means 32-bit samples, of which we keep the top half.
+        self.wide_samples = False
+        self._rate_win: tuple[float, float, int] | None = None   # (start, last frame, bytes)
         # the last ~1.5 s of mic audio: the wake word itself, added to the command
         # for voice matching (a 1 s command alone is too short to tell voices apart)
         self.recent_audio: deque[bytes] = deque(maxlen=WAKE_AUDIO_CHUNKS)
@@ -232,6 +239,31 @@ class Satellite:
     def can_speak(self) -> bool:
         return self.proto >= 2 and self.info.get("speaker", "1") == "1"
 
+    def _audio_cfg(self) -> dict[str, Any]:
+        try:
+            cfg = json.loads(self.hub.settings.get().sat_audio or "{}").get(self.id) or {}
+        except (ValueError, AttributeError):
+            cfg = {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    @property
+    def has_speaker(self) -> bool:
+        """The firmware can play sound and the panel did not say "no speaker here"."""
+        return self.can_speak and self._audio_cfg().get("speaker", True) is not False
+
+    def voice_out(self) -> "Satellite | None":
+        """Where this board's answers and sounds play: the board chosen in the panel,
+        else itself, else a board with a speaker in the same room, else any."""
+        want = str(self._audio_cfg().get("out") or "")
+        boards = self.hub.satellites
+        if want and want in boards and boards[want].has_speaker:
+            return boards[want]
+        if self.has_speaker:
+            return self
+        others = [b for b in boards.values() if b is not self and b.has_speaker]
+        same_room = [b for b in others if self.room and b.room == self.room]
+        return (same_room or others or [None])[0]
+
     def to_dict(self) -> dict[str, Any]:
         age = round(time.time() - self.last_audio_at, 1) if self.last_audio_at else None
         return {
@@ -247,6 +279,9 @@ class Satellite:
             "ha_device": bool(self.ha_device_id),
             "proto": self.proto,
             "can_speak": self.can_speak,
+            "has_speaker": self.has_speaker,
+            "thinking_s": round(time.time() - self.thinking_since, 1) if self.thinking_since else None,
+            "out": getattr(self.voice_out(), "id", None),
             "listening": self.listening,
             "state": STATE_NAMES.get(self.state, str(self.state)),
             "live_rms": round(self.live_rms, 4),
@@ -282,6 +317,10 @@ class Satellite:
         return True
 
     async def set_state(self, state: int) -> None:
+        if state == ST_THINKING and self.state != ST_THINKING:
+            self.thinking_since = time.time()
+        elif state != ST_THINKING:
+            self.thinking_since = None
         self.state = state
         if state in (ST_IDLE, ST_SLEEP):
             self._spawn(self.hub.unduck_tv())
@@ -305,15 +344,23 @@ class Satellite:
     async def go_idle(self) -> None:
         await self.set_state(self.idle_state())
 
-    async def play_earcon(self, kind: str) -> None:
+    async def earcon(self, kind: str) -> None:
+        """This board's sound, played wherever its answers play."""
+        out = self.voice_out()
+        if out is not None:
+            await out.play_earcon(kind, listener=self)
+
+    async def play_earcon(self, kind: str, listener: "Satellite | None" = None) -> None:
         """A short sound through the TTS path; the mic is ignored while it plays."""
         if not self.can_speak or self.speaking or self._earcon_lock.locked():
             return
         async with self._earcon_lock:
             pcm, rate = earcon_audio(kind, self.hub.settings.get().sound_volume)
             dur = len(pcm) / 2 / rate
-            # playback + Wi-Fi + the board's resampler buffer
-            self.mute_until = max(self.mute_until, time.monotonic() + dur + 0.35)
+            # playback + Wi-Fi + the board's resampler buffer; the board that
+            # listens hears the sound too when it plays on another one
+            for b in {self, listener or self}:
+                b.mute_until = max(b.mute_until, time.monotonic() + dur + 0.35)
             self._tts_done.clear()
             await self.send(T_TTS_START, rate=rate, channels=1, bits=16)
             for i in range(0, len(pcm), TTS_CHUNK):
@@ -331,7 +378,7 @@ class Satellite:
     async def flash_error(self) -> None:
         await self.set_state(ST_ERROR)
         if self.hub.settings.get().sound_error:
-            self._spawn(self.play_earcon("error"))
+            self._spawn(self.earcon("error"))
         await asyncio.sleep(2)
         if self.state == ST_ERROR:
             await self.go_idle()
@@ -403,9 +450,35 @@ class Satellite:
             elif not self.busy:
                 await self.start_command("button")
 
+    def check_rate(self, nbytes: int, rate: int, channels: int) -> None:
+        """Byte rate vs the announced format, over a few seconds of steady stream."""
+        if self.proto < 2 or self.wide_samples:
+            return
+        now = time.monotonic()
+        win = self._rate_win
+        if win is None or now - win[1] > 0.5:   # gap (mic off, reconnect): start over
+            self._rate_win = (now, now, 0)
+            return
+        start, _, total = win
+        total += nbytes
+        self._rate_win = (start, now, total)
+        if now - start < RATE_CHECK_S:
+            return
+        ratio = total / (now - start) / (rate * 2 * max(1, channels))
+        self._rate_win = None
+        if 1.75 <= ratio <= 2.3:
+            self.wide_samples = True
+            _LOGGER.warning(
+                "%s: audio arrives at %.2fx the announced %s Hz x%s 16-bit: treating samples as 32-bit "
+                "(update the board firmware)", self.id, ratio, rate, channels,
+            )
+
     def condition(self, payload: bytes, rate: int, channels: int) -> bytes:
         """Board PCM -> 16 kHz mono with the chosen ES7210 slot and digital gain."""
         s = self.hub.settings.get()
+        if self.wide_samples:
+            # little-endian 32-bit: the high 16 bits of each sample are every second int16
+            payload = np.frombuffer(payload[: len(payload) - len(payload) % 4], dtype="<i2")[1::2].tobytes()
         if channels == 2:
             left, right = split_stereo(payload)
             if not self.speaking and left.size:
@@ -507,14 +580,12 @@ class Satellite:
                 return False
             await self.hub.set_sleep(False, "voice")
             self.hub.assistant.record({"satellite": self.id, "text": text, "reply": "Режим сна выключен"})
-            if self.can_speak:
-                self.say("Я здесь.")
+            self.reply("Я здесь.")
             return True
         if norm in phrase_list(s.sleep_phrases) and (explicit or len(norm.split()) <= 3):
             await self.hub.set_sleep(True, "voice")
             self.hub.assistant.record({"satellite": self.id, "text": text, "reply": "Режим сна включён"})
-            if self.can_speak:
-                self.say("Хорошо, сплю. Скажите: не спи, чтобы разбудить.")
+            self.reply("Хорошо, сплю. Скажите: не спи, чтобы разбудить.")
             return True
         return False
 
@@ -539,7 +610,7 @@ class Satellite:
             await self.set_state(ST_LISTENING)
             if self.hub.settings.get().sound_wake:
                 # not awaited: the mic loop must keep running (mute_until covers the sound)
-                self._spawn(self.play_earcon("wake"))
+                self._spawn(self.earcon("wake"))
 
     async def run_command(self, pcm: bytes, silent: bool = False, wake_pcm: bytes = b"") -> None:
         hub = self.hub
@@ -619,8 +690,8 @@ class Satellite:
             )
             hub.assistant.record(entry, pcm)
             _LOGGER.info("%s: «%s» -> «%s»", self.id, text, result.speech)
-            if result.speech and self.can_speak:
-                self.say(result.speech, expect_reply=result.expect_reply)
+            if result.speech and self.voice_out() is not None:
+                self.reply(result.speech, expect_reply=result.expect_reply)
             elif result.error:
                 self._spawn(self.flash_error())
             else:
@@ -633,10 +704,20 @@ class Satellite:
         finally:
             self.busy = False
 
-    def say(self, text: str, voice: str | None = None, expect_reply: bool = False) -> asyncio.Task:
+    def reply(self, text: str, voice: str | None = None, expect_reply: bool = False) -> asyncio.Task | None:
+        """Speak an answer to what this board heard, on the board its sound goes to."""
+        out = self.voice_out()
+        if out is None:
+            self._spawn(self.go_idle())
+            return None
+        return out.say(text, voice, expect_reply, listener=self)
+
+    def say(
+        self, text: str, voice: str | None = None, expect_reply: bool = False, listener: "Satellite | None" = None
+    ) -> asyncio.Task:
         if self._speak_task is not None and not self._speak_task.done():
             self._speak_task.cancel()
-        self._speak_task = self._spawn(self._speak(text, voice, expect_reply))
+        self._speak_task = self._spawn(self._speak(text, voice, expect_reply, listener or self))
         return self._speak_task
 
     async def stop_speaking(self) -> None:
@@ -644,16 +725,21 @@ class Satellite:
             self._speak_task.cancel()
         await self.send(T_TTS_ABORT)
 
-    async def _speak(self, text: str, voice: str | None, expect_reply: bool) -> None:
+    async def _speak(self, text: str, voice: str | None, expect_reply: bool, listener: "Satellite") -> None:
+        """listener: the board that heard the question. It is muted while the
+        answer plays (it hears it from the next room too) and asks the follow-up."""
         hub = self.hub
         voice = resolve_voice(voice or hub.settings.get().tts_voice)
-        self.speaking = True
-        self.command = None
+        boards = {self, listener}
+        for b in boards:
+            b.speaking = True
+            b.command = None
         self._tts_done.clear()
         total = 0
         rate = 24000
         try:
-            await self.set_state(ST_REPLYING)
+            for b in boards:
+                await b.set_state(ST_REPLYING)
             started = False
             async for r, pcm in synthesize_stream(hub.tts_uri, text, voice):
                 if not started:
@@ -673,17 +759,22 @@ class Satellite:
             raise
         except Exception:
             _LOGGER.exception("%s: TTS to board failed", self.id)
-            self._spawn(self.flash_error())
+            if listener is not self:
+                self._spawn(self.go_idle())
+            self._spawn(listener.flash_error())
             return
         finally:
-            self.speaking = False
-            self.mute_until = time.monotonic() + 0.4
-            self.diary_seg.reset()
-            self.wake.reset()
-        if expect_reply:
-            await self.start_command("follow_up")
-        else:
+            for b in boards:
+                b.speaking = False
+                b.mute_until = time.monotonic() + 0.4
+                b.diary_seg.reset()
+                b.wake.reset()
+        if listener is not self:
             await self.go_idle()
+        if expect_reply:
+            await listener.start_command("follow_up")
+        else:
+            await listener.go_idle()
 
     async def close(self) -> None:
         self._closed = True
@@ -831,7 +922,7 @@ class SatelliteHub:
     def get(self, sat_id: str | None = None) -> Satellite | None:
         if sat_id:
             return self.satellites.get(sat_id)
-        speaking = [s for s in self.satellites.values() if s.can_speak]
+        speaking = [s for s in self.satellites.values() if s.has_speaker]
         return speaking[0] if speaking else next(iter(self.satellites.values()), None)
 
     def _count(self) -> None:
@@ -957,6 +1048,7 @@ class SatelliteHub:
                     if not 8000 <= rate <= 48000 or bits not in (0, 16):
                         _LOGGER.warning("Unsupported audio from %s: rate=%s bits=%s", peer, rate, bits)
                         break
+                    sat.check_rate(nbytes, rate, channels or 1)
                     pcm = sat.condition(payload, rate, channels or 1)
                     await sat.on_audio(pcm)
                 elif ftype == T_HELLO:

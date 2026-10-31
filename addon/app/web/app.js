@@ -478,6 +478,15 @@
   const satId = () => (satellite() || {}).id;
   const BOARD_LABELS = { waveshare: "Waveshare", xvf3800: "ReSpeaker XVF3800" };
 
+  // "5 с · обычно ~12 с · LLM думает"
+  function thinkingLine(a, elapsed) {
+    a = a || {};
+    const parts = [`${Math.round(elapsed)} с`];
+    if (a.typical_s) parts.push(`обычно ~${Math.round(a.typical_s)} с`);
+    if (a.busy && a.busy.stage) parts.push(a.busy.stage);
+    return parts.join(" · ");
+  }
+
   function renderPills() {
     const el = $("#pills");
     const s = state.status;
@@ -490,7 +499,8 @@
     if (!sat) col = pill("bad", "Колонка не подключена");
     else if (!sat.listening) col = pill("warn", "Колонка: микрофон выключен");
     else {
-      const [dot, text] = SAT_STATES[sat.state] || ["ok", sat.state];
+      const [dot, text0] = SAT_STATES[sat.state] || ["ok", sat.state];
+      const text = sat.thinking_s != null ? `${text0} ${thinkingLine(s.assistant, sat.thinking_s)}` : text0;
       const n = satellites().length;
       col = pill(dot, n > 1 ? `${sat.room || sat.name} · ${text} (+${n - 1})` : `Колонка · ${text}`);
     }
@@ -672,7 +682,7 @@
           </dl>
           <div class="row" style="flex-wrap:wrap;margin-top:12px">
             <input class="input" id="spSay" placeholder="Сказать на колонке…" maxlength="400" style="flex:1;min-width:180px">
-            <button class="btn primary" id="spSayBtn" ${sat.can_speak ? "" : "disabled"}>${icon("speaker")}Сказать</button>
+            <button class="btn primary" id="spSayBtn" ${sat.out ? "" : "disabled"}>${icon("speaker")}Сказать</button>
             <button class="btn" id="spListen" title="Как будто сказали ключевое слово">${icon("mic")}Слушать команду</button>
           </div>` : ""}
         </div>
@@ -725,10 +735,19 @@
     }
   }
 
+  function satAudio() {
+    try {
+      return JSON.parse((state.settings || {}).sat_audio || "{}") || {};
+    } catch {
+      return {};
+    }
+  }
+
   function roomsCard() {
     const all = satellites();
     const cur = satId();
     const manual = satRooms();
+    const audio = satAudio();
     const rows = all.map((x) => {
       const [dot, text] = SAT_STATES[x.state] || ["", x.state];
       const areas = [...(state.areas || [])];
@@ -740,22 +759,53 @@
             <button type="button" class="btn sm ${x.id === cur ? "primary" : "ghost"}" data-sat="${esc(x.id)}">${icon("speaker")}${esc(x.name)}</button>
             <span class="small muted">${esc(BOARD_LABELS[x.board] || x.board)} · <span class="mono">${esc(x.ip)}</span> · <span class="dot ${dot}"></span> ${esc(text)}${x.listening ? "" : " · микрофон выключен"}</span>
           </div>
-          <label class="small" style="display:flex;gap:8px;align-items:center">Комната
-            <select class="input" data-room="${esc(x.id)}" style="max-width:240px">
-              <option value="">${esc(auto)}</option>
-              ${areas.map((a) => `<option value="${esc(a)}" ${manual[x.id] === a ? "selected" : ""}>${esc(a)}</option>`).join("")}
-            </select>
-          </label>
+          <div class="row" style="gap:12px;flex-wrap:wrap;align-items:center">
+            <label class="switch small" title="${x.can_speak ? "Снимите, если к плате не подключён динамик" : "Прошивка без динамика"}"><input type="checkbox" data-speaker="${esc(x.id)}" ${x.has_speaker ? "checked" : ""} ${x.can_speak ? "" : "disabled"}><span class="track"></span>Динамик</label>
+            <label class="small" style="display:flex;gap:8px;align-items:center">Звук на
+              <select class="input" data-out="${esc(x.id)}" style="max-width:200px">
+                <option value="">${x.has_speaker ? "этой колонке" : `авто: ${esc((all.find((b) => b.id === x.out) || {}).name || "нет динамика")}`}</option>
+                ${all.filter((b) => b.id !== x.id && b.has_speaker).map((b) => `<option value="${esc(b.id)}" ${(audio[x.id] || {}).out === b.id ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
+              </select>
+            </label>
+            <label class="small" style="display:flex;gap:8px;align-items:center">Комната
+              <select class="input" data-room="${esc(x.id)}" style="max-width:220px">
+                <option value="">${esc(auto)}</option>
+                ${areas.map((a) => `<option value="${esc(a)}" ${manual[x.id] === a ? "selected" : ""}>${esc(a)}</option>`).join("")}
+              </select>
+            </label>
+          </div>
         </div>`;
     });
     return `
       <div class="row between"><h3>${icon("speaker")}Колонки и комнаты</h3><span class="small muted">${all.length} подключено</span></div>
-      <p class="card-sub">Кнопка с именем выбирает колонку для этой вкладки и «Озвучки». Комната — область платы в HA (Настройки → Устройства → плата ESPHome → Область) или выбранная здесь: «включи свет» без комнаты выполнится в комнате той колонки, что услышала. Если ключевое слово услышали две колонки — отвечает та, что услышала первой, а дневник пишет фразу один раз.</p>
+      <p class="card-sub">Кнопка с именем выбирает колонку для этой вкладки и «Озвучки». Комната — область платы в HA (Настройки → Устройства → плата ESPHome → Область) или выбранная здесь: «включи свет» без комнаты выполнится в комнате той колонки, что услышала. Если ключевое слово услышали две колонки — отвечает та, что услышала первой, а дневник пишет фразу один раз. Колонка без динамика (снимите «Динамик») отвечает и пищит через другую: выбранную в «Звук на» или колонку с динамиком в той же комнате.</p>
       ${rows.join("")}`;
   }
 
   async function onRoomChange(ev) {
     const t = ev.target;
+    if (t.dataset.speaker || t.dataset.out !== undefined) {
+      const audio = satAudio();
+      const id = t.dataset.speaker || t.dataset.out;
+      const cfg = { ...(audio[id] || {}) };
+      if (t.dataset.speaker) {
+        if (t.checked) delete cfg.speaker;
+        else cfg.speaker = false;
+      } else if (t.value) cfg.out = t.value;
+      else delete cfg.out;
+      if (Object.keys(cfg).length) audio[id] = cfg;
+      else delete audio[id];
+      try {
+        state.settings = await postJson("/api/settings", { sat_audio: JSON.stringify(audio) });
+        toast("Сохранено");
+        t.blur();
+        await poll();
+        renderSpeaker();
+      } catch (err) {
+        showError(err);
+      }
+      return;
+    }
     if (!t.dataset.room) return;
     const rooms = satRooms();
     if (t.value) rooms[t.dataset.room] = t.value;
@@ -1657,7 +1707,7 @@
   }
 
   function soundsBox(sat) {
-    const can = sat && sat.can_speak;
+    const can = sat && sat.out;
     const snd = state.sounds || {};
     const row = (kind, label) => {
       const info = snd[kind] || {};
@@ -1719,7 +1769,7 @@
             <input class="input" id="ttsText" value="Привет! Я колонка HA Voice. Чем помочь?" maxlength="400">
           </div>
           <div class="row" style="flex-wrap:wrap">
-            <button type="button" class="btn primary" id="ttsBoard" ${sat && sat.can_speak && tts.online ? "" : "disabled"}>${icon("speaker")}На колонке</button>
+            <button type="button" class="btn primary" id="ttsBoard" ${sat && sat.out && tts.online ? "" : "disabled"}>${icon("speaker")}На колонке</button>
             <button type="button" class="btn" id="ttsBrowser" ${tts.online ? "" : "disabled"}>${icon("play")}В браузере</button>
           </div>
           <p class="small muted" style="margin-bottom:0">Kokoro также доступен как Wyoming TTS на порту ${esc(st && st.ports ? st.ports.tts : "10351")} — только если хотите использовать его в обычном Assist.</p>
@@ -2098,11 +2148,23 @@
       const text = $("#asText").value.trim();
       if (!text) return;
       btn.disabled = true;
-      $("#asResult").innerHTML = `${icon("refresh", "spin")} Думаю…`;
+      const t0 = Date.now();
+      const show = () => {
+        const el = $("#asResult");
+        if (el) el.innerHTML = `${icon("refresh", "spin")} Думаю… ${esc(thinkingLine((state.status || {}).assistant, (Date.now() - t0) / 1000))}`;
+      };
+      show();
+      // the stage comes with /api/status; poll it faster while waiting
+      const timer = setInterval(() => { show(); }, 500);
+      const statusTimer = setInterval(() => { poll().catch(() => {}); }, 1500);
       try {
-        const res = await postJson("/api/assistant/ask", { text, speak: $("#asSpeak").checked });
+        const res = await postJson("/api/assistant/ask", { text, speak: $("#asSpeak").checked }).finally(() => {
+          clearInterval(timer);
+          clearInterval(statusTimer);
+        });
         const r = res.result;
-        $("#asResult").innerHTML = r.error && !r.speech ? `<span class="bad">${esc(r.error)}</span>` : `${icon("speaker")} ${esc(r.speech || "(без ответа)")}`;
+        const took = `<span class="muted small"> · ${((Date.now() - t0) / 1000).toFixed(1)} с</span>`;
+        $("#asResult").innerHTML = (r.error && !r.speech ? `<span class="bad">${esc(r.error)}</span>` : `${icon("speaker")} ${esc(r.speech || "(без ответа)")}`) + took;
         state.assistantLog.unshift(res.entry);
         renderAssistantLog();
       } catch (err) {

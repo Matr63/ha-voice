@@ -46,10 +46,14 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент умного �
 - Если непонятно, какое именно устройство имеется в виду (например, свет есть в нескольких комнатах), не угадывай — вызови ask_user с коротким уточняющим вопросом.
 - После действия коротко подтверди, что сделал.
 - Числа и единицы говори словами так, как их произносят.
-Сейчас {now}. {speaker}
-Устройства (entity_id | имя | комната | состояние):
+- Текущие значения датчиков и состояния устройств узнавай через get_state.
+- В начале сообщения пользователя в квадратных скобках — время, кто говорит и комната колонки.
+Устройства (entity_id | имя | комната):
 {entities}
 {extra}"""
+# The system prompt holds nothing that changes between requests (no time, no
+# states): llama.cpp then reuses its cache and reads only the new words, instead
+# of the whole device list on every command (tens of seconds on a CPU).
 
 TOOLS = [
     {
@@ -137,6 +141,9 @@ class Assistant:
         self._next_id = 1
         # command audio by log id: "чей это голос?" in the log teaches the voice
         self.audio: dict[int, bytes] = {}
+        # how long answers take (for "обычно ~N с") and what is going on right now
+        self.durations: deque[float] = deque(maxlen=10)
+        self.busy: dict[str, Any] | None = None
         self._convs: dict[str, _Conversation] = {}
         self._session: aiohttp.ClientSession | None = None
 
@@ -156,6 +163,15 @@ class Assistant:
         self.log.appendleft(entry)
         return entry
 
+    def typical_s(self) -> float | None:
+        if not self.durations:
+            return None
+        return round(sorted(self.durations)[len(self.durations) // 2], 1)
+
+    def _stage(self, text: str) -> None:
+        if self.busy is not None:
+            self.busy["stage"] = text
+
     def forget(self, conv_key: str) -> None:
         self._convs.pop(conv_key, None)
 
@@ -170,6 +186,8 @@ class Assistant:
         s = self.settings.get()
         backend = s.assistant_backend
         conv = self._conv(conv_key)
+        t0 = time.monotonic()
+        self.busy = {"since": time.time(), "stage": "Home Assistant" if backend == "ha" else "LLM"}
         try:
             if backend == "off":
                 result = AssistantResult(backend="off")
@@ -178,6 +196,7 @@ class Assistant:
             else:
                 result = await self._ha(text, conv, device_id)
                 if result.error in FALLBACK_CODES and s.llm_fallback:
+                    self._stage("HA не понял — спрашиваю LLM")
                     result = await self._fallback(text, conv, speaker, result, room)
         except (HaError, aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("Assistant %s failed: %s", backend, err)
@@ -185,6 +204,9 @@ class Assistant:
         except Exception as err:
             _LOGGER.exception("Assistant %s failed", backend)
             result = AssistantResult(speech="Что-то пошло не так.", backend=backend, error=str(err))
+        self.busy = None
+        if backend != "off":
+            self.durations.append(time.monotonic() - t0)
         if not result.expect_reply and result.backend.endswith("openai"):
             # keep the context briefly so "а теперь выключи" still works
             conv.messages = conv.messages[-12:]
@@ -245,23 +267,39 @@ class Assistant:
             rows = await self.ha.entities(self._domains())
         except HaError as err:
             return f"(не удалось получить список: {err})"
-        rows = rows[:MAX_PROMPT_ENTITIES]
-        return "\n".join(f"{r['entity_id']} | {r['name']} | {r['area'] or '-'} | {r['state']}" for r in rows)
+        rows = sorted(rows, key=lambda r: r["entity_id"])[:MAX_PROMPT_ENTITIES]
+        return "\n".join(f"{r['entity_id']} | {r['name']} | {r['area'] or '-'}" for r in rows)
+
+    async def _system(self) -> str:
+        return SYSTEM_PROMPT.format(entities=await self._entities_text(), extra=self.settings.get().llm_prompt.strip())
+
+    def _local_llm(self) -> bool:
+        return self.settings.get().llm_url.rstrip("/").startswith("http://127.0.0.1:10360")
+
+    async def prewarm(self) -> None:
+        """Read the system prompt into the local model's cache before the first command."""
+        if not self._local_llm():
+            return
+        t0 = time.monotonic()
+        try:
+            await self._chat(
+                [{"role": "system", "content": await self._system()}, {"role": "user", "content": "привет"}], max_tokens=1
+            )
+            _LOGGER.info("LLM prompt cached in %.1f s", time.monotonic() - t0)
+        except Exception as err:
+            _LOGGER.info("LLM prewarm failed: %s", err)
 
     async def _llm(self, text: str, conv: _Conversation, speaker: str | None, room: str | None = None) -> AssistantResult:
-        s = self.settings.get()
-        who = f"Говорит: {speaker}." if speaker else ""
+        ctx = [datetime.now().strftime("%A %d.%m.%Y %H:%M")]
+        if speaker:
+            ctx.append(f"говорит {speaker}")
         if room:
-            who += f" Колонка стоит в комнате «{room}»: если комната не названа, речь о ней."
-        system = SYSTEM_PROMPT.format(
-            now=datetime.now().strftime("%A %d.%m.%Y %H:%M"),
-            speaker=who.strip(),
-            entities=await self._entities_text(),
-            extra=s.llm_prompt.strip(),
-        )
-        conv.messages.append({"role": "user", "content": text})
+            ctx.append(f"колонка в комнате «{room}» — если комната не названа, речь о ней")
+        system = await self._system()
+        conv.messages.append({"role": "user", "content": f"[{'; '.join(ctx)}]\n{text}"})
         result = AssistantResult(backend="openai")
-        for _ in range(MAX_TOOL_ROUNDS):
+        for step in range(MAX_TOOL_ROUNDS):
+            self._stage("LLM думает" if step == 0 else f"LLM думает (шаг {step + 1})")
             msg = await self._chat([{"role": "system", "content": system}, *conv.messages])
             calls = msg.get("tool_calls") or []
             conv.messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
@@ -282,6 +320,7 @@ class Assistant:
                     result.speech = question
                     result.expect_reply = True
                     return result
+                self._stage(f"выполняю {args.get('domain', '')}.{args.get('service', '')}" if name == "call_service" else f"смотрю {name}")
                 output = await self._tool(name, args, result)
                 conv.messages.append(
                     {"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(output, ensure_ascii=False)}
@@ -289,12 +328,16 @@ class Assistant:
         result.speech = "Готово." if result.actions else "Не получилось разобраться с запросом."
         return result
 
-    async def _chat(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 300) -> dict[str, Any]:
         s = self.settings.get()
         headers = {"Content-Type": "application/json"}
         if s.llm_api_key:
             headers["Authorization"] = f"Bearer {s.llm_api_key}"
-        body = {"model": s.llm_model, "messages": messages, "tools": TOOLS, "temperature": 0.2}
+        body: dict[str, Any] = {
+            "model": s.llm_model, "messages": messages, "tools": TOOLS, "temperature": 0.2, "max_tokens": max_tokens,
+        }
+        if self._local_llm():
+            body["cache_prompt"] = True
         session = await self._http()
         async with session.post(s.llm_url.rstrip("/") + "/chat/completions", json=body, headers=headers) as resp:
             text = await resp.text()

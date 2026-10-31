@@ -208,6 +208,9 @@ microphone:
     microphone:
       microphone: i2s_mics_raw
       channels: [0, 1]
+      # must match the I2S stream: with the default (16) the decimator reported
+      # 16-bit while passing 32-bit samples, and the server heard audio 2x slow
+      bits_per_sample: 32
 
 speaker:
   - platform: i2s_audio

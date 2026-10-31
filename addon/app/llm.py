@@ -15,7 +15,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import aiohttp
 
@@ -94,6 +94,8 @@ class LlmManager:
         self.job: dict[str, Any] | None = None
         self._job_task: asyncio.Task | None = None
         self._proc: asyncio.subprocess.Process | None = None
+        # called once the server answers /health (the assistant reads its prompt into the cache)
+        self.on_ready: Callable[[], Awaitable[None]] | None = None
         self._watch: asyncio.Task | None = None
         self.model: str | None = None
         self.state = "stopped"  # stopped | loading | ready | error
@@ -277,6 +279,8 @@ class LlmManager:
             "--alias", path.stem, "-c", str(s.llm_ctx), "-t", str(threads),
             # chat template from the GGUF: tool calling needs it
             "--jinja",
+            # one voice at a time: the whole context and its prompt cache for one slot
+            "-np", "1",
         ]
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "wb")
@@ -322,6 +326,8 @@ class LlmManager:
                             if resp.status == 200:
                                 self.state = "ready"
                                 _LOGGER.info("llama-server ready: %s", self.model)
+                                if self.on_ready is not None:
+                                    asyncio.create_task(self.on_ready())
                                 break
                     except (aiohttp.ClientError, asyncio.TimeoutError):
                         pass
