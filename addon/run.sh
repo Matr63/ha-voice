@@ -27,6 +27,7 @@ os.environ.setdefault(
     "true" if opts.get("tts_enabled", True) else "false",
 )
 os.environ.setdefault("TTS_VOICE", str(opts.get("tts_voice", "sveta")))
+os.environ.setdefault("HF_ENDPOINT_OPT", str(opts.get("hf_endpoint") or "").strip())
 env_path = Path("/tmp/ha_voice_env")
 # без кавычек Python !r — проще для bash source
 def sh_export(k: str) -> str:
@@ -41,6 +42,7 @@ lines = [
     sh_export("DIALOGUE_VAD_RMS"),
     sh_export("TTS_ENABLED"),
     sh_export("TTS_VOICE"),
+    sh_export("HF_ENDPOINT_OPT"),
 ]
 env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 print("[ha-voice] options:", {k: os.environ.get(k) for k in (
@@ -56,6 +58,16 @@ export HF_HOME=/data/models
 export HUGGINGFACE_HUB_CACHE=/data/models
 export TRANSFORMERS_CACHE=/data/models
 export HF_HUB_CACHE=/data/models
+# a stalled HuggingFace connection must fail, not hang the loader forever
+export HF_HUB_DOWNLOAD_TIMEOUT=60
+export HF_HUB_ETAG_TIMEOUT=15
+if [ -n "${HF_ENDPOINT_OPT}" ]; then
+  export HF_ENDPOINT="${HF_ENDPOINT_OPT}"
+  echo "[ha-voice] HuggingFace mirror: ${HF_ENDPOINT}"
+fi
+export TTS_STATE_FILE=/tmp/ha-voice-logs/tts_state.json
+export LLM_DIR=/share/ha-voice/llm
+export LLM_LOG=/tmp/ha-voice-logs/llm.log
 export GATE_URI=tcp://0.0.0.0:10350
 export GATE_UPSTREAM=tcp://127.0.0.1:10305
 export DIALOGUE_STT_URI=tcp://127.0.0.1:10305
@@ -133,11 +145,18 @@ if [ "$READY" != "1" ]; then
 fi
 
 TTS_PID=""
-if [ "${TTS_ENABLED}" = "true" ]; then
-  echo "[ha-voice] TTS: Kokoro-ru voice=${TTS_VOICE} (Wyoming :10351)"
-  echo "[ha-voice] first run may download Kokoro-ru weights — see ${TTS_LOG}"
+TTS_RESTARTS=0
+TTS_NEXT_START=0
+start_tts() {
+  echo "[ha-voice] TTS: Kokoro-ru voice=${TTS_VOICE} (Wyoming :10351), log ${TTS_LOG}"
+  # previous log kept for the panel's "why did it fail"
+  [ -f "${TTS_LOG}" ] && mv -f "${TTS_LOG}" "${TTS_LOG}.prev"
   python3 /app/tts_server.py --uri "${TTS_URI}" --voice "${TTS_VOICE}" >"${TTS_LOG}" 2>&1 &
   TTS_PID=$!
+}
+if [ "${TTS_ENABLED}" = "true" ]; then
+  echo "[ha-voice] first run may download Kokoro-ru weights — see ${TTS_LOG}"
+  start_tts
 else
   echo "[ha-voice] TTS disabled (tts_enabled=false) — колонка не сможет отвечать голосом"
 fi
@@ -170,34 +189,8 @@ if [ "$API_OK" != "1" ]; then
   echo "[ha-voice] WARNING: API not healthy yet, continuing (gate may still be loading embeddings)"
 fi
 
-if [ -n "${TTS_PID}" ]; then
-  TTS_OK=0
-  for i in $(seq 1 300); do
-    if python3 -c "import socket;s=socket.create_connection(('127.0.0.1',10351),1);s.close()" 2>/dev/null; then
-      TTS_OK=1
-      echo "[ha-voice] TTS ready after ${i}s (pid=${TTS_PID})"
-      break
-    fi
-    if ! kill -0 "$TTS_PID" 2>/dev/null; then
-      echo "[ha-voice] WARNING: TTS process exited — dump ${TTS_LOG}:"
-      tail -n 80 "${TTS_LOG}" || true
-      TTS_PID=""
-      break
-    fi
-    if [ $((i % 20)) -eq 0 ]; then
-      echo "[ha-voice] waiting TTS… ${i}s / 300s"
-      tail -n 5 "${TTS_LOG}" 2>/dev/null || true
-    fi
-    sleep 1
-  done
-  if [ -n "${TTS_PID}" ] && [ "$TTS_OK" != "1" ]; then
-    echo "[ha-voice] WARNING: TTS did not open port 10351 in 300s — STT continues. Dump:"
-    tail -n 80 "${TTS_LOG}" || true
-  fi
-fi
-
 echo "[ha-voice] ===== running ====="
-trap 'echo "[ha-voice] stopping…"; kill '"$STT_PID"' '"$GATE_PID"' ${TTS_PID:+'"$TTS_PID"'} 2>/dev/null || true' SIGTERM SIGINT
+trap 'echo "[ha-voice] stopping…"; kill "$STT_PID" "$GATE_PID" ${TTS_PID:+"$TTS_PID"} 2>/dev/null || true; exit 0' SIGTERM SIGINT
 
 while true; do
   if ! kill -0 "$STT_PID" 2>/dev/null; then
@@ -213,9 +206,24 @@ while true; do
     exit 1
   fi
   if [ -n "${TTS_PID}" ] && ! kill -0 "$TTS_PID" 2>/dev/null; then
-    echo "[ha-voice] WARNING: TTS died — dump ${TTS_LOG}:"
-    tail -n 80 "${TTS_LOG}" || true
+    TTS_RESTARTS=$((TTS_RESTARTS + 1))
+    # 10 s, 20 s ... up to 5 min between attempts; the panel's "restart" resets it
+    DELAY=$((TTS_RESTARTS * 10))
+    [ "$DELAY" -gt 300 ] && DELAY=300
+    echo "[ha-voice] WARNING: Kokoro stopped (attempt ${TTS_RESTARTS}), restart in ${DELAY}s — ${TTS_LOG}:"
+    tail -n 40 "${TTS_LOG}" || true
     TTS_PID=""
+    TTS_NEXT_START=$(( $(date +%s) + DELAY ))
+  fi
+  if [ "${TTS_ENABLED}" = "true" ] && [ -z "${TTS_PID}" ]; then
+    if [ -f /tmp/ha-voice-tts-restart ]; then
+      rm -f /tmp/ha-voice-tts-restart
+      TTS_RESTARTS=0
+      TTS_NEXT_START=0
+    fi
+    if [ "$(date +%s)" -ge "${TTS_NEXT_START}" ]; then
+      start_tts
+    fi
   fi
   sleep 2
 done

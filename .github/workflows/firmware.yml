@@ -1,8 +1,10 @@
 name: Satellite firmware
 
-# Builds esphome/ha-voice-satellite.yaml and publishes factory.bin (first USB
-# flash) and ota.bin (Wi-Fi update from the HA Voice panel). A push to main
-# refreshes the "firmware-latest" release that the add-on downloads from.
+# Builds every board's firmware and publishes factory.bin (first USB flash)
+# and ota.bin (Wi-Fi update from the HA Voice panel). A push to main refreshes
+# the "firmware-latest" release that the add-on downloads from.
+#   ha-voice-satellite.yaml -> ha-voice-satellite.*.bin  (Waveshare)
+#   ha-voice-xvf3800.yaml   -> ha-voice-xvf3800.*.bin    (ReSpeaker XVF3800)
 
 on:
   push:
@@ -35,22 +37,28 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.platformio
-          key: platformio-${{ runner.os }}-${{ hashFiles('esphome/ha-voice-satellite.yaml') }}
+          key: platformio-${{ runner.os }}-${{ hashFiles('esphome/*.yaml') }}
           restore-keys: platformio-${{ runner.os }}-
 
       - name: Compile
         working-directory: esphome
-        run: esphome compile ha-voice-satellite.yaml
+        run: |
+          esphome compile ha-voice-satellite.yaml
+          esphome compile ha-voice-xvf3800.yaml
 
       - name: Collect binaries
         run: |
           mkdir -p dist
-          # ESP-IDF builds land in build/, older PlatformIO builds in .pioenvs/<name>/
-          factory=$(find esphome/.esphome/build/ha-voice-sat -name firmware.factory.bin | head -1)
-          ota=$(find esphome/.esphome/build/ha-voice-sat -name firmware.ota.bin | head -1)
-          test -n "$factory" && test -n "$ota"
-          cp "$factory" dist/ha-voice-satellite.factory.bin
-          cp "$ota" dist/ha-voice-satellite.ota.bin
+          # <device name> <release prefix>; ESP-IDF builds land in build/<name>/
+          collect() {
+            factory=$(find "esphome/.esphome/build/$1" -name firmware.factory.bin | head -1)
+            ota=$(find "esphome/.esphome/build/$1" -name firmware.ota.bin | head -1)
+            test -n "$factory" && test -n "$ota"
+            cp "$factory" "dist/$2.factory.bin"
+            cp "$ota" "dist/$2.ota.bin"
+          }
+          collect ha-voice-sat ha-voice-satellite
+          collect ha-voice-xvf ha-voice-xvf3800
           (cd dist && sha256sum *.bin > SHA256SUMS)
           ls -la dist
 
@@ -67,5 +75,5 @@ jobs:
           gh release delete firmware-latest --yes --cleanup-tag || true
           gh release create firmware-latest dist/* \
             --title "Satellite firmware (latest)" \
-            --notes "Built from ${GITHUB_SHA::7}. factory.bin - first USB flash, ota.bin - update over Wi-Fi." \
+            --notes "Built from ${GITHUB_SHA::7}. ha-voice-satellite = Waveshare, ha-voice-xvf3800 = ReSpeaker XVF3800. factory.bin - first USB flash, ota.bin - update over Wi-Fi." \
             --prerelease

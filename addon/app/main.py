@@ -14,6 +14,7 @@ from dialogue import DialogueRuntime, DialogueStore
 from firmware import FirmwareStore
 from gate_server import GateState, run_gate
 from ha_client import HaClient
+from llm import LlmManager
 from modes import Modes
 from satellite import SatelliteHub
 from settings import SettingsStore
@@ -58,6 +59,7 @@ async def amain() -> None:
     modes = Modes(settings)
     hub = SatelliteHub(settings, runtime, assistant, stt_uri, tts_uri, modes, ha)
     firmware = FirmwareStore(Path(os.environ.get("FIRMWARE_DIR", "/data/firmware")))
+    llm = LlmManager(settings)
     ctx = AppContext(
         settings=settings,
         store=store,
@@ -67,6 +69,7 @@ async def amain() -> None:
         assistant=assistant,
         ha=ha,
         firmware=firmware,
+        llm=llm,
         stt_uri=stt_uri,
         stt_model=os.environ.get("STT_MODEL", "gigaam-v3-e2e-rnnt"),
         tts_uri=tts_uri,
@@ -81,6 +84,7 @@ async def amain() -> None:
         },
     )
     await start_api(ctx, os.environ.get("API_HOST", "0.0.0.0"), api_port)
+    await llm.restore()
 
     await asyncio.gather(
         run_gate(gate_uri, upstream, store, settings, gate_state),

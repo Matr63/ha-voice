@@ -1,12 +1,15 @@
 """Kokoro-ru ONNX engine. Weights live under HF_HOME and survive add-on updates."""
 from __future__ import annotations
 
+import functools
 import importlib.util
+import inspect
 import json
 import logging
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,10 +31,11 @@ VOICES: dict[str, dict[str, str]] = {
 }
 DEFAULT_VOICE = "sveta"
 _SENT_RE = re.compile(r"(?<=[.!?…;:])\s+|\n+")
+# Small text files are re-checked on every start: ru_g2p.py follows library
+# changes upstream (e.g. the transformers v5 shim), a stale copy breaks Kokoro.
+_REFRESH = ["ru_g2p.py", "kokoro-config.json", "config.json"]
 _NEED = [
-    "ru_g2p.py",
-    "kokoro-config.json",
-    "config.json",
+    *_REFRESH,
     "onnx/model_quantized.onnx",
     "onnx/model_dima_quantized.onnx",
     "voices/sveta.bin",
@@ -43,6 +47,54 @@ _NEED = [
 def data_root() -> Path:
     base = Path(os.environ.get("HF_HOME", "/data/models"))
     return base / "kokoro-ru"
+
+
+def state_path() -> Path:
+    return Path(os.environ.get("TTS_STATE_FILE", "/tmp/ha-voice-logs/tts_state.json"))
+
+
+def write_state(stage: str, error: str | None = None, **extra: Any) -> None:
+    """Loading progress for the panel: the Wyoming port only opens once Kokoro is ready."""
+    data = {"stage": stage, "error": error, "ts": time.time(), "pid": os.getpid(), **extra}
+    try:
+        path = state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def read_state() -> dict[str, Any]:
+    try:
+        return json.loads(state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _ruaccent_workdir(root: Path) -> None:
+    """RUAccent keeps its models next to the package, i.e. inside the image, so
+    every add-on update downloaded them again. Point it at /data instead."""
+    try:
+        from ruaccent import RUAccent
+    except ImportError:
+        return
+    if getattr(RUAccent.load, "_ha_voice", False):
+        return
+    if "workdir" not in inspect.signature(RUAccent.load).parameters:
+        return
+    workdir = root.parent / "ruaccent"
+    workdir.mkdir(parents=True, exist_ok=True)
+    original = RUAccent.load
+
+    @functools.wraps(original)
+    def load(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("workdir", str(workdir))
+        return original(self, *args, **kwargs)
+
+    load._ha_voice = True  # type: ignore[attr-defined]
+    RUAccent.load = load
 
 
 def resolve_voice(name: str | None) -> str:
@@ -65,13 +117,17 @@ class KokoroEngine:
         self.error: str | None = None
 
     def load(self) -> None:
-        _LOGGER.info("Kokoro-ru: downloading assets to %s", self.root)
+        _LOGGER.info("Kokoro-ru: assets in %s", self.root)
         self._ensure_files()
+        write_state("g2p", detail="ударения RUAccent (первый раз скачивает ~300 МБ)")
         self._load_g2p()
+        write_state("onnx", detail="модель Kokoro")
         for name in VOICES:
             self._styles[name] = np.fromfile(self.root / "voices" / f"{name}.bin", dtype=np.float32).reshape(510, 256)
         # preload default (sveta/masha share one onnx)
         self._session_for(DEFAULT_VOICE)
+        write_state("warmup", detail="пробная фраза")
+        self.synthesize("Проверка.", DEFAULT_VOICE)
         self.ready = True
         self.error = None
         _LOGGER.info("Kokoro-ru ready, voices=%s", ", ".join(VOICES))
@@ -79,16 +135,25 @@ class KokoroEngine:
     def _ensure_files(self) -> None:
         for rel in _NEED:
             dest = self.root / rel
-            if dest.is_file() and dest.stat().st_size > 0:
+            have = dest.is_file() and dest.stat().st_size > 0
+            if have and rel not in _REFRESH:
                 continue
-            _LOGGER.info("download %s", rel)
-            hf_hub_download(REPO, rel, local_dir=str(self.root))
+            write_state("download", detail=rel)
+            _LOGGER.info("%s %s", "check" if have else "download", rel)
+            try:
+                hf_hub_download(REPO, rel, local_dir=str(self.root))
+            except Exception as err:
+                if not have:
+                    raise RuntimeError(f"не удалось скачать {rel} с HuggingFace: {err}") from err
+                _LOGGER.warning("HuggingFace недоступен (%s), беру сохранённый %s", err, rel)
         ru_dict = self.root / "espeak-data" / "ru_dict"
         if not ru_dict.is_file():
+            write_state("download", detail="espeak-data/")
             _LOGGER.info("download espeak-data/")
             snapshot_download(REPO, local_dir=str(self.root), allow_patterns=["espeak-data/**"])
 
     def _load_g2p(self) -> None:
+        _ruaccent_workdir(self.root)
         path = self.root / "ru_g2p.py"
         spec = importlib.util.spec_from_file_location("kokoro_ru_g2p", path)
         if spec is None or spec.loader is None:

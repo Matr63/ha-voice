@@ -18,6 +18,8 @@ RUN echo "[ha-voice 1/6] apt packages..." \
     espeak-ng \
     ffmpeg \
     curl \
+    cmake \
+    git \
  && rm -rf /var/lib/apt/lists/* \
  && echo "[ha-voice 1/6] apt done"
 
@@ -34,6 +36,7 @@ RUN echo "[ha-voice 2/6] pip: wyoming + onnx-asr (STT)..." \
 RUN echo "[ha-voice 3/6] pip: aiohttp/numpy1.26/soundfile..." \
  && pip3 install --break-system-packages --no-cache-dir \
       "wyoming>=1.5.3" "numpy>=1.26.0,<2" "aiohttp>=3.9.0" "soundfile>=0.12.1" "scipy>=1.11.0" "webrtcvad>=2.0.10" \
+      "esptool>=4.7,<6" \
  && echo "[ha-voice 3/6] light deps done"
 
 RUN echo "[ha-voice 4/6] pip: torch CPU (долго, ~1–2 GB)..." \
@@ -59,6 +62,21 @@ RUN echo "[ha-voice 5/6] pip: resemblyzer (speaker gate)..." \
  && python3 -c "import openwakeword.utils as u; u.download_models(model_names=['alexa','hey_jarvis','hey_mycroft','hey_rhasspy'])" \
  && echo "[ha-voice 5c/6] openWakeWord done"
 
+# Local LLM: llama.cpp's OpenAI-compatible server, one static binary.
+# GGML_NATIVE: the add-on is built on the HA machine itself, so -march=native
+# gives AVX2/NEON wherever the CPU has them.
+ARG LLAMA_CPP_REF=b12019
+RUN echo "[ha-voice 5d/6] build llama.cpp ${LLAMA_CPP_REF} (llama-server, 5-20 мин)..." \
+ && git clone --depth 1 --branch "${LLAMA_CPP_REF}" https://github.com/ggml-org/llama.cpp /tmp/llama.cpp \
+ && cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build \
+      -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=ON \
+      -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+ && cmake --build /tmp/llama.cpp/build --target llama-server -j"$(nproc)" \
+ && install -m 755 /tmp/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server \
+ && rm -rf /tmp/llama.cpp \
+ && llama-server --version \
+ && echo "[ha-voice 5d/6] llama-server done"
+
 COPY app/ /app/
 COPY integration/ /app/integration/
 COPY run.sh /run.sh
@@ -74,6 +92,7 @@ ENV DIALOGUE_DB=/data/dialogues/dialogue.db
 ENV WEB_ROOT=/app/web
 ENV FIRMWARE_DIR=/data/firmware
 ENV WAKEWORDS_DIR=/data/wakewords
+ENV LLM_DIR=/share/ha-voice/llm
 ENV PYTHONUNBUFFERED=1
 
 # bash явно — без проблем с CRLF shebang

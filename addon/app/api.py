@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,15 +15,16 @@ from aiohttp import web
 from assistant import Assistant, result_dict
 from audio_utils import decode_body, duration_ms, to_wav
 from dialogue import DialogueRuntime
-from firmware import KINDS, FirmwareStore
+from firmware import BOARDS, KINDS, FirmwareStore, board_key, file_name
 from gate_server import GateState
 from ha_client import HaClient, HaError
+from llm import PRESETS, LlmManager
 from satellite import SatelliteHub
 from settings import SettingsStore
 from speakers import SpeakerStore
 from stt_client import port_open, transcribe
 from tts_client import synthesize_wav
-from tts_engine import VOICES, resolve_voice
+from tts_engine import VOICES, read_state as tts_state, resolve_voice
 from version import __version__
 from wake import available_models
 
@@ -40,6 +43,7 @@ class AppContext:
     assistant: Assistant
     ha: HaClient
     firmware: FirmwareStore
+    llm: LlmManager
     stt_uri: str
     stt_model: str
     tts_uri: str
@@ -47,6 +51,43 @@ class AppContext:
     web_root: Path
     ports: dict[str, int]
     started_at: float = field(default_factory=time.time)
+
+
+def tail(path: Path, lines: int = 25) -> list[str]:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 16384))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return [ln for ln in text.splitlines() if ln.strip()][-lines:]
+
+
+def _tts_info(online: bool) -> dict[str, Any]:
+    """Why Kokoro is not up yet: loader stage from tts_server plus the log tail."""
+    if online:
+        return {"stage": "ready"}
+    st = tts_state()
+    log = Path(os.environ.get("TTS_LOG", "/tmp/ha-voice-logs/tts.log"))
+    lines = tail(log) or tail(log.with_name(log.name + ".prev"))
+    alive = False
+    if st.get("pid"):
+        try:
+            os.kill(int(st["pid"]), 0)
+            alive = True
+        except (OSError, ValueError):
+            pass
+    stage = st.get("stage") or "start"
+    if not alive and stage not in ("error",):
+        stage = "stopped"
+    return {
+        "stage": stage,
+        "detail": st.get("detail"),
+        "error": st.get("error"),
+        "since": st.get("ts"),
+        "log": lines,
+    }
 
 
 def _err(message: str, status: int = 400) -> web.Response:
@@ -84,7 +125,7 @@ async def _read_audio(request: web.Request) -> bytes:
 def create_app(ctx: AppContext) -> web.Application:
     app = web.Application(client_max_size=64 * 1024 * 1024, middlewares=[errors_middleware])
     store, runtime, settings, dstore = ctx.store, ctx.runtime, ctx.settings, ctx.runtime.dialogue_store
-    hub, assistant, firmware = ctx.hub, ctx.assistant, ctx.firmware
+    hub, assistant, firmware, llm = ctx.hub, ctx.assistant, ctx.firmware, ctx.llm
     background: set[asyncio.Task] = set()
 
     def spawn(coro: Any) -> None:
@@ -112,6 +153,7 @@ def create_app(ctx: AppContext) -> web.Application:
     async def status(_: web.Request) -> web.Response:
         s = settings.get()
         last_audio_age = round(time.time() - runtime.last_audio_at, 1) if runtime.last_audio_at else None
+        tts_online = await port_open(ctx.tts_uri) if ctx.tts_enabled else False
         return web.json_response(
             {
                 "ok": True,
@@ -156,11 +198,13 @@ def create_app(ctx: AppContext) -> web.Application:
                 "last_utterance": runtime.last_utterance,
                 "tts": {
                     "enabled": ctx.tts_enabled,
-                    "online": await port_open(ctx.tts_uri) if ctx.tts_enabled else False,
+                    "online": tts_online,
                     "voice": s.tts_voice,
                     "voices": [{"id": k, "label": v["label"], "gender": v["gender"]} for k, v in VOICES.items()],
                     "port": ctx.ports.get("tts"),
+                    **(_tts_info(tts_online) if ctx.tts_enabled else {}),
                 },
+                "llm": ctx.llm.status(),
             }
         )
 
@@ -369,6 +413,19 @@ def create_app(ctx: AppContext) -> web.Application:
             return _err(str(err) or "TTS не ответил — смотрите журнал дополнения", 503)
         return web.Response(body=wav, content_type="audio/wav", headers={"Cache-Control": "no-store"})
 
+    async def tts_restart(_: web.Request) -> web.Response:
+        """run.sh restarts Kokoro when it exits; the flag skips its back-off."""
+        if not ctx.tts_enabled:
+            return _err("Озвучка Kokoro выключена в конфигурации дополнения")
+        Path("/tmp/ha-voice-tts-restart").touch()
+        pid = tts_state().get("pid")
+        if pid:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+        return web.json_response({"ok": True})
+
     async def capture_enroll(request: web.Request) -> web.Response:
         pcm = runtime.capture_pcm()
         if not pcm:
@@ -472,26 +529,66 @@ def create_app(ctx: AppContext) -> web.Application:
     async def wake_models(_: web.Request) -> web.Response:
         return web.json_response({"models": available_models()})
 
+    # ---------------------------------------------------------- local LLM
+    async def llm_info(_: web.Request) -> web.Response:
+        models = await asyncio.to_thread(llm.models)
+        have = {m["name"] for m in models}
+        return web.json_response(
+            {
+                **llm.status(),
+                "models": models,
+                "presets": [{**p, "installed": p["file"] in have} for p in PRESETS],
+                "log": llm.log_tail() if llm.state in ("loading", "error") else [],
+            }
+        )
+
+    async def llm_download(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        return web.json_response(llm.download(data.get("preset") or None, data.get("url") or None))
+
+    async def llm_cancel(_: web.Request) -> web.Response:
+        llm.cancel()
+        return web.json_response(llm.status())
+
+    async def llm_upload(request: web.Request) -> web.Response:
+        # streamed straight to disk: models are several GB, far over client_max_size
+        name = request.query.get("name", "")
+        return web.json_response(await llm.upload(name, request.content.iter_chunked(1024 * 1024), request.content_length))
+
+    async def llm_start(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        return web.json_response(await llm.start(str(data.get("name") or ""), activate=bool(data.get("activate", True))))
+
+    async def llm_stop(_: web.Request) -> web.Response:
+        return web.json_response(await llm.stop())
+
+    async def llm_delete(request: web.Request) -> web.Response:
+        await asyncio.to_thread(llm.delete, request.match_info["name"])
+        return web.json_response({"ok": True})
+
     # ----------------------------------------------------------- firmware
     async def firmware_info(_: web.Request) -> web.Response:
         return web.json_response(await asyncio.to_thread(firmware.info))
 
-    async def firmware_fetch(_: web.Request) -> web.Response:
-        return web.json_response(await firmware.fetch_latest())
+    async def firmware_fetch(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        return web.json_response(await firmware.fetch_latest(data.get("board") or None))
 
     async def firmware_upload(request: web.Request) -> web.Response:
         kind = request.match_info["kind"]
         if kind not in KINDS:
             return _err("Тип прошивки: factory или ota", 404)
+        board = board_key(request.query.get("board"))
         body = await request.read()
-        return web.json_response(await asyncio.to_thread(firmware.save, kind, body))
+        return web.json_response(await asyncio.to_thread(firmware.save, kind, body, "upload", board))
 
     async def firmware_file(request: web.Request) -> web.StreamResponse:
         kind = request.match_info["kind"]
-        path = firmware.path(kind)
+        board = board_key(request.query.get("board"))
+        path = firmware.path(kind, board)
         if not path.is_file():
             return _err("Файла прошивки ещё нет — нажмите «Скачать последнюю»", 404)
-        disposition = 'attachment; filename="%s"' % KINDS[kind]
+        disposition = 'attachment; filename="%s"' % file_name(board, kind)
         return web.FileResponse(
             path,
             headers={
@@ -501,27 +598,41 @@ def create_app(ctx: AppContext) -> web.Application:
             },
         )
 
-    async def firmware_manifest(_: web.Request) -> web.Response:
-        # ESP Web Tools resolves "factory.bin" relative to this manifest URL
+    async def firmware_manifest(request: web.Request) -> web.Response:
+        # ESP Web Tools resolves "factory.bin?board=…" relative to this manifest URL
+        board = board_key(request.query.get("board"))
         return web.json_response(
             {
-                "name": "HA Voice satellite",
+                "name": f"HA Voice · {BOARDS[board]['label']}",
                 "version": __version__,
                 "new_install_prompt_erase": True,
-                "builds": [{"chipFamily": "ESP32-S3", "parts": [{"path": "factory.bin", "offset": 0}]}],
+                "builds": [{"chipFamily": "ESP32-S3", "parts": [{"path": f"factory.bin?board={board}", "offset": 0}]}],
             }
         )
 
     async def firmware_ota(request: web.Request) -> web.Response:
         data = await _json_obj(request)
         ip = (data.get("ip") or "").strip()
-        if not ip:
-            ip = _satellite(data).to_dict()["ip"]
-        if not firmware.path("ota").is_file():
-            raise ValueError("Нет ota.bin — скачайте или загрузите прошивку")
-        firmware.ota_jobs[ip] = {"ip": ip, "status": "uploading", "started": time.time(), "error": None}
-        spawn(firmware.ota(ip))
+        board = data.get("board") or None
+        if not ip or not board:
+            sat = _satellite(data).to_dict()
+            ip = ip or sat["ip"]
+            board = board or sat.get("board")
+        board = board_key(board)
+        if not firmware.path("ota", board).is_file():
+            raise ValueError(f"Нет {file_name(board, 'ota')} — скачайте или загрузите прошивку")
+        firmware.ota_jobs[ip] = {"ip": ip, "board": board, "status": "uploading", "started": time.time(), "error": None}
+        spawn(firmware.ota(ip, board))
         return web.json_response(firmware.ota_jobs[ip])
+
+    async def firmware_serial(_: web.Request) -> web.Response:
+        return web.json_response({"ports": await asyncio.to_thread(firmware.serial_ports), "job": firmware.serial_job})
+
+    async def firmware_serial_flash(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        job = firmware.start_serial_flash(str(data.get("port") or ""), data.get("board") or None)
+        spawn(firmware.serial_flash(job, bool(data.get("erase", True))))
+        return web.json_response(job)
 
     r = app.router
     r.add_get("/", index)
@@ -553,6 +664,7 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_get("/api/capture/audio", capture_audio)
     r.add_post("/api/capture/enroll", capture_enroll)
     r.add_post("/api/tts", tts_speak)
+    r.add_post("/api/tts/restart", tts_restart)
     r.add_get("/api/satellites", satellites_list)
     r.add_post("/api/satellites/say", satellite_say)
     r.add_post("/api/satellites/volume", satellite_volume)
@@ -566,12 +678,21 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_get("/api/ha", ha_status)
     r.add_get("/api/ha/media_players", ha_media_players)
     r.add_get("/api/wake/models", wake_models)
+    r.add_get("/api/llm", llm_info)
+    r.add_post("/api/llm/download", llm_download)
+    r.add_post("/api/llm/cancel", llm_cancel)
+    r.add_post("/api/llm/upload", llm_upload)
+    r.add_post("/api/llm/start", llm_start)
+    r.add_post("/api/llm/stop", llm_stop)
+    r.add_delete("/api/llm/models/{name}", llm_delete)
     r.add_get("/api/firmware", firmware_info)
     r.add_post("/api/firmware/fetch", firmware_fetch)
     r.add_get("/api/firmware/manifest.json", firmware_manifest)
     r.add_get("/api/firmware/{kind}.bin", firmware_file)
     r.add_post("/api/firmware/ota", firmware_ota)
     r.add_post("/api/firmware/upload/{kind}", firmware_upload)
+    r.add_get("/api/firmware/serial", firmware_serial)
+    r.add_post("/api/firmware/serial", firmware_serial_flash)
     r.add_static("/static/", ctx.web_root, show_index=False)
     return app
 

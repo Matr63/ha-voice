@@ -1,5 +1,5 @@
 name: HA Voice
-version: "2.1.1"
+version: "2.2.0"
 slug: ha_voice
 description: >-
   Голосовой ассистент на ПК для колонки Waveshare: плата — микрофон и динамик,
@@ -19,6 +19,8 @@ panel_title: HA Voice
 homeassistant_api: true
 hassio_api: true
 hassio_role: default
+# USB serial ports of the HA machine: first flash of a satellite board from the panel
+uart: true
 discovery:
   - ha_voice
 ports:
@@ -37,6 +39,7 @@ map:
   - addon_config:rw
   - homeassistant_config:rw
   - media:rw
+  - share:rw
 options:
   stt_model: gigaam-v3-e2e-rnnt
   stt_quantization: int8
@@ -55,3 +58,4 @@ schema:
   diary_vad_rms: float
   tts_enabled: bool
   tts_voice: list(sveta|masha|dima)
+  hf_endpoint: str?

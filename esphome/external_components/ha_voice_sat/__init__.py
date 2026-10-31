@@ -20,6 +20,7 @@ CONF_MICROPHONE = "microphone"
 CONF_SPEAKER = "speaker"
 CONF_LISTENING = "listening"
 CONF_DEVICE_NAME = "device_name"
+CONF_BOARD = "board"
 CONF_ON_STATE = "on_state"
 CONF_ON_VOLUME = "on_volume"
 CONF_ON_SETTING = "on_setting"
@@ -38,6 +39,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_SPEAKER): cv.use_id(speaker.Speaker),
         cv.Optional(CONF_LISTENING, default=True): cv.boolean,
         cv.Optional(CONF_DEVICE_NAME, default=""): cv.string,
+        # which firmware build the HA Voice panel offers for OTA
+        cv.Optional(CONF_BOARD, default="waveshare"): cv.string_strict,
         cv.Optional(CONF_ON_STATE): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_VOLUME): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_SETTING): automation.validate_automation(single=True),
@@ -61,6 +64,7 @@ async def to_code(config):
     cg.add(var.set_port(config[CONF_PORT]))
     cg.add(var.set_listening(config[CONF_LISTENING]))
     cg.add(var.set_device_name(config[CONF_DEVICE_NAME]))
+    cg.add(var.set_board(config[CONF_BOARD]))
 
     if CONF_ON_STATE in config:
         await automation.build_automation(

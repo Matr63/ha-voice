@@ -107,6 +107,17 @@ void HaVoiceSat::dump_config() {
 void HaVoiceSat::on_audio_(const std::vector<uint8_t> &data) {
   if (!this->listening_.load() || !this->connected_.load() || data.empty())
     return;
+  if (this->mic_->get_audio_stream_info().get_bits_per_sample() == 32) {
+    // little endian: the top two bytes of each 32-bit sample are its 16-bit value
+    const size_t n = data.size() / 4;
+    this->pack_buf_.resize(n * 2);
+    for (size_t i = 0; i < n; i++) {
+      this->pack_buf_[2 * i] = data[4 * i + 2];
+      this->pack_buf_[2 * i + 1] = data[4 * i + 3];
+    }
+    this->tx_ring_->write_without_replacement(this->pack_buf_.data(), this->pack_buf_.size(), 0);
+    return;
+  }
   this->tx_ring_->write_without_replacement(data.data(), data.size(), 0);
 }
 
@@ -346,7 +357,7 @@ void HaVoiceSat::send_hello_() {
   std::string name = this->device_name_.empty() ? App.get_name().str() : this->device_name_;
   std::string hello = "name=" + name + "\n" + "friendly_name=" + App.get_friendly_name().str() + "\n" +
                       "mac=" + get_mac_address_pretty() + "\n" + "ip=" + ip + "\n" +
-                      "esphome=" ESPHOME_VERSION "\n" + "proto=2\n" +
+                      "esphome=" ESPHOME_VERSION "\n" + "proto=2\n" + "board=" + this->board_ + "\n" +
                       "mic_rate=" + std::to_string(info.get_sample_rate()) + "\n" +
                       "mic_channels=" + std::to_string(info.get_channels()) + "\n" +
                       "listening=" + (this->listening_.load() ? "1" : "0") + "\n";
@@ -495,7 +506,8 @@ void HaVoiceSat::net_run_() {
     size_t n = this->tx_ring_->read(buf.data(), buf.size(), pdMS_TO_TICKS(20));
     if (n > 0) {
       auto info = this->mic_->get_audio_stream_info();
-      size_t frame = info.get_bits_per_sample() / 8 * info.get_channels();
+      const uint8_t bits = info.get_bits_per_sample() == 32 ? 16 : info.get_bits_per_sample();
+      size_t frame = bits / 8 * info.get_channels();
       if (frame == 0)
         frame = 2;
       size_t rem = n % frame;
@@ -504,8 +516,7 @@ void HaVoiceSat::net_run_() {
       }
       n -= n % frame;
       if (n > 0)
-        this->send_frame_(FRAME_AUDIO, buf.data(), n, info.get_sample_rate(), info.get_channels(),
-                          info.get_bits_per_sample());
+        this->send_frame_(FRAME_AUDIO, buf.data(), n, info.get_sample_rate(), info.get_channels(), bits);
     } else if (millis() - this->last_tx_ms_ > PING_MS) {
       this->send_frame_(FRAME_PING, nullptr, 0);
     }

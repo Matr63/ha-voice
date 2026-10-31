@@ -17,7 +17,7 @@ from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.tts import Synthesize
 
-from tts_engine import DEFAULT_VOICE, SAMPLE_RATE, VOICES, KokoroEngine, resolve_voice
+from tts_engine import DEFAULT_VOICE, SAMPLE_RATE, VOICES, KokoroEngine, resolve_voice, write_state
 from version import __version__
 
 _LOGGER = logging.getLogger("ha-voice.tts")
@@ -121,13 +121,20 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     default_voice = resolve_voice(args.voice)
+    write_state("start")
     engine = KokoroEngine()
-    engine.load()
+    try:
+        engine.load()
+    except Exception as err:
+        _LOGGER.exception("Kokoro-ru failed to load")
+        write_state("error", error=f"{err.__class__.__name__}: {err}"[:500])
+        raise SystemExit(1) from err
 
     info = _info(default_voice)
     server = AsyncServer.from_uri(args.uri)
     lock = asyncio.Lock()
     _LOGGER.info("TTS listening on %s default_voice=%s", args.uri, default_voice)
+    write_state("ready")
     await server.run(partial(TtsHandler, info, engine, lock, default_voice))
 
 

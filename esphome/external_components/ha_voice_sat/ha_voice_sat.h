@@ -64,6 +64,7 @@ class HaVoiceSat : public Component {
   void set_host(const std::string &host);
   void set_port(uint16_t port) { this->port_ = port; }
   void set_device_name(const std::string &name) { this->device_name_ = name; }
+  void set_board(const std::string &board) { this->board_ = board; }
   void set_listening(bool on);
   bool is_listening() const { return this->listening_.load(); }
   bool is_connected() const { return this->connected_.load(); }
@@ -104,6 +105,9 @@ class HaVoiceSat : public Component {
   std::string host_;
   uint16_t port_{10500};
   std::string device_name_;
+  std::string board_{"waveshare"};
+  // 32-bit mics (XVF3800) are sent as 16-bit: half the Wi-Fi traffic
+  std::vector<uint8_t> pack_buf_;
 
   std::atomic<bool> listening_{true};
   std::atomic<bool> connected_{false};

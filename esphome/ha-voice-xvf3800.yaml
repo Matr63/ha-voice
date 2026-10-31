@@ -1,0 +1,502 @@
+###############################################################################
+# HA Voice satellite - Seeed ReSpeaker XVF3800 4-Mic Array + XIAO ESP32-S3
+#
+# Same role as ha-voice-satellite.yaml (Waveshare): the board streams the
+# microphone to HA Voice (TCP :10500) and plays what HA Voice says. Wake word,
+# GigaAM, speaker id, diary and assistant run on the HA machine.
+#
+# The XMOS XVF3800 does the audio front end itself (4 mics, beamforming, AEC,
+# noise suppression, AGC) and sends two processed channels over I2S:
+#   0 - comms beam (noise suppression + AGC), 1 - ASR beam (fixed gain).
+# HA Voice picks the louder one per board ("Канал микрофона" in the panel).
+#
+# Hardware drivers (XVF3800 over I2C, TLV320AIC3104 codec, 48->16 kHz
+# decimator) come from formatBCE's ESPHome integration; pins are fixed by the
+# board. The XVF3800 must run the I2S firmware: the respeaker_xvf3800 component
+# below carries it and flashes the DSP over I2C on boot when the version
+# differs (takes ~1 min, do not unplug). Boards that still have Seeed's USB
+# firmware and do not answer on I2C need one manual DFU, see INSTALL.md.
+#
+# First flash: USB-C of the XIAO (the port farther from the 3.5 mm jack).
+# After that: OTA over Wi-Fi from the HA Voice panel.
+###############################################################################
+
+substitutions:
+  name: ha-voice-xvf
+  friendly_name: "HA Voice XVF3800"
+  ha_voice_host: homeassistant.local
+  ha_voice_port: '10500'
+  volume_min: '0.3'
+  volume_max: '1.0'
+  # formatBCE/Respeaker-XVF3800-ESPHome-integration release: C++ components
+  # and the XVF3800 DSP firmware it embeds
+  respeaker_ref: '2026.10.4'
+  respeaker_lite_ref: '2026.10.4'
+  xvf_fw_version: '1.0.9'
+  xvf_fw_md5: b62766ccf8fbbaf924d0d13beace495b
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true
+  min_version: 2026.10.0
+  project:
+    name: matr63.ha-voice-xvf3800
+    version: "2.2.0"
+  on_boot:
+    - priority: 600
+      then:
+        - lambda: |-
+            id(dsp_status).publish_state(id(respeaker).is_failed() ? "Нет ответа / ошибка обновления" : "OK");
+    - priority: 375
+      then:
+        - script.execute:
+            id: ring_state
+            state: -1
+
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
+      CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+external_components:
+  - source:
+      type: local
+      path: external_components
+    components: [ha_voice_sat]
+  - source:
+      type: git
+      url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration
+      ref: ${respeaker_ref}
+    components: [respeaker_xvf3800, aic3104]
+    refresh: 1d
+  - source:
+      type: git
+      url: https://github.com/formatBCE/Respeaker-Lite-ESPHome-integration
+      ref: ${respeaker_lite_ref}
+    components: [decimator]
+    refresh: 1d
+
+wifi:
+  id: wifi_id
+  power_save_mode: none
+  ap:
+    ssid: "HA-Voice-Setup"
+  on_connect:
+    - script.execute:
+        id: ring_state
+        state: -1
+  on_disconnect:
+    - script.execute:
+        id: ring_state
+        state: -1
+
+captive_portal:
+improv_serial:
+improv_ble:
+  authorizer: none
+
+logger:
+  level: INFO
+  logs:
+    i2s_audio: WARN
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+  - platform: web_server
+
+web_server:
+  port: 80
+  version: 3
+
+i2c:
+  - id: internal_i2c
+    sda: GPIO5
+    scl: GPIO6
+    frequency: 400kHz
+
+# One I2S clock pair (LRCLK GPIO7, BCLK GPIO8) for both directions, 48 kHz:
+# the XVF3800 is the clock master.
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO8
+      allow_other_uses: true
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO7
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO8
+      allow_other_uses: true
+
+respeaker_xvf3800:
+  id: respeaker
+  i2c_id: internal_i2c
+  address: 0x2C
+  # Mute key on the board: the DSP mutes the mics by itself, the switch mirrors it.
+  mute_switch:
+    id: mic_mute_switch
+    name: "Микрофон выключен (кнопка)"
+    icon: mdi:microphone-off
+    update_interval: 1s
+    on_turn_on:
+      - script.execute:
+          id: ring_state
+          state: !lambda return id(ring_last);
+    on_turn_off:
+      - script.execute:
+          id: ring_state
+          state: !lambda return id(ring_last);
+  dfu_version:
+    name: "XVF3800 firmware"
+    update_interval: 120s
+  firmware:
+    url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/${respeaker_ref}/respeaker_xvf3800_i2s_master_v${xvf_fw_version}_48k.bin
+    version: ${xvf_fw_version}
+    md5: ${xvf_fw_md5}
+    on_begin:
+      - script.execute:
+          id: ring_state
+          state: 3
+    on_error:
+      - lambda: id(dsp_status).publish_state("Обновление DSP не удалось");
+
+audio_dac:
+  - platform: aic3104
+    id: aic3104_dac
+    i2c_id: internal_i2c
+
+microphone:
+  - platform: i2s_audio
+    id: i2s_mics_raw
+    i2s_audio_id: i2s_input
+    i2s_din_pin: GPIO43
+    adc_type: external
+    pdm: false
+    i2s_mode: secondary
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    channel: stereo
+  # 48 -> 16 kHz, both DSP channels; ha_voice_sat packs 32 -> 16 bit.
+  - platform: decimator
+    id: i2s_mics
+    microphone:
+      microphone: i2s_mics_raw
+      channels: [0, 1]
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_audio_speaker
+    i2s_audio_id: i2s_output
+    i2s_dout_pin: GPIO44
+    i2s_mode: secondary
+    dac_type: external
+    audio_dac: aic3104_dac
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_audio_speaker
+    num_channels: 2
+    task_stack_in_psram: true
+    source_speakers:
+      - id: tts_mixing_input
+        timeout: never
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+
+  # HA Voice TTS (Kokoro 24 kHz mono) has its own input
+  - platform: resampler
+    id: tts_resampling_speaker
+    output_speaker: tts_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+    buffer_duration: 500ms
+  - platform: resampler
+    id: announcement_resampling_speaker
+    output_speaker: announcement_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+  - platform: resampler
+    id: media_resampling_speaker
+    output_speaker: media_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+media_player:
+  - platform: speaker
+    id: external_media_player
+    name: None
+    internal: false
+    volume_increment: 0.05
+    volume_min: ${volume_min}
+    volume_max: ${volume_max}
+    announcement_pipeline:
+      speaker: announcement_resampling_speaker
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+    media_pipeline:
+      speaker: media_resampling_speaker
+      format: FLAC
+      num_channels: 2
+      sample_rate: 48000
+
+ha_voice_sat:
+  id: sat
+  host: ${ha_voice_host}
+  port: ${ha_voice_port}
+  board: xvf3800
+  microphone: i2s_mics
+  speaker: tts_resampling_speaker
+  on_connected:
+    - script.execute:
+        id: ring_state
+        state: 0
+  on_disconnected:
+    - script.execute:
+        id: ring_state
+        state: -1
+  on_state:
+    - script.execute:
+        id: ring_state
+        state: !lambda return x;
+  on_volume:
+    - media_player.volume_set:
+        id: external_media_player
+        volume: !lambda return x;
+  on_setting:
+    - lambda: |-
+        float v = atof(value.c_str());
+        if (key == "led_brightness") {
+          id(led_level) = clamp(v / 100.0f, 0.0f, 1.0f);
+          id(ring_state).execute(id(ring_last));
+        } else if (key == "listen") {
+          if (v > 0) id(listen_switch).turn_on(); else id(listen_switch).turn_off();
+        } else if (key == "mic_gain") {
+          // the Waveshare ES7210 gain (0..36 dB) maps onto the XVF3800 ASR output gain (x1..x8)
+          auto call = id(asr_out_gain).make_call();
+          call.set_value(clamp(1.0f + v / 36.0f * 7.0f, 1.0f, 8.0f));
+          call.perform();
+        }
+  on_tts_start:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 20
+        duration: 0.0s
+  on_tts_end:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 0
+        duration: 1.0s
+
+globals:
+  - id: led_level
+    type: float
+    restore_value: true
+    initial_value: '0.8'
+  - id: ring_last
+    type: int
+    initial_value: '-1'
+  - id: ring_tick
+    type: uint32_t
+    initial_value: '0'
+
+script:
+  # -1 = no link to HA Voice, 0 idle, 1 wake word, 2 listening, 3 thinking,
+  # 4 replying, 5 error, 6 sleep. The 12-LED ring belongs to the XVF3800 and
+  # is written over I2C by the interval below.
+  - id: ring_state
+    mode: restart
+    parameters:
+      state: int
+    then:
+      - lambda: |-
+          id(ring_last) = state;
+          id(ring_tick) = 0;
+      - if:
+          condition:
+            lambda: return state == 5;
+          then:
+            - delay: 2s
+            - lambda: id(ring_last) = 0;
+
+interval:
+  - interval: 60ms
+    then:
+      - lambda: |-
+          if (id(respeaker).is_failed())
+            return;
+          static uint32_t last[12];
+          static bool have_last = false;
+          const int state = id(ring_last);
+          const uint32_t t = id(ring_tick)++;
+          const float lvl = id(led_level);
+          float r = 0, g = 0, b = 0, k = 0;  // colour 0..1 and brightness 0..1
+          int spot = -1;                     // spinner position
+          if (state < 0) {
+            if (id(wifi_id).is_connected()) { r = 1.0f; g = 0.6f; } else { r = 1.0f; g = 0.3f; }
+            k = 0.15f + 0.25f * (sinf(t * 0.06f) + 1.0f) * 0.5f;
+          } else if (state == 1) {
+            g = 0.8f; b = 1.0f; k = 0.8f;
+          } else if (state == 2) {
+            g = 0.3f; b = 1.0f; k = 0.4f + 0.4f * (sinf(t * 0.35f) + 1.0f) * 0.5f;
+          } else if (state == 3) {
+            r = 0.6f; b = 1.0f; k = 0.8f; spot = t % 12;
+          } else if (state == 4) {
+            g = 1.0f; b = 0.3f; k = 0.2f + 0.6f * (sinf(t * 0.12f) + 1.0f) * 0.5f;
+          } else if (state == 5) {
+            r = 1.0f; k = 1.0f;
+          }
+          k *= lvl;
+          if (lvl <= 0.01f) k = 0;
+          auto px = [](float r, float g, float b, float k) -> uint32_t {
+            return ((uint32_t)(r * k * 255.0f) << 16) | ((uint32_t)(g * k * 255.0f) << 8) | (uint32_t)(b * k * 255.0f);
+          };
+          uint32_t colors[12];
+          for (int i = 0; i < 12; i++) {
+            float kk = k;
+            if (spot >= 0) {
+              int d = (i - spot + 12) % 12;
+              kk = d == 0 ? k : (d == 11 ? k * 0.35f : 0.0f);
+            }
+            colors[i] = px(r, g, b, kk);
+          }
+          // muted by the board's key: four red marks on top of everything
+          if (id(mic_mute_switch).state) {
+            const float mk = std::max(lvl, 0.2f);
+            for (int i : {1, 4, 7, 10}) colors[i] = px(1.0f, 0, 0, mk);
+          }
+          if (have_last && memcmp(last, colors, sizeof(colors)) == 0)
+            return;
+          memcpy(last, colors, sizeof(colors));
+          have_last = true;
+          id(respeaker).set_led_ring(colors);
+
+switch:
+  - platform: template
+    id: listen_switch
+    name: "Слушать"
+    icon: mdi:ear-hearing
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - ha_voice_sat.set_listening:
+          listening: true
+    on_turn_off:
+      - ha_voice_sat.set_listening:
+          listening: false
+
+select:
+  - platform: template
+    name: "DSP route"
+    id: dsp_route
+    optimistic: true
+    restore_value: true
+    initial_option: "Comms to STT, ASR to wake word"
+    entity_category: config
+    icon: mdi:call-split
+    options:
+      - "ASR to STT and wake word"
+      - "Comms to STT, ASR to wake word"
+    on_value:
+      - lambda: id(respeaker).set_asr_route(i == 0);
+
+number:
+  - platform: template
+    name: "ASR output gain"
+    id: asr_out_gain
+    optimistic: true
+    restore_value: true
+    initial_value: 1.0
+    min_value: 1.0
+    max_value: 8.0
+    step: 0.1
+    entity_category: config
+    icon: mdi:microphone-message
+    on_value:
+      - lambda: id(respeaker).set_asr_out_gain(x);
+  - platform: template
+    name: "AGC max gain (comms)"
+    id: agc_max_gain
+    optimistic: true
+    restore_value: true
+    initial_value: 32
+    min_value: 1
+    max_value: 125
+    step: 1
+    entity_category: config
+    icon: mdi:auto-fix
+    on_value:
+      - lambda: id(respeaker).set_agc_max_gain(x);
+
+text:
+  - platform: template
+    id: ha_voice_host_text
+    name: "Сервер HA Voice"
+    icon: mdi:server-network
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ${ha_voice_host}
+    on_value:
+      - lambda: |-
+          if (!x.empty()) id(sat).set_host(x);
+
+text_sensor:
+  - platform: template
+    id: dsp_status
+    name: "DSP status"
+    icon: mdi:chip
+    entity_category: diagnostic
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    name: "HA Voice connected"
+    icon: mdi:lan-connect
+    entity_category: diagnostic
+    lambda: return id(sat).is_connected();
+
+sensor:
+  - platform: wifi_signal
+    name: "Wi-Fi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: config

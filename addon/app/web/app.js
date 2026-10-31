@@ -424,7 +424,11 @@
     settings: null,
     gate: { events: [] },
     firmware: null,
+    fwBoard: null,
+    serial: null,
     assistantLog: [],
+    llm: null,
+    llmUpload: null,
     agents: null,
     wakeModels: null,
     ha: null,
@@ -455,6 +459,15 @@
     error: ["bad", "Ошибка"],
     sleep: ["warn", "Спит"],
   };
+  const TTS_STAGES = {
+    start: "запуск",
+    download: "скачивание",
+    g2p: "словарь ударений",
+    onnx: "модель",
+    warmup: "проверка",
+    error: "ошибка",
+    stopped: "остановлен",
+  };
   const BACKENDS = { ha: "Home Assistant", openai: "LLM (OpenAI-совместимый)", off: "выключен" };
   const satellite = () => (state.status && state.status.satellites && state.status.satellites[0]) || null;
 
@@ -477,7 +490,8 @@
     let tts;
     if (!s.tts || !s.tts.enabled) tts = pill("", "Kokoro выключен");
     else if (s.tts.online) tts = pill("ok", `Kokoro · ${s.tts.voice || ""}`);
-    else tts = pill("warn live", "Kokoro загружается…");
+    else if (s.tts.stage === "error" || s.tts.stage === "stopped") tts = pill("bad", "Kokoro: ошибка");
+    else tts = pill("warn live", `Kokoro · ${TTS_STAGES[s.tts.stage] || "загружается"}…`);
     const a = s.assistant || {};
     const asst = a.backend === "off" ? pill("", "Ассистент выключен") : pill(a.ha_configured || a.backend === "openai" ? "ok" : "warn", `Ассистент · ${BACKENDS[a.backend] || a.backend}`);
     el.innerHTML = col + stt + tts + asst;
@@ -492,13 +506,23 @@
   const fmtBytes = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} МБ` : `${Math.round(n / 1024)} КБ`);
   const loadFirmware = async () => { state.firmware = await api("/api/firmware"); };
 
+  const BOARD_HINTS = {
+    waveshare: "Плата Waveshare: USB‑C на плате.",
+    xvf3800: "ReSpeaker XVF3800: USB‑C на XIAO ESP32‑S3 (дальний от аудиоразъёма 3.5 мм). При первом включении плата сама обновит DSP XVF3800 (~1 мин, кольцо фиолетовое) — не отключайте питание.",
+  };
+  const fwBoardOf = (sat) => state.fwBoard || (sat && sat.board) || "waveshare";
+  const loadSerial = async () => { state.serial = await api("/api/firmware/serial"); };
+
   function firmwareCard(sat) {
-    const fw = state.firmware || { files: {}, ota: {} };
-    const f = fw.files || {};
+    const fw = state.firmware || { boards: {}, ota: {} };
+    const boards = fw.boards || {};
+    const board = fwBoardOf(sat);
+    const f = (boards[board] || {}).files || {};
+    const q = `?board=${encodeURIComponent(board)}`;
     const fileRow = (kind, label) => {
       const x = f[kind];
       return `<dt>${esc(label)}</dt><dd class="small">${x ? `${fmtBytes(x.size)} · ${x.source === "github" ? "с GitHub" : "загружен вручную"} · ${fmtAgoTs(new Date(x.ts * 1000).toISOString())}` : `<span class="muted">нет</span>`}</dd>
-        <dd>${x ? `<a class="btn ghost icon sm" href="${BASE}/api/firmware/${kind}.bin" title="Скачать">${icon("download")}</a>` : ""}</dd>`;
+        <dd>${x ? `<a class="btn ghost icon sm" href="${BASE}/api/firmware/${kind}.bin${q}" title="Скачать">${icon("download")}</a>` : ""}</dd>`;
     };
     const job = sat ? (fw.ota || {})[sat.ip] : null;
     let jobLine = "";
@@ -507,11 +531,37 @@
       else if (job.status === "done") jobLine = `<div class="small ok" style="margin-top:8px">${icon("check")} Прошито, колонка перезагружается и сама подключится</div>`;
       else jobLine = `<div class="small bad" style="margin-top:8px">${icon("alert")} ${esc(job.error || "ошибка")}</div>`;
     }
+    const satBoard = sat ? sat.board || "waveshare" : null;
+    const otaOk = sat && sat.proto >= 2 && f.ota && satBoard === board;
+    const otaTitle = !sat ? "Колонка не подключена" : satBoard !== board ? `Подключена другая плата (${(boards[satBoard] || {}).label || satBoard})` : "";
     const webSerial = window.isSecureContext && "serial" in navigator;
+    const boardOpts = Object.entries(boards).map(([id, b]) => `<option value="${esc(id)}" ${id === board ? "selected" : ""}>${esc(b.label)}${satBoard === id ? " — подключена" : ""}</option>`).join("");
+
+    // USB port of the HA machine
+    const ser = state.serial || {};
+    const sj = ser.job;
+    const ports = ser.ports || [];
+    let serialBody;
+    if (sj && sj.status === "running")
+      serialBody = `<div class="small">${icon("refresh", "spin")} Прошиваю ${esc(sj.port)}… ${sj.progress || 0}%</div><div class="meter" style="margin-top:6px"><div class="meter-fill" style="width:${sj.progress || 0}%"></div></div>`;
+    else {
+      const last = sj && sj.status === "done" ? `<div class="small ok" style="margin-top:6px">${icon("check")} Прошито. Отключите и снова подключите плату, затем задайте Wi‑Fi.</div>`
+        : sj && sj.status === "error" ? `<div class="small bad" style="margin-top:6px">${icon("alert")} ${esc(sj.error || "ошибка")}</div>${sj.log && sj.log.length ? `<details><summary class="small">Журнал esptool</summary><pre class="mono small" style="white-space:pre-wrap;max-height:200px;overflow:auto">${esc(sj.log.join("\n"))}</pre></details>` : ""}` : "";
+      serialBody = `
+        <div class="row" style="flex-wrap:wrap">
+          <select class="input" id="fwPort" style="flex:1;min-width:220px">${ports.length ? ports.map((p) => `<option value="${esc(p.port)}">${esc(p.name)}${p.hint ? ` — ${esc(p.hint)}` : ""}</option>`).join("") : `<option value="">USB‑порты не найдены</option>`}</select>
+          <button type="button" class="btn ghost icon" data-fw="ports" title="Обновить список">${icon("refresh")}</button>
+          <button type="button" class="btn primary" data-fw="serial" ${ports.length && f.factory ? "" : "disabled"}>${icon("chip")}Прошить</button>
+        </div>
+        <label class="switch small" style="margin-top:6px"><input type="checkbox" id="fwErase" checked><span class="track"></span>Стереть всё перед прошивкой (Wi‑Fi задать заново)</label>
+        ${last}`;
+    }
+
     return `
       <div class="card">
         <h3>${icon("chip")}Прошивка колонки</h3>
         <p class="card-sub">Первый раз — по USB. Дальше — по Wi‑Fi кнопкой «Обновить по сети», кабель не нужен.</p>
+        <div class="field"><label for="fwBoard">Плата</label><select class="input" id="fwBoard" data-fw="board">${boardOpts}</select></div>
         <dl class="kv">
           ${fileRow("factory", "factory.bin (USB)")}
           ${fileRow("ota", "ota.bin (по сети)")}
@@ -519,18 +569,20 @@
         <div class="row" style="margin-top:10px;flex-wrap:wrap">
           <button class="btn" data-fw="fetch">${icon("refresh")}Скачать последнюю</button>
           <label class="btn ghost">${icon("upload")}Свой .bin<input type="file" accept=".bin" data-fw="upload" hidden></label>
-          <button class="btn primary" data-fw="ota" ${sat && sat.proto >= 2 && f.ota ? "" : "disabled"} title="${sat ? "" : "Колонка не подключена"}">${icon("upload")}Обновить по сети</button>
+          <button class="btn primary" data-fw="ota" ${otaOk ? "" : "disabled"} title="${esc(otaTitle)}">${icon("upload")}Обновить по сети</button>
         </div>
         ${jobLine}
-        <details style="margin-top:12px">
+        <details style="margin-top:12px" data-fw-usb ${state.fwUsbOpen ? "open" : ""}>
           <summary class="small">Первая прошивка по USB</summary>
-          <ol class="hint" style="margin:8px 0 0;padding-left:18px">
-            <li>Подключите плату Waveshare кабелем USB‑C к компьютеру.</li>
-            ${webSerial ? `<li>Нажмите <b>«Прошить по USB»</b> ниже и выберите порт.</li>` : `<li>Скачайте <b>factory.bin</b>, откройте <a href="https://web.esphome.io" target="_blank" rel="noopener">web.esphome.io</a> в Chrome/Edge → Connect → Install → выберите файл.</li>`}
+          <p class="small" style="margin:8px 0 4px"><b>Вариант 1 — в USB сервера Home Assistant.</b> ${esc(BOARD_HINTS[board] || "")}</p>
+          ${serialBody}
+          <p class="small" style="margin:12px 0 4px"><b>Вариант 2 — в USB этого компьютера</b> (Chrome/Edge):</p>
+          <ol class="hint" style="margin:0;padding-left:18px">
+            ${webSerial ? `<li>Нажмите <b>«Прошить по USB из браузера»</b> и выберите порт.</li>` : `<li>Скачайте <b>factory.bin</b> выше, откройте <a href="https://web.esphome.io" target="_blank" rel="noopener">web.esphome.io</a> → Connect → Install → выберите файл. (Кнопка прошивки прямо отсюда появляется, когда панель открыта по https.)</li>`}
             <li>После прошивки задайте Wi‑Fi: на том же сайте (Improv) или подключитесь к сети <b>HA-Voice-Setup</b> с телефона.</li>
             <li>Колонка сама найдёт HA Voice (по умолчанию <span class="mono">homeassistant.local</span>). Другой адрес — сущность «Сервер HA Voice» у устройства в HA или веб‑страница платы.</li>
           </ol>
-          ${webSerial && f.factory ? `<div style="margin-top:10px"><esp-web-install-button manifest="${BASE}/api/firmware/manifest.json"><button slot="activate" class="btn primary">${icon("chip")}Прошить по USB</button></esp-web-install-button></div>` : ""}
+          ${webSerial && f.factory ? `<div style="margin-top:10px"><esp-web-install-button manifest="${BASE}/api/firmware/manifest.json${q}"><button slot="activate" class="btn primary">${icon("chip")}Прошить по USB из браузера</button></esp-web-install-button></div>` : ""}
         </details>
       </div>`;
   }
@@ -564,11 +616,13 @@
         banner(
           "warn",
           "Колонка не подключена",
-          `Прошейте Waveshare прошивкой HA Voice (карточка «Прошивка» ниже) и подключите к Wi‑Fi. Она сама подключится к этому серверу на порт <b>${esc(s.ports.pcm)}</b>.`
+          `Прошейте колонку (Waveshare или ReSpeaker XVF3800) прошивкой HA Voice (карточка «Прошивка» ниже) и подключите к Wi‑Fi. Она сама подключится к этому серверу на порт <b>${esc(s.ports.pcm)}</b>.`
         )
       );
     else if (sat.proto < 2)
       banners.push(banner("warn", "Старая прошивка (room_diary)", "Дневник работает, но колонка не умеет отвечать голосом и не показывает состояние. Обновите прошивку по USB."));
+    if (s.tts && s.tts.enabled && !s.tts.online && (s.tts.stage === "error" || s.tts.stage === "stopped"))
+      banners.push(banner("bad", "Kokoro не запустился", `${esc(s.tts.error || "Процесс озвучки остановился")}. Подробности и перезапуск — вкладка «Озвучка».`));
     if (sat && sat.wake_error) banners.push(banner("bad", "Ключевое слово не загрузилось", esc(sat.wake_error)));
     if (s.diary.dropped > 0) banners.push(banner("warn", "Дневник не успевает", `Пропущено реплик: ${s.diary.dropped}. Процессор не справляется.`));
 
@@ -723,14 +777,28 @@
       } else if (fw && fw.dataset.fw === "fetch") {
         fw.disabled = true;
         fw.innerHTML = `${icon("refresh", "spin")}Скачиваю…`;
-        state.firmware = await postJson("/api/firmware/fetch", {});
-        toast("Прошивка скачана");
+        const res = await postJson("/api/firmware/fetch", {});
+        state.firmware = res;
+        const board = fwBoardOf(satellite());
+        const miss = (res.errors || []).filter((e) => e.includes(board === "xvf3800" ? "xvf3800" : "satellite"));
+        if (miss.length) toast(`Для этой платы на GitHub пока нет сборки: ${miss[0]}`, "bad");
+        else toast("Прошивка скачана");
         renderSpeaker();
       } else if (fw && fw.dataset.fw === "ota") {
         const sat = satellite();
         if (!(await confirmDialog("Обновить прошивку по сети?", `Колонка ${sat ? sat.ip : ""} перезагрузится примерно через минуту.`, "Обновить"))) return;
-        await postJson("/api/firmware/ota", { id: sat && sat.id });
+        await postJson("/api/firmware/ota", { id: sat && sat.id, board: fwBoardOf(sat) });
         await loadFirmware();
+        renderSpeaker();
+      } else if (fw && fw.dataset.fw === "ports") {
+        await loadSerial();
+        renderSpeaker();
+      } else if (fw && fw.dataset.fw === "serial") {
+        const port = $("#fwPort").value;
+        const board = fwBoardOf(satellite());
+        const label = ((state.firmware.boards || {})[board] || {}).label || board;
+        if (!port || !(await confirmDialog("Прошить по USB сервера?", `${label} на ${port}. Не отключайте плату ~1–2 мин.`, "Прошить"))) return;
+        state.serial = { ...(state.serial || {}), job: await postJson("/api/firmware/serial", { port, board, erase: $("#fwErase").checked }) };
         renderSpeaker();
       }
     } catch (err) {
@@ -742,10 +810,14 @@
   async function onSpeakerChange(ev) {
     const t = ev.target;
     try {
-      if (t.dataset.fw === "upload" && t.files && t.files[0]) {
+      if (t.dataset.fw === "board") {
+        state.fwBoard = t.value;
+        renderSpeaker();
+      } else if (t.dataset.fw === "upload" && t.files && t.files[0]) {
         const file = t.files[0];
         const kind = /factory/i.test(file.name) ? "factory" : "ota";
-        state.firmware = await api(`/api/firmware/upload/${kind}`, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file });
+        const board = fwBoardOf(satellite());
+        state.firmware = await api(`/api/firmware/upload/${kind}?board=${encodeURIComponent(board)}`, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file });
         toast(`${kind}.bin загружен`);
         renderSpeaker();
       }
@@ -1376,6 +1448,7 @@
     sec: (x) => `${Math.round(x / 1000)} с`,
     vol: (x) => `${x}%`,
     db: (x) => `${x} дБ`,
+    threads: (x) => (Number(x) ? String(x) : "авто"),
   };
   const switchField = (name, label, checked, hint) =>
     `<div class="field"><label class="switch"><input type="checkbox" name="${name}" ${checked ? "checked" : ""}><span class="track"></span>${esc(label)}</label>${hint ? `<div class="hint">${esc(hint)}</div>` : ""}</div>`;
@@ -1466,8 +1539,19 @@
       x.id,
       `${x.label}${x.gender ? (x.gender === "female" ? " · жен." : " · муж.") : ""}`,
     ]);
-    const ttsStatus = !tts.enabled ? "выключена в конфигурации дополнения" : tts.online ? "готова" : "загружается";
+    const ttsStatus = !tts.enabled ? "выключена в конфигурации дополнения" : tts.online ? "готова" : (TTS_STAGES[tts.stage] || "загружается");
+    const failed = tts.stage === "error" || tts.stage === "stopped";
+    const since = tts.since ? Math.round(Date.now() / 1000 - tts.since) : null;
+    const loadCard = tts.enabled && !tts.online ? `
+      <div class="card" style="margin-bottom:16px">
+        <div class="row between"><h3>${icon(failed ? "alert" : "refresh", failed ? "" : "spin")}Kokoro ${failed ? "не запустился" : "загружается"}</h3>
+          <button type="button" class="btn" id="ttsRestart">${icon("refresh")}Перезапустить</button></div>
+        <p class="card-sub">${failed ? esc(tts.error || "Процесс озвучки остановился — дополнение перезапускает его само, с паузой.") : `Этап: <b>${esc(TTS_STAGES[tts.stage] || tts.stage || "запуск")}</b>${tts.detail ? ` — ${esc(tts.detail)}` : ""}${since != null ? ` · ${since} с` : ""}. При первом запуске и после обновления дополнения скачиваются модели с HuggingFace.`}</p>
+        ${tts.log && tts.log.length ? `<details ${failed ? "open" : ""}><summary class="small">Журнал Kokoro</summary><pre class="mono small" style="white-space:pre-wrap;max-height:260px;overflow:auto;margin:8px 0 0">${esc(tts.log.join("\n"))}</pre></details>` : ""}
+        <p class="small muted" style="margin-bottom:0">Если HuggingFace не открывается из вашей сети, укажите зеркало в конфигурации дополнения: <span class="mono">hf_endpoint: https://hf-mirror.com</span>.</p>
+      </div>` : "";
     v.innerHTML = `
+      ${loadCard}
       <div class="grid grid-2">
         <form class="card" id="ttsForm" autocomplete="off">
           <h3>${icon("speaker")}Голос ответов — Kokoro-ru</h3>
@@ -1490,6 +1574,17 @@
         </div>
       </div>`;
     bindSettingsForm($("#ttsForm"), async () => renderTts());
+    const restart = $("#ttsRestart");
+    if (restart)
+      restart.addEventListener("click", async () => {
+        restart.disabled = true;
+        try {
+          await postJson("/api/tts/restart", {});
+          toast("Kokoro перезапускается");
+        } catch (err) {
+          showError(err);
+        }
+      });
     const voice = () => $("#f_tts_voice").value;
     $("#ttsBrowser").addEventListener("click", async (e) => {
       const btn = e.currentTarget;
@@ -1513,8 +1608,14 @@
   }
 
   /* ---------------- assistant ---------------- */
+  const loadLlm = async () => { state.llm = await api("/api/llm"); };
+  const llmBusy = () => {
+    const l = state.llm;
+    return !!(state.llmUpload || (l && (l.state === "loading" || (l.job && l.job.status === "running"))));
+  };
+
   async function loadAssistant() {
-    const jobs = [api("/api/assistant/log?limit=100").then((r) => { state.assistantLog = r.log || []; })];
+    const jobs = [api("/api/assistant/log?limit=100").then((r) => { state.assistantLog = r.log || []; }), loadLlm().catch(() => {})];
     if (!state.wakeModels) jobs.push(api("/api/wake/models").then((r) => { state.wakeModels = r.models || []; }));
     if (!state.agents)
       jobs.push(
@@ -1549,6 +1650,149 @@
           ${e.error ? `<div class="small bad" style="margin-top:4px">${esc(e.error)}</div>` : ""}
         </div>
       </div>`;
+  }
+
+  /* ---------------- local LLM (llama.cpp on this server) ---------------- */
+  const LLM_STATES = { stopped: ["", "остановлена"], loading: ["warn live", "загружается в память"], ready: ["ok", "работает"], error: ["bad", "ошибка"] };
+
+  function llmJobLine(job) {
+    if (!job) return "";
+    const pct = job.total ? Math.min(100, Math.round((job.done / job.total) * 100)) : null;
+    if (job.status === "running") {
+      const speed = job.speed ? ` · ${fmtBytes(job.speed)}/с` : "";
+      return `<div style="margin-top:10px">
+        <div class="row between small"><span>${icon("download")} ${esc(job.name)} — ${fmtBytes(job.done)}${job.total ? ` из ${fmtBytes(job.total)}` : ""}${speed}</span>
+          ${job.source !== "upload" ? `<button type="button" class="btn ghost sm" data-llm="cancel">${icon("x")}Отменить</button>` : ""}</div>
+        <div class="meter" style="margin-top:6px"><div class="meter-fill" style="width:${pct ?? 5}%"></div></div></div>`;
+    }
+    if (job.status === "error") return `<div class="small bad" style="margin-top:8px">${icon("alert")} ${esc(job.name)}: ${esc(job.error || "ошибка")}</div>`;
+    if (job.status === "cancelled") return `<div class="small muted" style="margin-top:8px">Загрузка ${esc(job.name)} отменена — при повторе продолжится с того же места.</div>`;
+    if (job.status === "done") return `<div class="small ok" style="margin-top:8px">${icon("check")} ${esc(job.name)} загружена</div>`;
+    return "";
+  }
+
+  function renderLlm() {
+    const el = $("#llmCard");
+    if (!el) return;
+    const l = state.llm;
+    if (!l) {
+      el.innerHTML = `<h3>${icon("robot")}Своя модель на этом сервере</h3><p class="card-sub">Не удалось получить состояние.</p>`;
+      return;
+    }
+    const [dot, label] = LLM_STATES[l.state] || ["", l.state];
+    const busy = l.job && l.job.status === "running";
+    const up = state.llmUpload;
+    const models = l.models || [];
+    const rows = models.length
+      ? models.map((m) => {
+          const running = l.model === m.name && l.state !== "stopped";
+          return `<div class="row between" style="padding:8px 0;border-top:1px solid var(--line, #e5e7eb);flex-wrap:wrap;gap:8px">
+            <div><b class="mono">${esc(m.name)}</b> <span class="small muted">${fmtBytes(m.size)}</span>${running ? ` <span class="pill"><span class="dot ${dot}"></span>${esc(label)}</span>` : ""}</div>
+            <div class="row">
+              ${running
+                ? `<button type="button" class="btn sm" data-llm="stop">${icon("stop")}Остановить</button>`
+                : `<button type="button" class="btn primary sm" data-llm="start" data-name="${esc(m.name)}" ${l.available ? "" : "disabled"}>${icon("play")}Запустить и использовать</button>`}
+              <button type="button" class="btn ghost icon sm" data-llm="delete" data-name="${esc(m.name)}" title="Удалить" ${running ? "disabled" : ""}>${icon("trash")}</button>
+            </div></div>`;
+        }).join("")
+      : `<p class="small muted">Моделей пока нет — скачайте готовую ниже или загрузите свой файл <span class="mono">.gguf</span>.</p>`;
+    const presets = (l.presets || []).map((p) => `<div class="row between" style="padding:6px 0;flex-wrap:wrap;gap:8px">
+        <div><b>${esc(p.label)}</b> <span class="small muted">${fmtBytes(p.size)} · ${esc(p.note)}</span></div>
+        ${p.installed ? `<span class="small ok">${icon("check")} скачана</span>` : `<button type="button" class="btn sm" data-llm="preset" data-id="${esc(p.id)}" ${busy || up ? "disabled" : ""}>${icon("download")}Скачать</button>`}
+      </div>`).join("");
+    const upLine = up
+      ? `<div style="margin-top:10px"><div class="small">${icon("upload")} ${esc(up.name)} — ${fmtBytes(up.done)} из ${fmtBytes(up.total)}</div><div class="meter" style="margin-top:6px"><div class="meter-fill" style="width:${Math.round((up.done / Math.max(1, up.total)) * 100)}%"></div></div></div>`
+      : "";
+    el.innerHTML = `
+      <div class="row between"><h3>${icon("robot")}Своя модель на этом сервере</h3>
+        ${l.active ? `<span class="pill"><span class="dot ok"></span>ассистент использует её</span>` : ""}</div>
+      <p class="card-sub">LLM работает прямо на машине с Home Assistant (llama.cpp, только процессор), интернет не нужен. «Запустить и использовать» переключает «Кто отвечает» на LLM с адресом <span class="mono">${esc(l.url)}</span>.
+        Модели лежат в <span class="mono">${esc(l.dir)}</span>${l.disk_free != null ? ` (свободно ${fmtBytes(l.disk_free)})` : ""} — туда можно положить файл и через Samba.</p>
+      ${l.available ? "" : banner("warn", "llama-server не найден", "Образ собран без него: обновите/переустановите дополнение. В Docker Compose используйте Ollama (поле «Адрес API» выше).")}
+      ${l.state === "error" ? banner("bad", "Модель не запустилась", esc(l.error || "")) : ""}
+      ${l.log && l.log.length ? `<details ${l.state === "error" ? "open" : ""}><summary class="small">Журнал llama-server</summary><pre class="mono small" style="white-space:pre-wrap;max-height:220px;overflow:auto">${esc(l.log.join("\n"))}</pre></details>` : ""}
+      ${rows}
+      ${llmJobLine(l.job)}${upLine}
+      <details style="margin-top:12px" ${models.length ? "" : "open"}>
+        <summary class="small"><b>Скачать модель</b> — с HuggingFace, файл продолжит качаться при обрыве</summary>
+        <div style="margin-top:8px">${presets}</div>
+        <div class="row" style="margin-top:10px;flex-wrap:wrap">
+          <input class="input" id="llmUrl" placeholder="https://huggingface.co/…/resolve/main/model-Q4_K_M.gguf" style="flex:1;min-width:240px">
+          <button type="button" class="btn" data-llm="url" ${busy || up ? "disabled" : ""}>${icon("download")}Скачать по ссылке</button>
+        </div>
+        <p class="small muted">Для голосового ассистента на процессоре берите 1.5–4B в квантовании Q4_K_M. Модель должна уметь вызывать инструменты (tool calling).</p>
+      </details>
+      <div class="row" style="margin-top:10px;flex-wrap:wrap">
+        <label class="btn ghost ${busy || up ? "disabled" : ""}">${icon("upload")}Загрузить .gguf с компьютера<input type="file" accept=".gguf" data-llm="upload" hidden ${busy || up ? "disabled" : ""}></label>
+      </div>
+      <details style="margin-top:8px"><summary class="small">Параметры</summary>
+        <form id="llmForm" autocomplete="off" style="margin-top:8px">
+          ${rangeField("llm_threads", "Потоки процессора (0 — все, кроме одного)", (state.settings || {}).llm_threads ?? 0, 0, 16, 1, "threads")}
+          ${selectField("llm_ctx", "Контекст, токенов", String((state.settings || {}).llm_ctx ?? 8192), [["4096", "4096 — меньше памяти"], ["8192", "8192 (рекомендуется)"], ["16384", "16384 — много устройств в доме"]], "Применяется при следующем запуске модели.")}
+          ${saveRow()}
+        </form>
+      </details>`;
+    bindSettingsForm($("#llmForm"));
+  }
+
+  async function onLlmClick(ev) {
+    const b = ev.target.closest("[data-llm]");
+    if (!b || b.tagName === "INPUT") return;
+    const act = b.dataset.llm;
+    try {
+      if (act === "preset") state.llm.job = await postJson("/api/llm/download", { preset: b.dataset.id });
+      else if (act === "url") {
+        const url = $("#llmUrl").value.trim();
+        if (!url) return;
+        state.llm.job = await postJson("/api/llm/download", { url });
+      } else if (act === "cancel") await postJson("/api/llm/cancel", {});
+      else if (act === "start") {
+        b.disabled = true;
+        await postJson("/api/llm/start", { name: b.dataset.name });
+        await loadSettings();
+        toast("Модель загружается в память — ассистент переключён на неё");
+        renderAssistant();
+        return;
+      } else if (act === "stop") {
+        await postJson("/api/llm/stop", {});
+        toast("Модель остановлена");
+      } else if (act === "delete") {
+        if (!(await confirmDialog("Удалить модель?", b.dataset.name))) return;
+        await api(`/api/llm/models/${encodeURIComponent(b.dataset.name)}`, { method: "DELETE" });
+      }
+      await loadLlm();
+      renderLlm();
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  function onLlmChange(ev) {
+    const t = ev.target;
+    if (t.dataset.llm !== "upload" || !t.files || !t.files[0]) return;
+    const file = t.files[0];
+    // XHR, not fetch: fetch has no upload progress, and models are gigabytes
+    const xhr = new XMLHttpRequest();
+    state.llmUpload = { name: file.name, done: 0, total: file.size };
+    xhr.open("POST", `${BASE}/api/llm/upload?name=${encodeURIComponent(file.name)}`);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.onprogress = (e) => {
+      state.llmUpload.done = e.loaded;
+      renderLlm();
+    };
+    xhr.onloadend = async () => {
+      state.llmUpload = null;
+      if (xhr.status >= 200 && xhr.status < 300) toast(`${file.name} загружена`);
+      else {
+        let msg = `HTTP ${xhr.status || "—"}`;
+        try { msg = JSON.parse(xhr.responseText).error || msg; } catch { /* not json */ }
+        showError(new Error(msg));
+      }
+      await loadLlm().catch(() => {});
+      renderLlm();
+    };
+    xhr.send(file);
+    renderLlm();
   }
 
   function renderAssistantLog() {
@@ -1601,6 +1845,7 @@
           ${saveRow()}
         </form>
       </div>
+      <div class="card" style="margin-top:14px" id="llmCard"></div>
       <div class="card" style="margin-top:14px">
         <h3>${icon("flask")}Проверить фразу</h3>
         <div class="row" style="flex-wrap:wrap">
@@ -1625,6 +1870,9 @@
     syncShow();
     bindSettingsForm($("#asForm"));
     bindSettingsForm($("#wwForm"));
+    renderLlm();
+    $("#llmCard").addEventListener("click", onLlmClick);
+    $("#llmCard").addEventListener("change", onLlmChange);
     $("#asAsk").addEventListener("click", async (e) => {
       const btn = e.currentTarget;
       const text = $("#asText").value.trim();
@@ -1805,13 +2053,24 @@
     try {
       if (state.tab === "speaker" && !editing("speaker")) {
         const fw = state.firmware && Object.values(state.firmware.ota || {}).some((j) => j.status === "uploading");
-        await Promise.all([loadOverviewData(), fw ? loadFirmware() : null]);
+        const usb = state.serial && state.serial.job && state.serial.job.status === "running";
+        await Promise.all([loadOverviewData(), fw ? loadFirmware() : null, usb ? loadSerial() : null]);
         renderSpeaker();
       } else if (state.tab === "assistant") {
         state.assistantLog = (await api("/api/assistant/log?limit=100")).log || [];
         renderAssistantLog();
+        if (llmBusy() && !state.llmUpload && !editing("assistant")) {
+          await loadLlm();
+          renderLlm();
+        }
       } else if (state.tab === "diary" && state.diary.items.length <= PAGE && state.playingId == null) {
         await loadDiary();
+      } else if (state.tab === "tts" && !editing("tts")) {
+        // repaint only while Kokoro is loading and once when it comes up
+        const tts = (state.status && state.status.tts) || {};
+        const key = `${tts.online}|${tts.stage}|${tts.detail}|${(tts.log || []).length}`;
+        if (!tts.online || state.ttsKey !== key) renderTts();
+        state.ttsKey = key;
       }
     } catch (err) {
       console.error(err);
@@ -1832,6 +2091,16 @@
     if (b) setTab(b.dataset.tab);
   });
   view("speaker").addEventListener("click", onSpeakerClick);
+  view("speaker").addEventListener(
+    "toggle",
+    (ev) => {
+      if (ev.target.matches && ev.target.matches("[data-fw-usb]")) {
+        state.fwUsbOpen = ev.target.open;
+        if (ev.target.open && !state.serial) loadSerial().then(renderSpeaker).catch(() => {});
+      }
+    },
+    true
+  );
   view("speaker").addEventListener("change", onSpeakerChange);
   view("speaker").addEventListener("input", (ev) => {
   });

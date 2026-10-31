@@ -215,6 +215,8 @@ class Satellite:
             "ip": self.info.get("ip") or self.ip,
             "mac": self.info.get("mac"),
             "esphome": self.info.get("esphome"),
+            # firmware build for OTA; boards before 2.2 did not say and are all Waveshare
+            "board": self.info.get("board") or "waveshare",
             "proto": self.proto,
             "can_speak": self.can_speak,
             "listening": self.listening,

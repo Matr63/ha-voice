@@ -58,6 +58,7 @@ services:
       HUGGINGFACE_HUB_CACHE: /data/models
       TRANSFORMERS_CACHE: /data/models
       TTS_ENABLED: ${TTS_ENABLED:-true}
+      LLM_DIR: /data/llm  # local llama.cpp models are an add-on feature; use Ollama here
       TTS_VOICE: ${TTS_VOICE:-sveta}
       TTS_URI: tcp://0.0.0.0:10351
       TTS_CLIENT_URI: tcp://127.0.0.1:10351

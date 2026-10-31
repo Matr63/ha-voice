@@ -25,6 +25,8 @@ LIMITS: dict[str, tuple[float, float]] = {
     "sat_mic_gain": (0, 36),
     "sat_led_brightness": (0, 100),
     "mic_boost_db": (0, 36),
+    "llm_threads": (0, 64),
+    "llm_ctx": (2048, 32768),
 }
 
 ENUMS: dict[str, tuple[str, ...]] = {
@@ -88,6 +90,10 @@ class Settings:
     llm_model: str = "qwen2.5:7b"
     llm_api_key: str = ""
     llm_prompt: str = ""
+    # local model run by the add-on (llama.cpp); empty = none
+    llm_local_model: str = ""
+    llm_threads: int = 0            # 0 = all cores but one
+    llm_ctx: int = 8192
     assistant_domains: str = DEFAULT_DOMAINS
     # Home Assistant access (empty = Supervisor token on HAOS)
     ha_url: str = ""
