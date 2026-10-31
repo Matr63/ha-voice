@@ -7,3 +7,9 @@ __pycache__/
 .DS_Store
 .esphome/
 esphome/secrets.yaml
+
+# Kokoro offline pack (scripts/kokoro_models.py / .bat)
+ha-voice-models/
+ha-voice-kokoro-models.zip
+**/ha-voice-models/
+**/ha-voice-kokoro-models.zip

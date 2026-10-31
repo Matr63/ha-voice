@@ -4,22 +4,22 @@ overview: "HA Voice становится одним продуктом: плат
 todos:
   - id: sat-firmware
     content: Единый YAML спутника + компонент ha_voice_sat (старт микрофона, двусторонний PCM, OTA)
-    status: pending
+    status: cancelled
   - id: audio-path
     content: "Один поток на ПК: протокол с channels, VAD только на сервере, дневник и enrollment с ESP"
-    status: pending
+    status: cancelled
   - id: pc-wake-tts
     content: OpenWakeWord всегда включён; после фразы — Kokoro на динамик платы
-    status: pending
+    status: cancelled
   - id: assistant-llm
     content: ИИ с tool-calling к HA (свет, датчики, уточняющий вопрос) и озвучкой Kokoro
-    status: pending
+    status: cancelled
   - id: one-ui
     content: "Одна панель: колонка, голоса, дневник, Kokoro, ассистент, OTA/.bin"
-    status: pending
+    status: cancelled
   - id: ha-install
     content: Интеграция сама находит аддон; Wyoming/Assist не обязательны
-    status: pending
+    status: cancelled
 isProject: false
 ---
 

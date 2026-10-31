@@ -160,6 +160,36 @@ def models_ready(root: Path | None = None) -> bool:
     )
 
 
+def _fix_token_type_ids_shim(mod: Any) -> None:
+    """zaakirio/kokoro-ru wraps AutoTokenizer in _TokenTypeIdsShim and stores the
+    HuggingFace tokenizer as ``._tokenizer``. ruaccent then does
+    ``tokenizer._tokenizer.model`` expecting the *Rust* backend — and crashes
+    with ``BertTokenizerFast has no attribute model``. Keep the shim, but put
+    the HF tokenizer in ``_inner`` so ``._tokenizer`` still reaches the backend.
+    """
+    shim = getattr(mod, "_TokenTypeIdsShim", None)
+    if shim is None or getattr(shim, "_ha_voice", False):
+        return
+
+    def __init__(self: Any, tokenizer: Any) -> None:
+        self._inner = tokenizer
+
+    def __call__(self: Any, *args: Any, **kwargs: Any) -> Any:
+        enc = self._inner(*args, **kwargs)
+        if "token_type_ids" not in enc:
+            enc["token_type_ids"] = np.zeros_like(enc["input_ids"])
+        return enc
+
+    def __getattr__(self: Any, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    shim.__init__ = __init__
+    shim.__call__ = __call__
+    shim.__getattr__ = __getattr__
+    shim._ha_voice = True  # type: ignore[attr-defined]
+    _LOGGER.info("patched kokoro-ru _TokenTypeIdsShim for ruaccent")
+
+
 def resolve_voice(name: str | None) -> str:
     key = (name or "").strip().lower()
     if key in VOICES:
@@ -240,6 +270,7 @@ class KokoroEngine:
             raise RuntimeError("не удалось загрузить ru_g2p.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        _fix_token_type_ids_shim(mod)
         g2p_cfg = self.root / "kokoro-config.json"
         self._g2p = mod.RuG2P(espeak_data=self.root / "espeak-data", vocab_path=g2p_cfg)
         onnx_cfg = self.root / "config.json"
