@@ -64,7 +64,7 @@ class Settings:
     tv_entity: str = ""             # media_player.* in Home Assistant
     sat_mic_gain: int = 36          # ES7210 hardware gain, dB (3 dB steps)
     sat_led_brightness: int = 80
-    mic_boost_db: int = 18          # digital gain on the PC: Waveshare mics are quiet
+    mic_boost_db: int = 6           # digital gain on the PC (the board's loud slot is picked first)
     mic_channel: str = "auto"       # which ES7210 slot to use
     # sleep mode: by schedule and by voice
     sleep_schedule: bool = False

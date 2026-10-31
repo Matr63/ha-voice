@@ -1,5 +1,5 @@
 name: HA Voice
-version: "2.1.0"
+version: "2.1.1"
 slug: ha_voice
 description: >-
   Голосовой ассистент на ПК для колонки Waveshare: плата — микрофон и динамик,
@@ -17,6 +17,8 @@ ingress_port: 8088
 panel_icon: mdi:microphone-message
 panel_title: HA Voice
 homeassistant_api: true
+hassio_api: true
+hassio_role: default
 discovery:
   - ha_voice
 ports:

@@ -10,6 +10,8 @@ import logging
 import os
 from typing import Any
 
+from pathlib import Path
+
 import aiohttp
 
 from settings import SettingsStore
@@ -31,9 +33,54 @@ class HaError(RuntimeError):
     pass
 
 
+_TOKEN_KEYS = ("SUPERVISOR_TOKEN", "HASSIO_TOKEN")
+_TOKEN_FILES = (
+    "/run/s6/container_environment/SUPERVISOR_TOKEN",
+    "/var/run/s6/container_environment/SUPERVISOR_TOKEN",
+)
+
+
+def _proc1_env() -> dict[str, str]:
+    """The container's own environment (PID 1), in case a parent process dropped it."""
+    try:
+        raw = Path("/proc/1/environ").read_bytes()
+    except OSError:
+        return {}
+    out = {}
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            k, v = item.split(b"=", 1)
+            out[k.decode(errors="replace")] = v.decode(errors="replace")
+    return out
+
+
 def supervisor_token() -> str | None:
     # HASSIO_TOKEN is the older name the Supervisor still sets next to SUPERVISOR_TOKEN
-    return os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN") or None
+    for key in _TOKEN_KEYS:
+        if os.environ.get(key):
+            return os.environ[key]
+    for path in _TOKEN_FILES:
+        try:
+            value = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    env1 = _proc1_env()
+    for key in _TOKEN_KEYS:
+        if env1.get(key):
+            return env1[key]
+    return None
+
+
+def token_diagnostics() -> dict[str, Any]:
+    env1 = _proc1_env()
+    return {
+        "env_tokens": sorted(k for k in os.environ if "TOKEN" in k),
+        "pid1_tokens": sorted(k for k in env1 if "TOKEN" in k),
+        "token_files": [p for p in _TOKEN_FILES if Path(p).exists()],
+        "supervisor_env": sorted(k for k in os.environ if k.startswith(("SUPERVISOR", "HASSIO"))),
+    }
 
 
 class HaClient:
@@ -82,11 +129,10 @@ class HaClient:
 
     async def ping(self) -> dict[str, Any]:
         if not self.configured:
-            tokens = sorted(k for k in os.environ if "TOKEN" in k)
             return {
                 "ok": False,
                 "error": "не настроен: нет токена Supervisor и не заданы адрес/токен HA",
-                "env_tokens": tokens,
+                **token_diagnostics(),
             }
         try:
             cfg = await self.request("GET", "/config")

@@ -61,8 +61,9 @@ async def _supervisor(session: aiohttp.ClientSession, method: str, path: str, pa
 
 async def run(api_port: int) -> None:
     if not supervisor_token():
-        tokens = sorted(k for k in os.environ if "TOKEN" in k)
-        _LOGGER.info("No Supervisor token (env: %s) — integration auto-install skipped", tokens or "none")
+        from ha_client import token_diagnostics
+
+        _LOGGER.warning("No Supervisor token %s — integration auto-install skipped", token_diagnostics())
         return  # docker compose: the integration is installed by hand / HACS
     try:
         changed = await asyncio.to_thread(copy_integration)
