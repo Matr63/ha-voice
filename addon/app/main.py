@@ -58,6 +58,7 @@ async def amain() -> None:
     assistant = Assistant(settings, ha)
     modes = Modes(settings)
     hub = SatelliteHub(settings, runtime, assistant, stt_uri, tts_uri, modes, ha)
+    assistant.hub = hub
     firmware = FirmwareStore(Path(os.environ.get("FIRMWARE_DIR", "/data/firmware")))
     llm = LlmManager(settings)
     llm.on_ready = assistant.prewarm

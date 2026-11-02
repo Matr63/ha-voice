@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -230,6 +231,9 @@ def create_app(ctx: AppContext) -> web.Application:
             await hub.set_sleep(hub.modes.sleeping(), "panel")
         if before["sat_rooms"] != after["sat_rooms"]:
             await hub.refresh_rooms()
+        if any(before.get(k) != after.get(k) for k in ("entity_catalog", "assistant_domains", "llm_prompt")):
+            assistant.invalidate_entities()
+            asyncio.create_task(assistant.prewarm())
         return web.json_response(settings.to_public_dict())
 
     async def speakers_list(_: web.Request) -> web.Response:
@@ -497,6 +501,52 @@ def create_app(ctx: AppContext) -> web.Application:
             return web.json_response({"areas": await ctx.ha.areas()})
         except HaError as err:
             return web.json_response({"areas": [], "error": str(err)})
+
+    async def ha_catalog(_: web.Request) -> web.Response:
+        if not ctx.ha.configured:
+            return web.json_response({"devices": [], "error": "нет доступа к Home Assistant"})
+        try:
+            devices = await assistant.catalog_view()
+        except HaError as err:
+            return web.json_response({"devices": [], "error": str(err)})
+        return web.json_response({"devices": devices})
+
+    async def ha_catalog_set(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        patch = data.get("entities") if isinstance(data.get("entities"), dict) else data
+        if not isinstance(patch, dict):
+            raise ValueError("Ожидался объект сущностей")
+        try:
+            catalog = json.loads(settings.get().entity_catalog or "{}")
+        except (TypeError, ValueError):
+            catalog = {}
+        if not isinstance(catalog, dict):
+            catalog = {}
+        for eid, meta in patch.items():
+            if not isinstance(eid, str) or "." not in eid or not isinstance(meta, dict):
+                continue
+            cur = dict(catalog[eid]) if isinstance(catalog.get(eid), dict) else {}
+            if "enabled" in meta:
+                cur["enabled"] = bool(meta["enabled"])
+            if "hints" in meta:
+                hints = str(meta["hints"] or "").strip()
+                if hints:
+                    cur["hints"] = hints
+                else:
+                    cur.pop("hints", None)
+            cur = {k: v for k, v in cur.items() if k in ("enabled", "hints")}
+            if cur:
+                catalog[eid] = cur
+            else:
+                catalog.pop(eid, None)
+        settings.update({"entity_catalog": json.dumps(catalog, ensure_ascii=False)})
+        assistant.invalidate_entities()
+        asyncio.create_task(assistant.prewarm())
+        try:
+            devices = await assistant.catalog_view()
+        except HaError as err:
+            return web.json_response({"ok": True, "devices": [], "error": str(err)})
+        return web.json_response({"ok": True, "devices": devices})
 
     async def satellites_rooms_refresh(_: web.Request) -> web.Response:
         await hub.refresh_rooms()
@@ -788,6 +838,8 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_get("/api/satellites", satellites_list)
     r.add_post("/api/satellites/rooms", satellites_rooms_refresh)
     r.add_get("/api/ha/areas", ha_areas)
+    r.add_get("/api/ha/catalog", ha_catalog)
+    r.add_post("/api/ha/catalog", ha_catalog_set)
     r.add_post("/api/satellites/say", satellite_say)
     r.add_post("/api/satellites/volume", satellite_volume)
     r.add_post("/api/satellites/earcon", satellite_earcon)

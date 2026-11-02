@@ -30,6 +30,7 @@ CONVERSATION_TTL_S = 300
 KEEP_AUDIO = 40
 MAX_TOOL_ROUNDS = 6
 MAX_PROMPT_ENTITIES = 200
+ENTITIES_CACHE_S = 30
 # HA answers that mean "didn't understand the phrase / no device by that name":
 # with llm_fallback on, the LLM gets a second try at these.
 FALLBACK_CODES = {"no_intent_match", "no_valid_targets", "no_intent", "failed_to_handle"}
@@ -47,8 +48,9 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент умного �
 - После действия коротко подтверди, что сделал.
 - Числа и единицы говори словами так, как их произносят.
 - Текущие значения датчиков и состояния устройств узнавай через get_state.
+- В списке устройства сгруппированы по приборам. Одинаковые имена датчиков в одной комнате — это разные приборы; смотри имя прибора и подсказки после «|».
 - В начале сообщения пользователя в квадратных скобках — время, кто говорит и комната колонки.
-Устройства (entity_id | имя | комната):
+Устройства (прибор, затем entity_id | имя | подсказки):
 {entities}
 {extra}"""
 # The system prompt holds nothing that changes between requests (no time, no
@@ -146,6 +148,8 @@ class Assistant:
         self.busy: dict[str, Any] | None = None
         self._convs: dict[str, _Conversation] = {}
         self._session: aiohttp.ClientSession | None = None
+        self.hub: Any = None
+        self._ent_cache: tuple[float, list[dict[str, str]]] | None = None
 
     # ------------------------------------------------------------------ api
     def history(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -226,6 +230,106 @@ class Assistant:
     def _domains(self) -> list[str]:
         return [d.strip() for d in self.settings.get().assistant_domains.split(",") if d.strip()]
 
+    def invalidate_entities(self) -> None:
+        self._ent_cache = None
+
+    def _catalog(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.settings.get().entity_catalog or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _board_ids(self) -> set[str]:
+        hub = self.hub
+        if hub is None:
+            return set()
+        return {s.board_device_id for s in hub.satellites.values() if getattr(s, "board_device_id", None)}
+
+    def _exposed(self, row: dict[str, str], catalog: dict[str, Any] | None = None) -> bool:
+        catalog = self._catalog() if catalog is None else catalog
+        meta = catalog.get(row["entity_id"])
+        if isinstance(meta, dict) and "enabled" in meta:
+            return bool(meta["enabled"])
+        did = row.get("device_id") or ""
+        return not (did and did in self._board_ids())
+
+    def _hints(self, entity_id: str, catalog: dict[str, Any] | None = None) -> str:
+        catalog = self._catalog() if catalog is None else catalog
+        meta = catalog.get(entity_id)
+        if isinstance(meta, dict):
+            return str(meta.get("hints") or "").strip()
+        return ""
+
+    async def _all_rows(self) -> list[dict[str, str]]:
+        now = time.monotonic()
+        if self._ent_cache and now - self._ent_cache[0] < ENTITIES_CACHE_S:
+            return self._ent_cache[1]
+        rows = await self.ha.entities(self._domains())
+        self._ent_cache = (now, rows)
+        return rows
+
+    async def catalog_view(self) -> list[dict[str, Any]]:
+        """Devices with their entities, overlaying enabled/hints from settings."""
+        rows = await self._all_rows()
+        catalog = self._catalog()
+        board_ids = self._board_ids()
+        groups: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for r in rows:
+            did = r.get("device_id") or f"entity:{r['entity_id']}"
+            if did not in groups:
+                groups[did] = {
+                    "id": did,
+                    "name": r.get("device") or r["name"],
+                    "area": r.get("area") or "",
+                    "board": bool(r.get("device_id") and r["device_id"] in board_ids),
+                    "entities": [],
+                }
+                order.append(did)
+            elif r.get("device") and not groups[did]["name"]:
+                groups[did]["name"] = r["device"]
+            if r.get("area") and not groups[did]["area"]:
+                groups[did]["area"] = r["area"]
+            groups[did]["entities"].append(
+                {
+                    "entity_id": r["entity_id"],
+                    "name": r["name"],
+                    "domain": r.get("domain") or r["entity_id"].split(".", 1)[0],
+                    "state": r.get("state") or "",
+                    "hints": self._hints(r["entity_id"], catalog),
+                    "enabled": self._exposed(r, catalog),
+                }
+            )
+        devices = [groups[k] for k in order]
+        for d in devices:
+            d["entities"].sort(key=lambda e: (e["domain"], e["name"].lower()))
+        devices.sort(key=lambda d: (d["board"], d["area"].lower(), d["name"].lower()))
+        return devices
+
+    def _ids_of(self, value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, list):
+            return [str(x) for x in value if x]
+        return []
+
+    async def _allow_entity(self, eid: str) -> bool:
+        if eid.split(".", 1)[0] not in self._domains():
+            return False
+        catalog = self._catalog()
+        meta = catalog.get(eid)
+        if isinstance(meta, dict) and "enabled" in meta:
+            return bool(meta["enabled"])
+        try:
+            rows = await self._all_rows()
+        except HaError:
+            return True
+        row = next((r for r in rows if r["entity_id"] == eid), None)
+        if row is None:
+            return False
+        return self._exposed(row, catalog)
+
     async def _http(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90))
@@ -264,11 +368,30 @@ class Assistant:
 
     async def _entities_text(self) -> str:
         try:
-            rows = await self.ha.entities(self._domains())
+            rows = await self._all_rows()
         except HaError as err:
             return f"(не удалось получить список: {err})"
-        rows = sorted(rows, key=lambda r: r["entity_id"])[:MAX_PROMPT_ENTITIES]
-        return "\n".join(f"{r['entity_id']} | {r['name']} | {r['area'] or '-'}" for r in rows)
+        catalog = self._catalog()
+        rows = [r for r in rows if self._exposed(r, catalog)]
+        groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
+        for r in rows:
+            key = (r.get("device") or r["name"], r.get("area") or "", r.get("device_id") or r["entity_id"])
+            groups.setdefault(key, []).append(r)
+        lines: list[str] = []
+        count = 0
+        for key in sorted(groups, key=lambda x: (x[1].lower(), x[0].lower(), x[2])):
+            dname, area, _ = key
+            lines.append(f"{dname} ({area or 'без комнаты'}):")
+            for r in sorted(groups[key], key=lambda x: x["name"].lower()):
+                if count >= MAX_PROMPT_ENTITIES:
+                    break
+                hints = self._hints(r["entity_id"], catalog)
+                extra = f" | {hints}" if hints else ""
+                lines.append(f"  {r['entity_id']} | {r['name']}{extra}")
+                count += 1
+            if count >= MAX_PROMPT_ENTITIES:
+                break
+        return "\n".join(lines) if lines else "(нет доступных устройств — отметьте их на вкладке «Устройства»)"
 
     async def _system(self) -> str:
         return SYSTEM_PROMPT.format(entities=await self._entities_text(), extra=self.settings.get().llm_prompt.strip())
@@ -350,15 +473,30 @@ class Assistant:
         domains = self._domains()
         try:
             if name == "list_entities":
+                catalog = self._catalog()
                 dom = str(args.get("domain") or "").strip()
                 area = str(args.get("area") or "").strip().lower()
                 rows = await self.ha.entities([dom] if dom in domains else domains)
+                rows = [r for r in rows if self._exposed(r, catalog)]
                 if area:
-                    rows = [r for r in rows if area in (r["area"] or "").lower()]
-                return rows[:100]
+                    rows = [r for r in rows if area in (r["area"] or "").lower() or area in (r.get("device") or "").lower()]
+                out = []
+                for r in rows[:100]:
+                    item = {
+                        "entity_id": r["entity_id"],
+                        "name": r["name"],
+                        "state": r.get("state"),
+                        "area": r.get("area") or "",
+                        "device": r.get("device") or "",
+                    }
+                    hints = self._hints(r["entity_id"], catalog)
+                    if hints:
+                        item["hints"] = hints
+                    out.append(item)
+                return out
             if name == "get_state":
                 eid = str(args.get("entity_id") or "")
-                if eid.split(".", 1)[0] not in domains:
+                if not await self._allow_entity(eid):
                     return {"error": "эта сущность недоступна ассистенту"}
                 st = await self.ha.state(eid)
                 attrs = {k: v for k, v in (st.get("attributes") or {}).items() if not isinstance(v, (list, dict))}
@@ -368,6 +506,10 @@ class Assistant:
                 service = str(args.get("service") or "")
                 if domain not in ACTION_DOMAINS or domain not in domains:
                     return {"error": f"управление доменом {domain} не разрешено"}
+                targets = self._ids_of(args.get("entity_id"))
+                for eid in targets:
+                    if not await self._allow_entity(eid):
+                        return {"error": f"{eid} недоступна ассистенту"}
                 data = dict(args.get("data") or {})
                 data["entity_id"] = args.get("entity_id")
                 await self.ha.call_service(domain, service, data)

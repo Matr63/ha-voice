@@ -188,6 +188,7 @@ a { color: var(--accent); }
 .switch input:checked + .track { background: var(--ok); }
 .switch input:checked + .track::after { transform: translateX(17px); }
 .switch input:focus-visible + .track { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
+.switch.small { font-weight: 600; font-size: 0.85rem; gap: 8px; }
 
 .range-row { display: flex; align-items: center; gap: 12px; }
 .range-row input[type="range"] { flex: 1; accent-color: var(--accent); }
@@ -327,3 +328,14 @@ a { color: var(--accent); }
 
 .spin { animation: spin 0.9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+.device-ent {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px 12px;
+  align-items: start;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+.device-ent .input { margin-top: 6px; }
+.device-card h3 { margin-bottom: 4px; }

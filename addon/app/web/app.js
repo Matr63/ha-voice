@@ -4,8 +4,8 @@
   const BASE = String(window.HV_BASE || "").replace(/\/+$/, "");
   const PAGE = 50;
   const POLL_MS = 4000;
-  const TABS = ["speaker", "diary", "voices", "tts", "assistant", "settings"];
-  const TAB_ALIASES = { overview: "speaker", assist: "assistant", test: "voices" };
+  const TABS = ["speaker", "diary", "voices", "tts", "assistant", "devices", "settings"];
+  const TAB_ALIASES = { overview: "speaker", assist: "assistant", test: "voices", catalog: "devices" };
   const SECURE = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -44,6 +44,7 @@
     sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
     settings: '<path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/>',
     home: '<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
+    grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   };
   const icon = (name, cls = "") =>
     `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ""}</svg>`;
@@ -432,6 +433,8 @@
     agents: null,
     wakeModels: null,
     ha: null,
+    catalog: null,
+    catalogQ: "",
     diary: { items: [], total: 0, q: "", speaker: "", day: "", seen: new Set(), seeded: false },
     playingId: null,
     modalOpen: false,
@@ -497,6 +500,7 @@
     const sat = satellite();
     let col;
     if (!sat) col = pill("bad", "Колонка не подключена");
+    else if (sat.can_listen === false) col = pill("warn", "Колонка: не слушает");
     else if (!sat.listening) col = pill("warn", "Колонка: микрофон выключен");
     else {
       const [dot, text0] = SAT_STATES[sat.state] || ["ok", sat.state];
@@ -748,11 +752,14 @@
     const cur = satId();
     const manual = satRooms();
     const audio = satAudio();
+    const voiceOut = ((state.settings || {}).sat_voice_out || "").trim();
+    const speakers = all.filter((b) => b.has_speaker);
     const rows = all.map((x) => {
       const [dot, text] = SAT_STATES[x.state] || ["", x.state];
       const areas = [...(state.areas || [])];
       if (manual[x.id] && !areas.includes(manual[x.id])) areas.push(manual[x.id]);
       const auto = x.room_source === "ha" ? `Из HA: ${x.room}` : "Из HA (область не задана)";
+      const listenOn = (audio[x.id] || {}).listen !== false;
       return `
         <div class="row between" style="gap:10px;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--line, rgba(127,127,127,.2))">
           <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">
@@ -760,13 +767,8 @@
             <span class="small muted">${esc(BOARD_LABELS[x.board] || x.board)} · <span class="mono">${esc(x.ip)}</span> · <span class="dot ${dot}"></span> ${esc(text)}${x.listening ? "" : " · микрофон выключен"}</span>
           </div>
           <div class="row" style="gap:12px;flex-wrap:wrap;align-items:center">
-            <label class="switch small" title="${x.can_speak ? "Снимите, если к плате не подключён динамик" : "Прошивка без динамика"}"><input type="checkbox" data-speaker="${esc(x.id)}" ${x.has_speaker ? "checked" : ""} ${x.can_speak ? "" : "disabled"}><span class="track"></span>Динамик</label>
-            <label class="small" style="display:flex;gap:8px;align-items:center">Звук на
-              <select class="input" data-out="${esc(x.id)}" style="max-width:200px">
-                <option value="">${x.has_speaker ? "этой колонке" : `авто: ${esc((all.find((b) => b.id === x.out) || {}).name || "нет динамика")}`}</option>
-                ${all.filter((b) => b.id !== x.id && b.has_speaker).map((b) => `<option value="${esc(b.id)}" ${(audio[x.id] || {}).out === b.id ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
-              </select>
-            </label>
+            <label class="switch small" title="Ключевое слово и дневник с этой колонки"><input type="checkbox" data-listen="${esc(x.id)}" ${listenOn ? "checked" : ""}><span class="track"></span>Слушает</label>
+            <label class="switch small" title="${x.can_speak ? "Снимите, если к плате не подключён динамик" : "Прошивка без динамика"}"><input type="checkbox" data-speaker="${esc(x.id)}" ${x.has_speaker ? "checked" : ""} ${x.can_speak ? "" : "disabled"}><span class="track"></span>Говорит</label>
             <label class="small" style="display:flex;gap:8px;align-items:center">Комната
               <select class="input" data-room="${esc(x.id)}" style="max-width:220px">
                 <option value="">${esc(auto)}</option>
@@ -776,23 +778,44 @@
           </div>
         </div>`;
     });
+    const outOpts = [`<option value="" ${voiceOut ? "" : "selected"}>на той, что услышала</option>`]
+      .concat(speakers.map((b) => `<option value="${esc(b.id)}" ${voiceOut === b.id ? "selected" : ""}>${esc(b.name)}${b.room ? ` · ${esc(b.room)}` : ""}</option>`))
+      .join("");
     return `
       <div class="row between"><h3>${icon("speaker")}Колонки и комнаты</h3><span class="small muted">${all.length} подключено</span></div>
-      <p class="card-sub">Кнопка с именем выбирает колонку для этой вкладки и «Озвучки». Комната — область платы в HA (Настройки → Устройства → плата ESPHome → Область) или выбранная здесь: «включи свет» без комнаты выполнится в комнате той колонки, что услышала. Если ключевое слово услышали две колонки — отвечает та, что услышала первой, а дневник пишет фразу один раз. Колонка без динамика (снимите «Динамик») отвечает и пищит через другую: выбранную в «Звук на» или колонку с динамиком в той же комнате.</p>
+      <p class="card-sub">«Слушает» — ключевое слово и дневник. «Говорит» — динамик этой платы. Ответы могут звучать на одной колонке, даже если спросили у другой: комната команды всё равно берётся у той, что услышала.</p>
+      <label class="small" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">Ответы звучат на
+        <select class="input" data-voice-out style="max-width:280px">${outOpts}</select>
+      </label>
       ${rows.join("")}`;
   }
 
   async function onRoomChange(ev) {
     const t = ev.target;
-    if (t.dataset.speaker || t.dataset.out !== undefined) {
+    if (t.dataset.voiceOut !== undefined) {
+      try {
+        state.settings = await postJson("/api/settings", { sat_voice_out: t.value });
+        toast("Сохранено");
+        t.blur();
+        await poll();
+        renderSpeaker();
+      } catch (err) {
+        showError(err);
+      }
+      return;
+    }
+    if (t.dataset.speaker || t.dataset.listen) {
       const audio = satAudio();
-      const id = t.dataset.speaker || t.dataset.out;
+      const id = t.dataset.speaker || t.dataset.listen;
       const cfg = { ...(audio[id] || {}) };
       if (t.dataset.speaker) {
         if (t.checked) delete cfg.speaker;
         else cfg.speaker = false;
-      } else if (t.value) cfg.out = t.value;
-      else delete cfg.out;
+      }
+      if (t.dataset.listen) {
+        if (t.checked) delete cfg.listen;
+        else cfg.listen = false;
+      }
       if (Object.keys(cfg).length) audio[id] = cfg;
       else delete audio[id];
       try {
@@ -856,7 +879,7 @@
           <h3>${icon("moon")}Режим сна</h3>
           <span class="pill"><span class="dot ${mode.sleeping ? "warn" : "ok"}"></span>${mode.sleeping ? "Спит" : "Активна"}${src ? ` · ${src}` : ""}${until}</span>
         </div>
-        <p class="card-sub">Во сне колонка продолжает слушать (дневник пишется), но не реагирует на ключевое слово и не светится. Разбудить — фразой ниже или кнопкой. Средняя кнопка на плате работает всегда.</p>
+        <p class="card-sub">Во сне колонка молчит: ни ответов, ни сигналов. Дневник пишется. Разбудить — фразой ниже, кнопкой или в час «Просыпаться в». Голосовой «спи» тоже держится до этого часа. Средняя кнопка на плате работает всегда.</p>
         <div class="row" style="margin-bottom:10px">
           <button type="button" class="btn ${mode.sleeping ? "primary" : ""}" data-sleep="${mode.sleeping ? 0 : 1}">${icon(mode.sleeping ? "sun" : "moon")}${mode.sleeping ? "Разбудить" : "Уснуть"}</button>
         </div>
@@ -865,8 +888,9 @@
           <div class="field" style="flex:1"><label for="f_sleep_start">Засыпать в</label><input class="input" type="time" id="f_sleep_start" name="sleep_start" value="${esc(st.sleep_start || "23:00")}"></div>
           <div class="field" style="flex:1"><label for="f_sleep_end">Просыпаться в</label><input class="input" type="time" id="f_sleep_end" name="sleep_end" value="${esc(st.sleep_end || "07:00")}"></div>
         </div>
-        ${textField("sleep_phrases", "Фразы «уснуть»", st.sleep_phrases, "Через запятую. Срабатывают, если сказаны целиком (или после фразы активации).")}
-        ${textField("awake_phrases", "Фразы «проснуться»", st.awake_phrases, "Работают во сне без ключевого слова: «не спи», «проснись».")}
+        ${textField("sleep_phrases", "Фразы «уснуть»", st.sleep_phrases, "Через запятую. Срабатывают, если сказаны целиком (или после фразы активации). Колонка ответит «Сплю» и замолчит.")}
+        ${textField("awake_phrases", "Фразы «проснуться»", st.awake_phrases, "Работают во сне без ключевого слова: «проснись».")}
+        ${textField("stop_phrases", "Фразы «стоп»", st.stop_phrases || "стоп, остановись, прекрати", "Пока колонка говорит — обрывают речь. В ассистента не уходят.")}
         ${saveRow()}
       </form>`;
   }
@@ -2098,7 +2122,7 @@
             ${textField("llm_url", "Адрес API", s.llm_url, "Ollama на этом ПК: <span class='mono'>http://127.0.0.1:11434/v1</span> (в compose — <span class='mono'>http://host.docker.internal:11434/v1</span>)")}
             ${textField("llm_model", "Модель", s.llm_model, "Нужна модель с tool calling, например qwen2.5:7b или llama3.1:8b.")}
             ${textField("llm_api_key", "API-ключ", s.llm_api_key, "Для Ollama не нужен.", 'type="password"')}
-            ${textField("assistant_domains", "Что доступно ассистенту", s.assistant_domains, "Домены через запятую. Управлять можно светом, розетками, шторами и т.п.; датчики — только читать.")}
+            ${textField("assistant_domains", "Что доступно ассистенту", s.assistant_domains, "Домены через запятую. Конкретные датчики, реле и подсказки — вкладка <a href=\"#devices\">Устройства</a>.")}
             <div class="field"><label for="f_llm_prompt">Дополнительные указания</label><textarea class="input" id="f_llm_prompt" name="llm_prompt" rows="3" placeholder="Например: обращайся ко мне на «ты», детскую называй комнатой Маши">${esc(s.llm_prompt || "")}</textarea></div>
           </div>
           ${saveRow()}
@@ -2180,12 +2204,113 @@
     renderAssistantLog();
   }
 
+  /* ---------------- devices (HA catalog) ---------------- */
+  async function loadCatalog() {
+    try {
+      state.catalog = await api("/api/ha/catalog");
+    } catch (err) {
+      state.catalog = { devices: [], error: err.message || String(err) };
+    }
+  }
+
+  function renderDevices() {
+    const v = view("devices");
+    const focusedSearch = document.activeElement && document.activeElement.id === "catQ";
+    const focusedPos = focusedSearch ? document.activeElement.selectionStart : null;
+    const cat = state.catalog;
+    if (!cat) {
+      v.innerHTML = emptyBox("refresh", "Загружаю устройства…");
+      return;
+    }
+    if (cat.error && !(cat.devices || []).length) {
+      v.innerHTML = banner("bad", "Нет списка из Home Assistant", esc(cat.error));
+      return;
+    }
+    const q = (state.catalogQ || "").trim().toLowerCase();
+    const devices = (cat.devices || []).filter((d) => {
+      if (!q) return true;
+      const blob = `${d.name} ${d.area} ${(d.entities || []).map((e) => `${e.name} ${e.entity_id} ${e.hints}`).join(" ")}`.toLowerCase();
+      return blob.includes(q);
+    });
+    const on = (cat.devices || []).reduce((n, d) => n + (d.entities || []).filter((e) => e.enabled).length, 0);
+    const total = (cat.devices || []).reduce((n, d) => n + (d.entities || []).length, 0);
+    const groups = devices.map((d) => {
+      const ents = (d.entities || []).map((e) => `
+        <div class="device-ent">
+          <label class="switch small" title="Доступна модели"><input type="checkbox" data-ent-on="${esc(e.entity_id)}" ${e.enabled ? "checked" : ""}><span class="track"></span></label>
+          <div>
+            <div>${esc(e.name)} <span class="muted small">${esc(e.domain)}${e.state ? ` · ${esc(e.state)}` : ""}</span></div>
+            <input class="input" data-ent-hints="${esc(e.entity_id)}" value="${esc(e.hints || "")}" placeholder="подсказки: у телевизора, возле тв" maxlength="120">
+          </div>
+        </div>`).join("");
+      return `
+        <div class="card device-card">
+          <div class="row between">
+            <h3>${icon("chip")}${esc(d.name)}${d.area ? ` <span class="muted small">· ${esc(d.area)}</span>` : ""}</h3>
+            ${d.board ? `<span class="badge warn">колонка</span>` : `<span class="small muted">${(d.entities || []).length}</span>`}
+          </div>
+          ${d.board ? `<p class="card-sub">Сущности этой колонки по умолчанию скрыты от модели.</p>` : ""}
+          ${ents || emptyBox("info", "Нет сущностей")}
+        </div>`;
+    }).join("");
+    v.innerHTML = `
+      <div class="card" style="margin-bottom:14px">
+        <div class="row between">
+          <h3>${icon("grid")}Доступ модели</h3>
+          <span class="small muted">${on} из ${total} доступны</span>
+        </div>
+        <p class="card-sub">Список, который видит ИИ: сначала прибор, внутри — датчики и реле. Подсказки («у телевизора») помогают найти нужный. Сущности колонки HA Voice по умолчанию выключены.</p>
+        <div class="input-icon">${icon("search")}<input class="input" id="catQ" placeholder="Поиск по имени, комнате, подсказке" value="${esc(state.catalogQ || "")}" autocomplete="off"></div>
+      </div>
+      <div class="stack" id="catList">${groups || emptyBox("home", q ? "Ничего не найдено." : "Устройств пока нет.")}</div>`;
+    const qEl = $("#catQ");
+    if (qEl) {
+      qEl.addEventListener("input", () => {
+        state.catalogQ = qEl.value;
+        clearTimeout(state.catalogQTimer);
+        state.catalogQTimer = setTimeout(renderDevices, 200);
+      });
+      if (document.activeElement && (document.activeElement.id === "catQ" || focusedSearch)) {
+        const pos = typeof focusedPos === "number" ? focusedPos : qEl.value.length;
+        qEl.focus();
+        qEl.setSelectionRange(pos, pos);
+      }
+    }
+  }
+
+  async function saveCatalogPatch(eid, patch) {
+    const res = await postJson("/api/ha/catalog", { [eid]: patch });
+    state.catalog = res;
+    if (!editing("devices")) renderDevices();
+  }
+
+  async function onDevicesChange(ev) {
+    const t = ev.target;
+    if (t.dataset.entOn) {
+      try {
+        await saveCatalogPatch(t.dataset.entOn, { enabled: t.checked });
+      } catch (err) {
+        showError(err);
+      }
+    }
+  }
+
+  async function onDevicesHints(ev) {
+    const t = ev.target;
+    if (!t.dataset.entHints) return;
+    try {
+      await saveCatalogPatch(t.dataset.entHints, { hints: t.value });
+    } catch (err) {
+      showError(err);
+    }
+  }
+
   /* ---------------- settings ---------------- */
   function tvField(s, st) {
     const tv = (st && st.tv) || {};
     const players = state.mediaPlayers;
     const now = tv.entity ? ` Сейчас: <b>${tv.on ? "включён" : "выключен"}</b>${tv.state ? ` (${esc(tv.state)})` : ""}.` : "";
-    const hint = `Пока ТВ включён, его речь не пишется в дневник. Если включено «Отказывать незнакомым голосам»: команды выполняются только знакомым голосам с порогом +10%, а ключевое слово из ТВ не зажигает кольцо.${now}`;
+    const hint = `Пока ТВ включён, его речь не пишется в дневник. Громкость ТВ колонка меняет только после того, как узнала ваш голос — от ключевого слова из передачи ТВ не глохнет. Звук с самого телевизора Home Assistant не отдаёт, вычесть его из микрофона нельзя.${now}`;
     if (!players) return textField("tv_entity", "Телевизор (media_player)", s.tv_entity, hint, 'placeholder="media_player.televizor"');
     const opts = [["", "— не выбран —"], ...players.map((p) => [p.id, `${p.name} (${p.state})`])];
     if (s.tv_entity && !players.some((p) => p.id === s.tv_entity)) opts.push([s.tv_entity, s.tv_entity]);
@@ -2223,9 +2348,9 @@
             ["mute", "Выключить звук"],
             ["pause", "Поставить на паузу"],
             ["off", "Не трогать"],
-          ], "После ключевого слова ТВ стихает, пока вы говорите команду, и возвращается, как только команда записана. Если звук на ТВ уже выключен — не трогаем; если громкость за это время поменяли вручную — тоже.")}
+          ], "После узнанного голоса ТВ стихает на время ответа и возвращается, когда колонка снова ждёт. Пока голоса не записаны, громкость ТВ не трогаем — отличить вас от передачи нельзя. Если звук на ТВ уже выключен или громкость поменяли вручную — не трогаем.")}
           ${rangeField("tv_duck_level", "Громкость ТВ на время команды", s.tv_duck_level ?? 25, 0, 90, 5, "vol", "Доля от текущей громкости телевизора.")}
-          ${noVoices ? `<div class="hint warn">Голоса ещё не записаны — фильтры начнут работать после первой записи во вкладке «Голоса».</div>` : ""}
+          ${noVoices ? `<div class="hint warn">Голоса ещё не записаны — отличить вас от ТВ нельзя, громкость телевизора от ключевого слова не меняется. Запишите голос во вкладке «Голоса».</div>` : ""}
           ${saveRow()}
         </form>
       </div>
@@ -2303,6 +2428,10 @@
         case "assistant":
           await Promise.all([loadSettings(), loadAssistant()]);
           renderAssistant();
+          break;
+        case "devices":
+          await loadCatalog();
+          renderDevices();
           break;
         case "settings":
           await loadSettings();
@@ -2400,6 +2529,8 @@
   view("speaker").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && ev.target.id === "spSay") $("#spSayBtn").click();
   });
+  view("devices").addEventListener("change", onDevicesChange);
+  view("devices").addEventListener("focusout", onDevicesHints);
   $("#voicesMain").addEventListener("click", onVoicesClick);
   $("#voicesMain").addEventListener("keydown", (ev) => {
     if ((ev.key === "Enter" || ev.key === " ") && ev.target.closest('[data-act="add"]')) {

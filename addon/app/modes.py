@@ -1,8 +1,8 @@
 """Sleep mode: the board keeps listening (diary), but the wake word is ignored.
 
 Sources, strongest first:
-  - a voice / panel / HA override ("не спи", "спи", the «Сон» switch) that
-    lasts until the schedule would change on its own
+  - a voice / panel / HA override ("проснись", "спи", the «Сон» switch)
+    that lasts until sleep_end ("morning"), even if the schedule toggle is off
   - the schedule (sleep_start .. sleep_end, can cross midnight)
 """
 from __future__ import annotations
@@ -23,6 +23,14 @@ class Modes:
     def __init__(self, settings: SettingsStore) -> None:
         self.settings = settings
         self._override: tuple[bool, float, str] | None = None  # (sleep, until ts, source)
+
+    def _next_end(self, now: datetime) -> datetime:
+        """Next sleep_end, used as 'morning' for a voice/panel sleep."""
+        eh, em = _hm(self.settings.get().sleep_end)
+        end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end <= now:
+            end += timedelta(days=1)
+        return end
 
     def _schedule(self, now: datetime) -> tuple[bool, datetime | None]:
         """(asleep by schedule, next time the schedule flips)."""
@@ -64,11 +72,17 @@ class Modes:
         }
 
     def set_sleep(self, on: bool, source: str) -> dict[str, Any]:
-        """Override until the schedule changes by itself (or for good without a schedule)."""
+        """Sleep until morning (sleep_end). Wake lasts until the schedule would wake, or now."""
         now = datetime.now()
         asleep, nxt = self._schedule(now)
-        if self.settings.get().sleep_schedule and asleep == on:
-            self._override = None
+        if on:
+            if self.settings.get().sleep_schedule and asleep:
+                self._override = None
+            else:
+                self._override = (True, self._next_end(now).timestamp(), source)
         else:
-            self._override = (on, nxt.timestamp() if nxt else float("inf"), source)
+            if self.settings.get().sleep_schedule and asleep:
+                self._override = (False, nxt.timestamp() if nxt else float("inf"), source)
+            else:
+                self._override = None
         return self.status()

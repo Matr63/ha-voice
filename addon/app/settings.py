@@ -108,9 +108,14 @@ class Settings:
     # room per board, JSON {"<board name>": "<HA area>"}; a board not listed
     # takes the area of its ESPHome device in HA
     sat_rooms: str = "{}"
-    # sound per board, JSON {"<board>": {"speaker": false, "out": "<board>"}}:
-    # a board without a speaker answers through another one
+    # sound per board, JSON {"<board>": {"speaker": false, "listen": false}}:
+    # «Говорит» / «Слушает»; answers go to sat_voice_out or the board that heard
     sat_audio: str = "{}"
+    # empty = the board that heard; otherwise that board speaks for everyone
+    sat_voice_out: str = ""
+    # JSON {"entity_id": {"enabled": false, "hints": "у телевизора"}}
+    entity_catalog: str = "{}"
+    stop_phrases: str = "стоп, остановись, прекрати"
     # local model run by the add-on (llama.cpp); empty = none
     llm_local_model: str = ""
     llm_threads: int = 0            # 0 = all cores but one

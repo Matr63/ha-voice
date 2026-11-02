@@ -18,12 +18,17 @@ from settings import SettingsStore
 
 _LOGGER = logging.getLogger("ha-voice.ha")
 
-# One template call returns every entity with its area, so the assistant knows
-# "свет на кухне" without a WebSocket registry dump.
+# One template call returns every entity with its area and device, so the
+# assistant can tell two "Температура" sensors in the same room apart.
 _ENTITIES_TEMPLATE = """
 {%- set ns = namespace(rows=[]) -%}
 {%- for s in states if s.domain in DOMAINS -%}
-{%- set ns.rows = ns.rows + [[s.entity_id, s.name, s.state, area_name(s.entity_id) or '']] -%}
+{%- set d = device_id(s.entity_id) -%}
+{%- set dname = '' -%}
+{%- if d -%}
+{%- set dname = device_attr(d, 'name_by_user') or device_attr(d, 'name') or '' -%}
+{%- endif -%}
+{%- set ns.rows = ns.rows + [[s.entity_id, s.name, s.state, area_name(s.entity_id) or '', d or '', dname]] -%}
 {%- endfor -%}
 {{ ns.rows | tojson }}
 """
@@ -160,7 +165,20 @@ class HaClient:
         tpl = _ENTITIES_TEMPLATE.replace("DOMAINS", json.dumps(domains))
         raw = await self.request("POST", "/template", {"template": tpl})
         rows = json.loads(raw) if isinstance(raw, str) else raw
-        return [{"entity_id": r[0], "name": r[1], "state": r[2], "area": r[3]} for r in rows]
+        out = []
+        for r in rows:
+            eid = r[0]
+            item = {
+                "entity_id": eid,
+                "name": r[1],
+                "state": r[2],
+                "area": r[3] if len(r) > 3 else "",
+                "device_id": r[4] if len(r) > 4 else "",
+                "device": r[5] if len(r) > 5 else "",
+                "domain": eid.split(".", 1)[0],
+            }
+            out.append(item)
+        return out
 
     async def _template_json(self, tpl: str) -> Any:
         raw = await self.request("POST", "/template", {"template": tpl})
