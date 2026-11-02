@@ -95,6 +95,10 @@ DUCK_MAX_S = 90.0
 TV_OFF_STATES = ("off", "unavailable", "unknown", "standby")
 SILENT_LINK_S = 30.0
 STOP_SILENCE_MS = 400
+# adaptive VAD (Segmenter): ~3 s of history, start at 3x the floor (~10 dB), keep at 2x
+NOISE_WINDOW_FRAMES = 150
+NOISE_START = 3.0
+NOISE_KEEP = 2.0
 STOP_MAX_MS = 3000
 
 
@@ -119,7 +123,12 @@ def pack(ftype: int, payload: bytes = b"", rate: int = 0, channels: int = 0, bit
 
 
 class Segmenter:
-    """Server-side VAD: energy on 20 ms frames, confirmed by webrtcvad when installed."""
+    """Server-side VAD: energy on 20 ms frames, confirmed by webrtcvad when installed.
+
+    The energy threshold follows the background: speech must stand NOISE_START
+    times above the recent noise floor to start and drops out below NOISE_KEEP
+    times it. With a TV or a fan on, a fixed threshold never saw the pause after
+    a phrase and every command ran to its maximum length."""
 
     def __init__(self, preroll_ms: int = 300) -> None:
         self.pre: deque[bytes] = deque(maxlen=max(1, preroll_ms // 20))
@@ -128,9 +137,27 @@ class Segmenter:
         self.silence_ms = 0
         self._rest = b""
         self._vad = webrtcvad.Vad(1) if webrtcvad is not None else None
+        self._levels: deque[float] = deque(maxlen=NOISE_WINDOW_FRAMES)
+        self.noise = 0.0
+
+    def seed_noise(self, other: "Segmenter") -> None:
+        self._levels.extend(other._levels)
+        self.noise = other.noise
+
+    def _floor(self, level: float) -> float:
+        """Noise floor: a low percentile of the last few seconds of frame levels
+        (the gaps between words count, so it holds during speech as well)."""
+        self._levels.append(level)
+        if len(self._levels) >= 25 and len(self._levels) % 5 == 0:
+            self.noise = float(np.percentile(self._levels, 15))
+        return self.noise
 
     def _is_speech(self, frame: bytes, threshold: float) -> bool:
-        if rms(frame) < threshold:
+        level = rms(frame)
+        noise = self._floor(level)
+        if len(self._levels) < 25:
+            return False  # the first 0.5 s after connecting: learning the background
+        if level < max(threshold, noise * (NOISE_KEEP if self.in_speech else NOISE_START)):
             return False
         if self._vad is not None:
             try:
@@ -235,6 +262,7 @@ class Satellite:
         self.ha_device_id: str | None = None
         self.board_device_id: str | None = None  # ESPHome device of this board (catalog)
         self.stop_seg = Segmenter(preroll_ms=200)
+        self._wake_pcm: bytes | None = None  # XVF3800: the ASR channel, for the wake word only
         self.last_wake: dict[str, Any] | None = None
         self.last_wake_ts = 0.0
         self.ch_rms = [0.0, 0.0]      # long-term level per ES7210 slot
@@ -525,7 +553,14 @@ class Satellite:
                     level = float(np.sqrt(np.mean(ch * ch)))
                     self.ch_rms[i] = level if self.ch_rms[i] == 0 else self.ch_rms[i] * 0.995 + level * 0.005
             mode = s.mic_channel
-            if mode == "left":
+            self._wake_pcm = None
+            if mode == "auto" and self.info.get("board") == "xvf3800":
+                # route «Comms to STT, ASR to wake word»: 0 = comms (the chip's noise
+                # suppression and AGC), 1 = ASR beam with «ASR output gain»
+                self.ch_active, audio = 0, left
+                wake = right if rate == TARGET_RATE else pcm16_to_float(normalize_pcm(apply_gain(right, 0), rate))
+                self._wake_pcm = apply_gain(wake, s.mic_boost_db)
+            elif mode == "left":
                 self.ch_active, audio = 0, left
             elif mode == "right":
                 self.ch_active, audio = 1, right
@@ -588,7 +623,8 @@ class Satellite:
 
         if self.busy:
             return
-        score = await self.wake.feed(pcm)
+        wake_in = self._wake_pcm if real and self._wake_pcm and len(self._wake_pcm) == len(pcm) else pcm
+        score = await self.wake.feed(wake_in)
         if score is not None and time.monotonic() < self.wake_pause_until:
             return
         if score is not None:
@@ -659,8 +695,10 @@ class Satellite:
         if reason == "wake" and not self.hub.claim(self):
             return
         silent = reason == "wake" and self.hub.tv_guard()
-        self.diary_seg.reset()
         self.command = CommandCapture(reason, silent=silent)
+        # the background level the board has been hearing: the command starts with it
+        self.command.seg.seed_noise(self.diary_seg)
+        self.diary_seg.reset()
         if reason == "wake":
             pre = b"".join(self.recent_audio)
             self.command.wake_pcm = pre[-int(WAKE_AUDIO_S * TARGET_RATE) * 2 :]

@@ -857,7 +857,7 @@
         ${rangeField("sat_volume", "Громкость динамика", st.sat_volume ?? 60, 0, 100, 5, "vol")}
         ${rangeField("sat_mic_gain", "Усиление микрофона на плате (ES7210)", st.sat_mic_gain ?? 36, 0, 36, 3, "db", "Аппаратное усиление. На Waveshare микрофоны тихие — держите 30–36 дБ.")}
         ${rangeField("mic_boost_db", "Цифровое усиление на ПК", st.mic_boost_db ?? 6, 0, 36, 1, "db", "Поднимает уровень для распознавания, записи голосов и дневника. Если речь «хрипит» — уменьшите. Порог громкости речи в «Настройках» сравнивается с уровнем после усиления.")}
-        ${selectField("mic_channel", "Канал микрофона", st.mic_channel || "auto", [["auto", "Автоматически (громкий)"], ["left", "Левый"], ["right", "Правый"], ["mix", "Смесь двух"]])}
+        ${selectField("mic_channel", "Канал микрофона", st.mic_channel || "auto", [["auto", "Автоматически"], ["left", "Левый"], ["right", "Правый"], ["mix", "Смесь двух"]], "Автоматически: Waveshare — громкий канал ES7210; ReSpeaker XVF3800 — речь из канала с шумоподавлением чипа (comms, его громкость — «AGC max gain»), ключевое слово из канала ASR («ASR output gain»).")}
         ${chLevels}
         ${rangeField("sat_led_brightness", "Яркость подсветки", st.sat_led_brightness ?? 80, 0, 100, 5, "vol", "0 — кольцо не светится совсем.")}
         <div class="row" style="margin-top:6px;flex-wrap:wrap">
