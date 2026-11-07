@@ -44,6 +44,13 @@
     sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
     settings: '<path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/>',
     home: '<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
+    chevron: '<polyline points="6 9 12 15 18 9"/>',
+    thermo: '<path d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0z"/>',
+    bulb: '<path d="M9 18h6M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z"/>',
+    tv: '<rect x="2" y="7" width="20" height="14" rx="2"/><polyline points="17 2 12 7 7 2"/>',
+    plug: '<path d="M9 2v6M15 2v6"/><path d="M6 8h12v4a6 6 0 0 1-12 0z"/><path d="M12 18v4"/>',
+    cloud: '<path d="M17.5 19H8a6 6 0 1 1 1.2-11.9A5 5 0 0 1 18.9 9.5a4.8 4.8 0 0 1-1.4 9.5z"/>',
+    archive: '<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>',
     grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   };
   const icon = (name, cls = "") =>
@@ -435,6 +442,11 @@
     ha: null,
     catalog: null,
     catalogQ: "",
+    catalogRoom: null,          // null = every room
+    catalogShow: "all",         // all | on | off
+    catalogOpen: new Set(),     // devices opened by hand
+    catalogShut: new Set(),     // devices closed by hand while a filter opens them
+    catalogSeq: 0,
     diary: { items: [], total: 0, q: "", speaker: "", day: "", seen: new Set(), seeded: false },
     playingId: null,
     modalOpen: false,
@@ -1786,6 +1798,9 @@
           ${switchField("sound_error", "Сигнал ошибки", s.sound_error, "Звучит, если команду не расслышали или она не выполнилась.")}
           ${rangeField("sound_volume", "Громкость сигналов", s.sound_volume ?? 60, 10, 100, 5, "vol")}
           <div id="soundsBox">${soundsBox(sat)}</div>
+          ${switchField("thinking_cue", "Фраза, пока ассистент думает", s.thinking_cue, "Если ответ готовится дольше порога, колонка коротко говорит одну из фраз. Если по последним ответам видно, что LLM будет думать дольше порога — сразу, не дожидаясь его.")}
+          ${rangeField("thinking_after_s", "Порог", s.thinking_after_s ?? 3, 1, 30, 1, "s")}
+          ${textField("thinking_phrases", "Фразы", s.thinking_phrases, "Через запятую. Выбираются случайно, недавние не повторяются.")}
           ${saveRow()}
         </form>
         <div class="card">
@@ -2213,10 +2228,137 @@
     }
   }
 
+  const CAT_TYPES = {
+    sensor: "датчик", binary_sensor: "датчик", light: "свет", switch: "выключатель", media_player: "плеер",
+    weather: "погода", climate: "климат", cover: "шторы", fan: "вентилятор", scene: "сцена", script: "скрипт",
+    input_boolean: "переключатель", vacuum: "пылесос", humidifier: "увлажнитель", lock: "замок",
+    valve: "кран", water_heater: "бойлер", button: "кнопка", input_button: "кнопка",
+  };
+  const CAT_STATES = {
+    on: "вкл", off: "выкл", playing: "играет", paused: "пауза", idle: "ожидает", standby: "ожидает",
+    unavailable: "недоступно", unknown: "нет данных", open: "открыто", closed: "закрыто",
+    sunny: "солнечно", "clear-night": "ясно", partlycloudy: "переменная облачность", cloudy: "облачно",
+    rainy: "дождь", pouring: "ливень", snowy: "снег", fog: "туман",
+  };
+  const CAT_NO_ROOM = "";
+  const CAT_BOARDS = "*boards";
+
+  const catKey = (d) => (d.board ? CAT_BOARDS : d.area || CAT_NO_ROOM);
+  const catKeyName = (key) => (key === CAT_BOARDS ? "Колонки HA Voice" : key === CAT_NO_ROOM ? "Без комнаты" : key);
+  const catMissing = (e) => e.state === "unavailable" || e.state === "unknown";
+
+  function catState(e) {
+    const raw = String(e.state ?? "");
+    if (/^\d{4}-\d{2}-\d{2}T/.test(raw)) {
+      const when = new Date(raw);
+      if (!Number.isNaN(when.getTime())) return when.toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    }
+    const num = raw.trim() === "" ? NaN : Number(raw);
+    if (!Number.isNaN(num)) return `${num.toLocaleString("ru-RU", { maximumFractionDigits: 1 })}${e.unit ? ` ${e.unit}` : ""}`;
+    return CAT_STATES[raw] || raw;
+  }
+
+  // what a device is, in words: services of HA itself have names that say nothing
+  function catKind(d) {
+    const ents = d.entities || [];
+    const has = (dom) => ents.some((e) => e.domain === dom);
+    const ids = ents.map((e) => e.entity_id);
+    if (ids.some((x) => x.startsWith("sensor.backup_"))) return { icon: "archive", about: "Резервные копии Home Assistant: когда были и когда следующая" };
+    if (ids.some((x) => x.startsWith("sensor.sun_") || x.startsWith("sun."))) return { icon: "sun", about: "Солнце: время восхода, заката и сумерек" };
+    if (has("weather")) return { icon: "cloud", about: "Прогноз погоды" };
+    if (has("media_player")) return { icon: "tv" };
+    if (has("light")) return { icon: "bulb" };
+    if (has("switch")) return { icon: "plug" };
+    if (has("sensor") || has("binary_sensor")) return { icon: "thermo" };
+    return { icon: "chip" };
+  }
+
+  // the values at a glance: a device row answers "что это" without opening it
+  function catPreview(d) {
+    const ents = d.entities || [];
+    const useful = ents.filter((e) => !catMissing(e) && !/батаре|battery/i.test(e.name));
+    const measured = useful.filter((e) => e.unit);
+    const pick = measured.length ? measured : useful;
+    pick.sort((a, b) => (a.unit === "°C" ? -1 : 0) - (b.unit === "°C" ? -1 : 0));
+    return pick.slice(0, 3).map(catState).join(" · ");
+  }
+
+  function catShortName(d, e) {
+    const prefix = String(d.name || "");
+    const name = String(e.name || "");
+    if (prefix && name.toLowerCase().startsWith(`${prefix.toLowerCase()} `)) return name.slice(prefix.length + 1);
+    return name;
+  }
+
+  function catEntityBlob(e) {
+    return `${e.name} ${e.entity_id} ${e.hints || ""} ${CAT_TYPES[e.domain] || e.domain}`.toLowerCase();
+  }
+
+  function catFilter(devices) {
+    const q = (state.catalogQ || "").trim().toLowerCase();
+    const show = state.catalogShow;
+    const out = [];
+    for (const d of devices) {
+      if (state.catalogRoom !== null && catKey(d) !== state.catalogRoom) continue;
+      const whole = !q || `${d.name} ${d.area} ${catKind(d).about || ""}`.toLowerCase().includes(q);
+      const ents = (d.entities || []).filter((e) => {
+        if (show === "on" && !e.enabled) return false;
+        if (show === "off" && e.enabled) return false;
+        return whole || catEntityBlob(e).includes(q);
+      });
+      if (ents.length) out.push({ device: d, ents, auto: show !== "all" || (Boolean(q) && !whole) });
+    }
+    return out;
+  }
+
+  function renderCatEntity(d, e) {
+    const off = !e.enabled;
+    return `
+      <div class="cat-ent ${off ? "off" : ""}">
+        <label class="cat-check" title="${off ? "Модель не видит" : "Модель видит"}"><input type="checkbox" data-ent-on="${esc(e.entity_id)}" data-fk="e:${esc(e.entity_id)}" ${e.enabled ? "checked" : ""}></label>
+        <div class="cat-ent-name" title="${esc(e.entity_id)}">
+          <span>${esc(catShortName(d, e))}</span>
+          <span class="cat-type">${esc(CAT_TYPES[e.domain] || e.domain)}</span>
+        </div>
+        <div class="cat-state ${catMissing(e) ? "muted" : ""}">${esc(catState(e))}</div>
+        <input class="input cat-hint" data-ent-hints="${esc(e.entity_id)}" data-fk="h:${esc(e.entity_id)}" value="${esc(e.hints || "")}" placeholder="добавить подсказку" maxlength="120" aria-label="Подсказка для модели">
+      </div>`;
+  }
+
+  function renderCatDevice({ device: d, ents, auto }, twins) {
+    const all = d.entities || [];
+    const on = all.filter((e) => e.enabled).length;
+    const open = auto ? !state.catalogShut.has(d.id) : state.catalogOpen.has(d.id);
+    const kind = catKind(d);
+    const dead = all.length && all.every(catMissing);
+    // two devices with one name: only the entity_id tells them apart
+    const twin = twins.has(d.name) && all.length ? all[0].entity_id : "";
+    const sub = kind.about || catPreview(d);
+    return `
+      <div class="cat-dev ${on ? "" : "off"} ${open ? "open" : ""}">
+        <div class="cat-dev-row">
+          <label class="cat-check" title="${on ? "Выключить для модели всё в приборе" : "Включить для модели всё в приборе"}"><input type="checkbox" data-dev-on="${esc(d.id)}" data-fk="d:${esc(d.id)}" ${on ? "checked" : ""} data-indet="${on && on < all.length ? 1 : 0}"></label>
+          <button type="button" class="cat-dev-btn" data-dev-toggle="${esc(d.id)}" data-auto="${auto ? 1 : 0}" data-fk="t:${esc(d.id)}" aria-expanded="${open}">
+            <span class="cat-dev-icon">${icon(kind.icon)}</span>
+            <span class="cat-dev-text">
+              <span class="cat-dev-name">${esc(d.name)}${twin ? ` <span class="mono muted">${esc(twin)}</span>` : ""}</span>
+              ${sub ? `<span class="cat-dev-sub">${esc(sub)}</span>` : ""}
+            </span>
+            ${dead ? `<span class="cat-tag">недоступно</span>` : ""}
+            <span class="cat-count">${on === all.length ? all.length : `${on} из ${all.length}`}</span>
+            ${icon("chevron", "cat-chevron")}
+          </button>
+        </div>
+        ${open ? `<div class="cat-ents">${ents.map((e) => renderCatEntity(d, e)).join("")}</div>` : ""}
+      </div>`;
+  }
+
   function renderDevices() {
     const v = view("devices");
-    const focusedSearch = document.activeElement && document.activeElement.id === "catQ";
-    const focusedPos = focusedSearch ? document.activeElement.selectionStart : null;
+    const active = document.activeElement;
+    const focusKey = active && v.contains(active) ? active.dataset.fk : null;
+    const focusedSearch = active && active.id === "catQ";
+    const focusedPos = focusedSearch ? active.selectionStart : null;
     const cat = state.catalog;
     if (!cat) {
       v.innerHTML = emptyBox("refresh", "Загружаю устройства…");
@@ -2226,80 +2368,152 @@
       v.innerHTML = banner("bad", "Нет списка из Home Assistant", esc(cat.error));
       return;
     }
-    const q = (state.catalogQ || "").trim().toLowerCase();
-    const devices = (cat.devices || []).filter((d) => {
-      if (!q) return true;
-      const blob = `${d.name} ${d.area} ${(d.entities || []).map((e) => `${e.name} ${e.entity_id} ${e.hints}`).join(" ")}`.toLowerCase();
-      return blob.includes(q);
+    const devices = cat.devices || [];
+    const everything = devices.flatMap((d) => d.entities || []);
+    const on = everything.filter((e) => e.enabled).length;
+    const rooms = [...new Set(devices.map(catKey))].sort((a, b) => {
+      const rank = (k) => (k === CAT_BOARDS ? 2 : k === CAT_NO_ROOM ? 1 : 0);
+      return rank(a) - rank(b) || a.localeCompare(b, "ru");
     });
-    const on = (cat.devices || []).reduce((n, d) => n + (d.entities || []).filter((e) => e.enabled).length, 0);
-    const total = (cat.devices || []).reduce((n, d) => n + (d.entities || []).length, 0);
-    const groups = devices.map((d) => {
-      const ents = (d.entities || []).map((e) => `
-        <div class="device-ent">
-          <label class="switch small" title="Доступна модели"><input type="checkbox" data-ent-on="${esc(e.entity_id)}" ${e.enabled ? "checked" : ""}><span class="track"></span></label>
-          <div>
-            <div>${esc(e.name)} <span class="muted small">${esc(e.domain)}${e.state ? ` · ${esc(e.state)}` : ""}</span></div>
-            <input class="input" data-ent-hints="${esc(e.entity_id)}" value="${esc(e.hints || "")}" placeholder="подсказки: у телевизора, возле тв" maxlength="120">
-          </div>
-        </div>`).join("");
+    if (state.catalogRoom !== null && !rooms.includes(state.catalogRoom)) state.catalogRoom = null;
+    const shown = catFilter(devices);
+    const names = devices.map((d) => d.name);
+    const twins = new Set(names.filter((n, i) => names.indexOf(n) !== i));
+    const sections = rooms.map((key) => {
+      const items = shown.filter((x) => catKey(x.device) === key);
+      if (!items.length) return "";
+      const ents = items.flatMap((x) => x.ents);
+      const onHere = ents.filter((e) => e.enabled).length;
       return `
-        <div class="card device-card">
-          <div class="row between">
-            <h3>${icon("chip")}${esc(d.name)}${d.area ? ` <span class="muted small">· ${esc(d.area)}</span>` : ""}</h3>
-            ${d.board ? `<span class="badge warn">колонка</span>` : `<span class="small muted">${(d.entities || []).length}</span>`}
+        <section class="cat-room">
+          <div class="cat-room-head">
+            <label class="cat-check" title="${onHere ? "Выключить для модели всё в этой группе" : "Включить для модели всё в этой группе"}"><input type="checkbox" data-room-on="${esc(key)}" data-fk="r:${esc(key)}" ${onHere ? "checked" : ""} data-indet="${onHere && onHere < ents.length ? 1 : 0}"></label>
+            <h4>${esc(catKeyName(key))}</h4>
+            <span class="small muted">${onHere} из ${ents.length}</span>
           </div>
-          ${d.board ? `<p class="card-sub">Сущности этой колонки по умолчанию скрыты от модели.</p>` : ""}
-          ${ents || emptyBox("info", "Нет сущностей")}
-        </div>`;
+          ${key === CAT_BOARDS ? `<p class="small muted cat-room-note">Сущности колонок по умолчанию скрыты от модели.</p>` : ""}
+          <div class="cat-devs">${items.map((x) => renderCatDevice(x, twins)).join("")}</div>
+        </section>`;
     }).join("");
+    const roomChip = (key, label, count) => `<button type="button" class="cat-chip ${state.catalogRoom === key ? "active" : ""}" data-cat-room="${key === null ? "*" : esc(key)}" data-fk="c:${key === null ? "*" : esc(key)}">${esc(label)}<span>${count}</span></button>`;
+    const showBtn = (key, label) => `<button type="button" class="${state.catalogShow === key ? "active" : ""}" data-cat-show="${key}" data-fk="s:${key}">${label}</button>`;
+    const filtered = (state.catalogQ || "").trim() || state.catalogRoom !== null || state.catalogShow !== "all";
     v.innerHTML = `
-      <div class="card" style="margin-bottom:14px">
+      <div class="card cat-bar">
         <div class="row between">
           <h3>${icon("grid")}Доступ модели</h3>
-          <span class="small muted">${on} из ${total} доступны</span>
+          <span class="small muted">модель видит <b>${on}</b> из ${everything.length}</span>
         </div>
-        <p class="card-sub">Список, который видит ИИ: сначала прибор, внутри — датчики и реле. Подсказки («у телевизора») помогают найти нужный. Сущности колонки HA Voice по умолчанию выключены.</p>
-        <div class="input-icon">${icon("search")}<input class="input" id="catQ" placeholder="Поиск по имени, комнате, подсказке" value="${esc(state.catalogQ || "")}" autocomplete="off"></div>
+        <p class="card-sub">Снимите галочку — модель не узнает об этом и не сможет этим управлять. Подсказка («у телевизора») помогает ей найти нужное. Для агента Home Assistant действует его собственный список.</p>
+        <div class="cat-tools">
+          <div class="input-icon">${icon("search")}<input class="input" id="catQ" placeholder="Поиск: имя, комната, подсказка, «свет»" value="${esc(state.catalogQ || "")}" autocomplete="off"></div>
+          <div class="cat-segment" role="group" aria-label="Показать">${showBtn("all", "Все")}${showBtn("on", "Включённые")}${showBtn("off", "Выключенные")}</div>
+        </div>
+        <div class="cat-chips">
+          ${roomChip(null, "Все комнаты", devices.length)}
+          ${rooms.map((k) => roomChip(k, catKeyName(k), devices.filter((d) => catKey(d) === k).length)).join("")}
+        </div>
       </div>
-      <div class="stack" id="catList">${groups || emptyBox("home", q ? "Ничего не найдено." : "Устройств пока нет.")}</div>`;
+      <div id="catList">${sections || `${emptyBox("home", filtered ? "Ничего не найдено." : "Устройств пока нет.")}${filtered ? `<div class="row" style="justify-content:center"><button type="button" class="btn ghost sm" data-cat-reset>Сбросить фильтры</button></div>` : ""}`}</div>`;
+    v.querySelectorAll('input[data-indet="1"]').forEach((el) => { el.indeterminate = true; });
     const qEl = $("#catQ");
     if (qEl) {
       qEl.addEventListener("input", () => {
         state.catalogQ = qEl.value;
+        state.catalogShut.clear();
         clearTimeout(state.catalogQTimer);
         state.catalogQTimer = setTimeout(renderDevices, 200);
       });
-      if (document.activeElement && (document.activeElement.id === "catQ" || focusedSearch)) {
-        const pos = typeof focusedPos === "number" ? focusedPos : qEl.value.length;
+      if (focusedSearch) {
         qEl.focus();
-        qEl.setSelectionRange(pos, pos);
+        qEl.setSelectionRange(focusedPos, focusedPos);
       }
+    }
+    if (focusKey) {
+      const again = [...v.querySelectorAll("[data-fk]")].find((el) => el.dataset.fk === focusKey);
+      if (again) again.focus({ preventScroll: true });
     }
   }
 
-  async function saveCatalogPatch(eid, patch) {
-    const res = await postJson("/api/ha/catalog", { [eid]: patch });
+  async function saveCatalogPatch(patch) {
+    const seq = ++state.catalogSeq;
+    const res = await postJson("/api/ha/catalog", { entities: patch });
+    if (seq !== state.catalogSeq) return;   // a newer change is on its way: its answer has this one too
     state.catalog = res;
-    if (!editing("devices")) renderDevices();
+    if (!(document.activeElement && document.activeElement.dataset.entHints)) renderDevices();
+  }
+
+  // shown at once; the answer from the server follows
+  async function setCatalogEnabled(ents, enabled) {
+    const patch = {};
+    for (const e of ents) {
+      e.enabled = enabled;
+      patch[e.entity_id] = { enabled };
+    }
+    renderDevices();
+    try {
+      await saveCatalogPatch(patch);
+    } catch (err) {
+      showError(err);
+      await loadCatalog();
+      renderDevices();
+    }
   }
 
   async function onDevicesChange(ev) {
     const t = ev.target;
+    const devices = (state.catalog && state.catalog.devices) || [];
     if (t.dataset.entOn) {
-      try {
-        await saveCatalogPatch(t.dataset.entOn, { enabled: t.checked });
-      } catch (err) {
-        showError(err);
-      }
+      const e = devices.flatMap((d) => d.entities || []).find((x) => x.entity_id === t.dataset.entOn);
+      if (e) await setCatalogEnabled([e], t.checked);
+    } else if (t.dataset.devOn) {
+      const d = devices.find((x) => x.id === t.dataset.devOn);
+      if (d) await setCatalogEnabled(d.entities || [], t.checked);
+    } else if (t.dataset.roomOn !== undefined) {
+      // only what the filters show: a search for «батарея» leaves the rest of the room alone
+      const items = catFilter(devices).filter((x) => catKey(x.device) === t.dataset.roomOn);
+      await setCatalogEnabled(items.flatMap((x) => x.ents), t.checked);
+    }
+  }
+
+  function onDevicesClick(ev) {
+    const toggle = ev.target.closest("[data-dev-toggle]");
+    if (toggle) {
+      const id = toggle.dataset.devToggle;
+      const set = toggle.dataset.auto === "1" ? state.catalogShut : state.catalogOpen;
+      if (!set.delete(id)) set.add(id);
+      renderDevices();
+      return;
+    }
+    const room = ev.target.closest("[data-cat-room]");
+    if (room) {
+      state.catalogRoom = room.dataset.catRoom === "*" ? null : room.dataset.catRoom;
+      renderDevices();
+      return;
+    }
+    const show = ev.target.closest("[data-cat-show]");
+    if (show) {
+      state.catalogShow = show.dataset.catShow;
+      state.catalogShut.clear();
+      renderDevices();
+      return;
+    }
+    if (ev.target.closest("[data-cat-reset]")) {
+      state.catalogQ = "";
+      state.catalogRoom = null;
+      state.catalogShow = "all";
+      renderDevices();
     }
   }
 
   async function onDevicesHints(ev) {
     const t = ev.target;
     if (!t.dataset.entHints) return;
+    const e = ((state.catalog && state.catalog.devices) || []).flatMap((d) => d.entities || []).find((x) => x.entity_id === t.dataset.entHints);
+    if (!e || (e.hints || "") === t.value.trim()) return;
+    e.hints = t.value.trim();
     try {
-      await saveCatalogPatch(t.dataset.entHints, { hints: t.value });
+      await saveCatalogPatch({ [t.dataset.entHints]: { hints: t.value } });
     } catch (err) {
       showError(err);
     }
@@ -2530,6 +2744,7 @@
     if (ev.key === "Enter" && ev.target.id === "spSay") $("#spSayBtn").click();
   });
   view("devices").addEventListener("change", onDevicesChange);
+  view("devices").addEventListener("click", onDevicesClick);
   view("devices").addEventListener("focusout", onDevicesHints);
   $("#voicesMain").addEventListener("click", onVoicesClick);
   $("#voicesMain").addEventListener("keydown", (ev) => {

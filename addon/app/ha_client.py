@@ -28,7 +28,7 @@ _ENTITIES_TEMPLATE = """
 {%- if d -%}
 {%- set dname = device_attr(d, 'name_by_user') or device_attr(d, 'name') or '' -%}
 {%- endif -%}
-{%- set ns.rows = ns.rows + [[s.entity_id, s.name, s.state, area_name(s.entity_id) or '', d or '', dname]] -%}
+{%- set ns.rows = ns.rows + [[s.entity_id, s.name, s.state, area_name(s.entity_id) or '', d or '', dname, s.attributes.get('unit_of_measurement') or '']] -%}
 {%- endfor -%}
 {{ ns.rows | tojson }}
 """
@@ -175,6 +175,7 @@ class HaClient:
                 "area": r[3] if len(r) > 3 else "",
                 "device_id": r[4] if len(r) > 4 else "",
                 "device": r[5] if len(r) > 5 else "",
+                "unit": r[6] if len(r) > 6 else "",
                 "domain": eid.split(".", 1)[0],
             }
             out.append(item)

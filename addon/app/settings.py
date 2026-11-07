@@ -29,6 +29,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "mic_boost_db": (0, 36),
     "llm_threads": (0, 64),
     "sound_volume": (10, 100),
+    "thinking_after_s": (1, 30),
     "llm_ctx": (2048, 32768),
 }
 
@@ -69,6 +70,10 @@ class Settings:
     sound_wake: bool = True
     sound_error: bool = True
     sound_volume: int = 60
+    # a short phrase while a long answer is prepared, never the same one twice in a row
+    thinking_cue: bool = True
+    thinking_after_s: int = 3
+    thinking_phrases: str = "Думаю, Секунду, Минутку, Сейчас посмотрю, Дайте подумать, Сейчас узнаю"
     # TV next to the board: diary for known voices only, stricter commands while it plays
     diary_known_only: bool = False
     tv_entity: str = ""             # media_player.* in Home Assistant

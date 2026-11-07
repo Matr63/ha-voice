@@ -21,7 +21,7 @@ from gate_server import GateState
 from ha_client import HaClient, HaError
 from llm import PRESETS, LlmManager
 import models_archive
-from satellite import SatelliteHub
+from satellite import SatelliteHub, ThinkingCue
 from settings import SettingsStore
 from speakers import SpeakerStore
 from stt_client import port_open, transcribe
@@ -234,6 +234,8 @@ def create_app(ctx: AppContext) -> web.Application:
         if any(before.get(k) != after.get(k) for k in ("entity_catalog", "assistant_domains", "llm_prompt")):
             assistant.invalidate_entities()
             asyncio.create_task(assistant.prewarm())
+        if any(before[k] != after[k] for k in ("thinking_cue", "thinking_phrases", "tts_voice")):
+            hub.prewarm_cues()
         return web.json_response(settings.to_public_dict())
 
     async def speakers_list(_: web.Request) -> web.Response:
@@ -541,7 +543,7 @@ def create_app(ctx: AppContext) -> web.Application:
                 catalog.pop(eid, None)
         settings.update({"entity_catalog": json.dumps(catalog, ensure_ascii=False)})
         assistant.invalidate_entities()
-        asyncio.create_task(assistant.prewarm())
+        assistant.schedule_prewarm()
         try:
             devices = await assistant.catalog_view()
         except HaError as err:
@@ -658,7 +660,13 @@ def create_app(ctx: AppContext) -> web.Application:
         text = (data.get("text") or "").strip()
         if not text:
             raise ValueError("Введите фразу")
-        result = await assistant.handle(text, conv_key="panel")
+        board = hub.get(data.get("id") or None) if data.get("speak") else None
+        cue = ThinkingCue(board) if board is not None else None
+        try:
+            result = await assistant.handle(text, conv_key="panel", on_llm=cue.llm_started if cue else None)
+        finally:
+            if cue:
+                cue.done()
         entry = assistant.record(
             {
                 "satellite": "panel",

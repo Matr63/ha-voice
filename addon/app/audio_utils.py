@@ -153,9 +153,14 @@ def save_sound(kind: str, body: bytes) -> dict:
     return sound_info(kind)
 
 
+def pad_sound(pcm: bytes, rate: int) -> bytes:
+    """Silence around a short sound, so the board's resampler is running before
+    it and has a tail to drain."""
+    return b"\0" * (int(rate * 0.12) * 2) + pcm + b"\0" * (int(rate * 0.2) * 2)
+
+
 def earcon_audio(kind: str, volume_pct: int = 60) -> tuple[bytes, int]:
-    """The user's WAV if uploaded, else the built-in tone; padded with silence
-    so the board's resampler is running before the sound and has a tail to drain."""
+    """The user's WAV if uploaded, else the built-in tone, padded for the board."""
     audio = None
     p = sound_path(kind)
     if p.is_file():
@@ -167,9 +172,7 @@ def earcon_audio(kind: str, volume_pct: int = 60) -> tuple[bytes, int]:
     if audio is None:
         rate = EARCON_RATE
         audio = pcm16_to_float(earcon(kind, volume_pct))
-    pad = np.zeros(int(rate * 0.12), dtype=np.float32)
-    tail = np.zeros(int(rate * 0.2), dtype=np.float32)
-    return float_to_pcm16(np.concatenate([pad, audio.astype(np.float32), tail])), rate
+    return pad_sound(float_to_pcm16(audio.astype(np.float32)), rate), rate
 
 
 def split_stereo(pcm: bytes) -> tuple[np.ndarray, np.ndarray]:

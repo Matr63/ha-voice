@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import struct
 import time
 from collections import deque
@@ -29,6 +30,7 @@ from audio_utils import (
     duration_ms,
     earcon_audio,
     normalize_pcm,
+    pad_sound,
     pcm16_to_float,
     rms,
     split_stereo,
@@ -236,6 +238,57 @@ class CommandCapture:
         return None
 
 
+class ThinkingCue:
+    """A short spoken phrase («думаю») while the assistant works: after
+    thinking_after_s, or at once when the LLM is expected to take that long."""
+
+    def __init__(self, sat: "Satellite") -> None:
+        self.sat = sat
+        self.after = float(sat.hub.settings.get().thinking_after_s)
+        self.predicted: float | None = None
+        self.finished = False
+        self._wake = asyncio.Event()
+        sat._spawn(self._run())
+
+    def llm_started(self, predicted_s: float | None) -> None:
+        if predicted_s is not None and predicted_s >= self.after:
+            self.predicted = predicted_s
+            self._wake.set()
+
+    def done(self) -> None:
+        self.finished = True
+        self._wake.set()
+
+    async def _run(self) -> None:
+        sat, hub = self.sat, self.sat.hub
+        if not hub.settings.get().thinking_cue:
+            return
+        gen = hub.speak_gen
+        try:
+            await asyncio.wait_for(self._wake.wait(), self.after)
+        except asyncio.TimeoutError:
+            pass
+        out = sat.voice_out()
+        if self.finished or out is None or hub.modes.sleeping():
+            return
+        phrase = hub.next_cue_phrase()
+        if not phrase:
+            return
+        try:
+            pcm, rate = await hub.cue_clip(phrase)
+        except Exception as err:
+            _LOGGER.info("%s: thinking phrase not synthesized: %s", sat.id, err)
+            return
+        # the answer may have come while the phrase was synthesized
+        if self.finished or gen != hub.speak_gen:
+            return
+        _LOGGER.info(
+            "%s: thinking phrase «%s» (%s)", sat.id, phrase,
+            f"expected {self.predicted:.1f} s" if self.predicted is not None else f"no answer in {self.after:.0f} s",
+        )
+        await out.play_clip(pcm, rate, listener=sat, label="thinking")
+
+
 class Satellite:
     def __init__(self, hub: "SatelliteHub", writer: asyncio.StreamWriter, peer: Any) -> None:
         self.hub = hub
@@ -414,29 +467,43 @@ class Satellite:
             await out.play_earcon(kind, listener=self)
 
     async def play_earcon(self, kind: str, listener: "Satellite | None" = None) -> None:
+        pcm, rate = earcon_audio(kind, self.hub.settings.get().sound_volume)
+        await self.play_clip(pcm, rate, listener, kind)
+
+    async def play_clip(self, pcm: bytes, rate: int, listener: "Satellite | None" = None, label: str = "") -> None:
         """A short sound through the TTS path; the mic is ignored while it plays."""
-        if not self.can_speak or self.speaking or self._earcon_lock.locked():
+        if not self.can_speak:
+            return
+        if self.speaking or self._earcon_lock.locked():
+            _LOGGER.info("%s: %s sound skipped, the speaker is busy", self.id, label)
             return
         async with self._earcon_lock:
-            pcm, rate = earcon_audio(kind, self.hub.settings.get().sound_volume)
             dur = len(pcm) / 2 / rate
             # playback + Wi-Fi + the board's resampler buffer; the board that
             # listens hears the sound too when it plays on another one
             for b in {self, listener or self}:
                 b.mute_until = max(b.mute_until, time.monotonic() + dur + 0.35)
             self._tts_done.clear()
+            started = time.monotonic()
             await self.send(T_TTS_START, rate=rate, channels=1, bits=16)
             for i in range(0, len(pcm), TTS_CHUNK):
                 await self.send(T_AUDIO, pcm[i : i + TTS_CHUNK], rate=rate, channels=1, bits=16)
-            await self.send(T_TTS_END)
+            await self._end_stream(started, len(pcm), rate)
             try:
-                await asyncio.wait_for(self._tts_done.wait(), timeout=dur + 2.5)
+                await asyncio.wait_for(self._tts_done.wait(), timeout=2.5)
             except asyncio.TimeoutError:
                 # the board's player did not finish (stuck on a short stream):
                 # reset it, or every later sound and reply would queue behind it
                 if not self.speaking:
-                    _LOGGER.info("%s: no tts_done after the %s sound, resetting playback", self.id, kind)
+                    _LOGGER.info("%s: no tts_done after the %s sound, resetting playback", self.id, label)
                     await self.send(T_TTS_ABORT)
+
+    async def _end_stream(self, started: float, nbytes: int, rate: int) -> None:
+        """END only once the audio had time to play. A short sound fits the board's
+        buffers whole: told to finish at once, the resampler finishes its output before
+        the sound has reached it, and the sound is sometimes lost."""
+        await asyncio.sleep(max(0.0, started + nbytes / 2 / rate - time.monotonic()))
+        await self.send(T_TTS_END)
 
     async def flash_error(self) -> None:
         if self.hub.modes.sleeping():
@@ -475,6 +542,7 @@ class Satellite:
         await self.push_board_settings()
         await self.go_idle()
         self._spawn(self.resolve_room())
+        self.hub.prewarm_cues()
 
     async def resolve_room(self) -> None:
         """Room from the panel, else the area of this board's ESPHome device in HA."""
@@ -660,6 +728,9 @@ class Satellite:
         self.last_wake = {"ts": time.time(), "score": 1.0, "word": hit[0], "by": "phrase"}
         _LOGGER.info("%s: activation phrase '%s' -> %r", self.id, hit[0], rest)
         if rest:
+            # said in one breath: the sound comes after the phrase and means "heard"
+            if s.sound_wake:
+                self._spawn(self.earcon("wake"))
             self._spawn(self.run_text(rest, match, pcm, heard=text))
         else:
             await self.start_command("phrase")
@@ -788,9 +859,14 @@ class Satellite:
             gen = hub.speak_gen
             if self.state != ST_THINKING:
                 await self.set_state(ST_THINKING)
-            result = await hub.assistant.handle(
-                text, conv_key=self.id, speaker=speaker, device_id=self.ha_device_id, room=self.room or None
-            )
+            cue = ThinkingCue(self)
+            try:
+                result = await hub.assistant.handle(
+                    text, conv_key=self.id, speaker=speaker, device_id=self.ha_device_id, room=self.room or None,
+                    on_llm=cue.llm_started,
+                )
+            finally:
+                cue.done()
             entry.update(
                 reply=result.speech,
                 backend=result.backend,
@@ -860,30 +936,32 @@ class Satellite:
         for b in boards:
             b.speaking = True
             b.command = None
-        self._tts_done.clear()
         total = 0
         rate = 24000
         try:
+            # a sound or «думаю» still playing finishes first: one stream at a time
+            async with self._earcon_lock:
+                self._tts_done.clear()
             if gen != hub.speak_gen:
                 return
             for b in boards:
                 await b.set_state(ST_REPLYING)
-            started = False
+            started = 0.0
             async for r, pcm in synthesize_stream(hub.tts_uri, text, voice):
                 if gen != hub.speak_gen:
                     await self.send(T_TTS_ABORT)
                     return
                 if not started:
                     rate = r
+                    started = time.monotonic()
                     await self.send(T_TTS_START, rate=rate, channels=1, bits=16)
-                    started = True
                 for i in range(0, len(pcm), TTS_CHUNK):
                     await self.send(T_AUDIO, pcm[i : i + TTS_CHUNK], rate=rate, channels=1, bits=16)
                 total += len(pcm)
             if gen != hub.speak_gen:
                 await self.send(T_TTS_ABORT)
                 return
-            await self.send(T_TTS_END)
+            await self._end_stream(started, total, rate)
             try:
                 await asyncio.wait_for(self._tts_done.wait(), timeout=total / 2 / rate + 5)
             except asyncio.TimeoutError:
@@ -958,9 +1036,57 @@ class SatelliteHub:
         self._duck_lock = asyncio.Lock()
         self._duck_timer: asyncio.Task | None = None
         self.speak_gen = 0
+        self._cue_clips: dict[tuple[str, str], tuple[bytes, int]] = {}
+        self._cue_recent: list[str] = []
+        self._cue_warm: asyncio.Task | None = None
 
     def any_speaking(self) -> bool:
         return any(s.speaking for s in self.satellites.values())
+
+    # ------------------------------------------------- thinking phrases
+    def _cue_phrases(self) -> list[str]:
+        return [p.strip() for p in self.settings.get().thinking_phrases.split(",") if p.strip()]
+
+    def next_cue_phrase(self) -> str | None:
+        """Random, but not one of the phrases said just before."""
+        phrases = self._cue_phrases()
+        if not phrases:
+            return None
+        keep = len(phrases) // 2
+        recent = self._cue_recent[-keep:] if keep else []
+        phrase = random.choice([p for p in phrases if p not in recent] or phrases)
+        self._cue_recent = [*recent, phrase]
+        return phrase
+
+    async def cue_clip(self, text: str) -> tuple[bytes, int]:
+        """Synthesized once: said from memory, it does not make the speech engine
+        compete with the LLM for the CPU at the moment the phrase is needed."""
+        key = (resolve_voice(self.settings.get().tts_voice), text)
+        clip = self._cue_clips.get(key)
+        if clip is None:
+            audio = bytearray()
+            rate = 24000
+            async for rate, pcm in synthesize_stream(self.tts_uri, text, key[0]):
+                audio.extend(pcm)
+            if not audio:
+                raise RuntimeError("TTS не вернул звук")
+            clip = self._cue_clips[key] = (pad_sound(bytes(audio), rate), rate)
+        return clip
+
+    def prewarm_cues(self) -> None:
+        if self.settings.get().thinking_cue and (self._cue_warm is None or self._cue_warm.done()):
+            self._cue_warm = asyncio.create_task(self._prewarm_cues())
+
+    async def _prewarm_cues(self) -> None:
+        phrases = self._cue_phrases()
+        voice = resolve_voice(self.settings.get().tts_voice)
+        self._cue_clips = {k: v for k, v in self._cue_clips.items() if k[0] == voice and k[1] in phrases}
+        try:
+            for phrase in phrases:
+                await self.cue_clip(phrase)
+        except Exception as err:
+            # the speech engine is still loading: the phrase is made when first needed
+            _LOGGER.info("Thinking phrases not prepared yet: %s", err)
 
     async def interrupt_speech(self) -> None:
         """Cut the current reply on every board. A new reply after this is allowed."""

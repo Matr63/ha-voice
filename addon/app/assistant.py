@@ -13,11 +13,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 import aiohttp
 
@@ -44,6 +45,7 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент умного �
 Правила:
 - Отвечай по-русски, коротко: одно-два предложения, без markdown, списков и эмодзи.
 - Чтобы управлять устройствами, вызывай call_service. Чтобы узнать состояние — get_state или list_entities.
+- Функции вызывай только как вызов функции. В тексте ответа никогда не пиши их названия и entity_id: текст читается вслух.
 - Если непонятно, какое именно устройство имеется в виду (например, свет есть в нескольких комнатах), не угадывай — вызови ask_user с коротким уточняющим вопросом.
 - После действия коротко подтверди, что сделал.
 - Числа и единицы говори словами так, как их произносят.
@@ -118,6 +120,85 @@ TOOLS = [
     },
 ]
 
+# Small local models sometimes write a tool call as plain text instead of making
+# it: get_state(sensor.x), light.turn_on(entity_id="light.y"), {"name": ..., "arguments": ...}
+_TOOL_NAMES = sorted(t["function"]["name"] for t in TOOLS)
+_TOOL_POSITIONAL = {
+    "get_state": ("entity_id",),
+    "ask_user": ("question",),
+    "list_entities": ("domain", "area"),
+    "call_service": ("domain", "service", "entity_id"),
+}
+_TEXT_ARGS = r"\(((?:\"[^\"]*\"|'[^']*'|[^()\"'])*)\)"
+_TEXT_TOOL_RE = re.compile(rf"\b({'|'.join(_TOOL_NAMES)})\s*{_TEXT_ARGS}")
+_TEXT_SERVICE_RE = re.compile(rf"\b({'|'.join(sorted(ACTION_DOMAINS))})\.([a-z0-9_]+)\s*{_TEXT_ARGS}")
+_TEXT_ARG_RE = re.compile(r"""(?:"[^"]*"|'[^']*'|[^,"'])+""")
+_TEXT_KWARG_RE = re.compile(r"(\w+)\s*[=:]\s*(.+)", re.S)
+
+
+def _parse_text_args(name: str, raw: str) -> dict[str, Any]:
+    positional: list[str] = []
+    args: dict[str, Any] = {}
+    for part in _TEXT_ARG_RE.findall(raw):
+        part = part.strip()
+        if not part:
+            continue
+        kw = _TEXT_KWARG_RE.fullmatch(part)
+        if kw:
+            args[kw.group(1)] = kw.group(2).strip().strip("\"'")
+        else:
+            positional.append(part.strip("\"'"))
+    if name == "call_service":
+        # call_service(light.turn_on, light.kitchen)
+        if positional and "." in positional[0]:
+            positional[:1] = positional[0].split(".", 1)
+        elif "." in str(args.get("service") or ""):
+            args["domain"], args["service"] = args["service"].split(".", 1)
+    for key, value in zip(_TOOL_POSITIONAL.get(name, ()), positional):
+        args.setdefault(key, value)
+    return args
+
+
+def _json_tool_calls(content: str) -> list[tuple[str, dict[str, Any]]]:
+    decoder = json.JSONDecoder()
+    found: list[tuple[str, dict[str, Any]]] = []
+    start = content.find("{")
+    while start >= 0:
+        try:
+            obj, end = decoder.raw_decode(content, start)
+        except ValueError:
+            start = content.find("{", start + 1)
+            continue
+        if isinstance(obj, dict) and obj.get("name") in _TOOL_NAMES:
+            args = obj.get("arguments") or obj.get("parameters") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {}
+            found.append((obj["name"], args if isinstance(args, dict) else {}))
+        start = content.find("{", end)
+    return found
+
+
+def text_tool_calls(content: str) -> list[dict[str, Any]]:
+    """Tool calls written in the reply text, in the shape of message.tool_calls."""
+    found = _json_tool_calls(content)
+    if not found:
+        found = [(m.group(1), _parse_text_args(m.group(1), m.group(2))) for m in _TEXT_TOOL_RE.finditer(content)]
+    if not found:
+        for m in _TEXT_SERVICE_RE.finditer(content):
+            args = _parse_text_args("get_state", m.group(3))
+            found.append(("call_service", {**args, "domain": m.group(1), "service": m.group(2)}))
+    return [
+        {
+            "id": f"text_{i}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        }
+        for i, (name, args) in enumerate(found)
+    ]
+
 
 @dataclass
 class AssistantResult:
@@ -145,6 +226,10 @@ class Assistant:
         self.audio: dict[int, bytes] = {}
         # how long answers take (for "обычно ~N с") and what is going on right now
         self.durations: deque[float] = deque(maxlen=10)
+        # the LLM alone: what the next answer is predicted from
+        self.llm_durations: deque[float] = deque(maxlen=10)
+        self._cached_system: str | None = None
+        self._prewarm_task: asyncio.Task | None = None
         self.busy: dict[str, Any] | None = None
         self._convs: dict[str, _Conversation] = {}
         self._session: aiohttp.ClientSession | None = None
@@ -186,7 +271,9 @@ class Assistant:
         speaker: str | None = None,
         device_id: str | None = None,
         room: str | None = None,
+        on_llm: Callable[[float | None], None] | None = None,
     ) -> AssistantResult:
+        """on_llm: called when the LLM is about to start, with the seconds it is expected to take."""
         s = self.settings.get()
         backend = s.assistant_backend
         conv = self._conv(conv_key)
@@ -196,12 +283,12 @@ class Assistant:
             if backend == "off":
                 result = AssistantResult(backend="off")
             elif backend == "openai":
-                result = await self._llm(text, conv, speaker, room)
+                result = await self._llm(text, conv, speaker, room, on_llm)
             else:
                 result = await self._ha(text, conv, device_id)
                 if result.error in FALLBACK_CODES and s.llm_fallback:
                     self._stage("HA не понял — спрашиваю LLM")
-                    result = await self._fallback(text, conv, speaker, result, room)
+                    result = await self._fallback(text, conv, speaker, result, room, on_llm)
         except (HaError, aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("Assistant %s failed: %s", backend, err)
             result = AssistantResult(speech="Не получилось связаться с сервером.", backend=backend, error=str(err))
@@ -212,8 +299,12 @@ class Assistant:
         if backend != "off":
             self.durations.append(time.monotonic() - t0)
         if not result.expect_reply and result.backend.endswith("openai"):
-            # keep the context briefly so "а теперь выключи" still works
-            conv.messages = conv.messages[-12:]
+            # keep the context briefly so "а теперь выключи" still works; it starts
+            # at a phrase: a tool answer without its call confuses the model
+            tail = conv.messages[-12:]
+            while tail and tail[0].get("role") != "user":
+                tail.pop(0)
+            conv.messages = tail
         return result
 
     # ------------------------------------------------------------- helpers
@@ -297,6 +388,7 @@ class Assistant:
                     "name": r["name"],
                     "domain": r.get("domain") or r["entity_id"].split(".", 1)[0],
                     "state": r.get("state") or "",
+                    "unit": r.get("unit") or "",
                     "hints": self._hints(r["entity_id"], catalog),
                     "enabled": self._exposed(r, catalog),
                 }
@@ -351,12 +443,18 @@ class Assistant:
         return AssistantResult(speech=speech, expect_reply=expect, backend="ha", actions=actions, error=err)
 
     async def _fallback(
-        self, text: str, conv: _Conversation, speaker: str | None, ha_result: AssistantResult, room: str | None = None
+        self,
+        text: str,
+        conv: _Conversation,
+        speaker: str | None,
+        ha_result: AssistantResult,
+        room: str | None = None,
+        on_llm: Callable[[float | None], None] | None = None,
     ) -> AssistantResult:
         """HA did not understand: let the LLM try. If it is not reachable, keep HA's answer."""
         keep = len(conv.messages)
         try:
-            result = await self._llm(text, conv, speaker, room)
+            result = await self._llm(text, conv, speaker, room, on_llm)
         except (HaError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
             _LOGGER.info("LLM fallback unavailable: %s", err)
             del conv.messages[keep:]
@@ -405,29 +503,83 @@ class Assistant:
             return
         t0 = time.monotonic()
         try:
-            await self._chat(
-                [{"role": "system", "content": await self._system()}, {"role": "user", "content": "привет"}], max_tokens=1
-            )
+            system = await self._system()
+            await self._chat([{"role": "system", "content": system}, {"role": "user", "content": "привет"}], max_tokens=1)
+            self._cached_system = system
             _LOGGER.info("LLM prompt cached in %.1f s", time.monotonic() - t0)
         except Exception as err:
             _LOGGER.info("LLM prewarm failed: %s", err)
 
-    async def _llm(self, text: str, conv: _Conversation, speaker: str | None, room: str | None = None) -> AssistantResult:
+    def schedule_prewarm(self, delay_s: float = 3.0) -> None:
+        """Once the changes stop: every tick in the device list would read the whole prompt again."""
+        if self._prewarm_task is not None:
+            self._prewarm_task.cancel()
+
+        async def later() -> None:
+            await asyncio.sleep(delay_s)
+            await self.prewarm()
+
+        self._prewarm_task = asyncio.create_task(later())
+
+    def _predict_llm_s(self, system: str) -> float | None:
+        """How long the LLM will take: the usual time of the last answers. The number
+        of tool steps is the model's own choice, so this is an estimate at best."""
+        if self._local_llm() and system != self._cached_system:
+            return float("inf")  # the whole device list has to be read first
+        if not self.llm_durations:
+            return None
+        return sorted(self.llm_durations)[len(self.llm_durations) // 2]
+
+    def _reads_as_ids(self, speech: str) -> bool:
+        domains = "|".join(re.escape(d) for d in self._domains())
+        return bool(re.search(rf"\b(?:{domains})\.[a-z0-9_]+\b|\b(?:{'|'.join(_TOOL_NAMES)})\b", speech))
+
+    async def _llm(
+        self,
+        text: str,
+        conv: _Conversation,
+        speaker: str | None,
+        room: str | None = None,
+        on_llm: Callable[[float | None], None] | None = None,
+    ) -> AssistantResult:
+        system = await self._system()
+        if on_llm is not None:
+            on_llm(self._predict_llm_s(system))
+        t0 = time.monotonic()
+        result = await self._llm_rounds(text, conv, speaker, room, system)
+        self._cached_system = system
+        self.llm_durations.append(time.monotonic() - t0)
+        return result
+
+    async def _llm_rounds(
+        self, text: str, conv: _Conversation, speaker: str | None, room: str | None, system: str
+    ) -> AssistantResult:
         ctx = [datetime.now().strftime("%A %d.%m.%Y %H:%M")]
         if speaker:
             ctx.append(f"говорит {speaker}")
         if room:
             ctx.append(f"колонка в комнате «{room}» — если комната не названа, речь о ней")
-        system = await self._system()
         conv.messages.append({"role": "user", "content": f"[{'; '.join(ctx)}]\n{text}"})
         result = AssistantResult(backend="openai")
         for step in range(MAX_TOOL_ROUNDS):
             self._stage("LLM думает" if step == 0 else f"LLM думает (шаг {step + 1})")
             msg = await self._chat([{"role": "system", "content": system}, *conv.messages])
             calls = msg.get("tool_calls") or []
+            content = (msg.get("content") or "").strip()
+            if not calls:
+                calls = text_tool_calls(content)
+                if calls:
+                    # stored as a real call: copied from the history, the text form would come back
+                    _LOGGER.info("LLM wrote a tool call as text, executing it: %r", content)
+                    msg = {"role": "assistant", "content": "", "tool_calls": calls}
+            if not calls and self._reads_as_ids(content):
+                _LOGGER.warning("LLM answer not spoken, it holds service names: %r", content)
+                result.speech = "Не получилось разобраться с запросом."
+                result.error = f"Модель ответила служебным текстом: {content[:200]}"
+                return result
             conv.messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
             if not calls:
-                result.speech = (msg.get("content") or "").strip()
+                result.speech = content
                 result.expect_reply = result.speech.endswith("?")
                 return result
             for call in calls:
