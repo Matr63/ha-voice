@@ -16,6 +16,7 @@ from gate_server import GateState, run_gate
 from ha_client import HaClient
 from llm import LlmManager
 from modes import Modes
+from notes import NotesBook
 from satellite import SatelliteHub
 from settings import SettingsStore
 from speakers import SpeakerStore
@@ -55,7 +56,7 @@ async def amain() -> None:
     tts_uri = os.environ.get("TTS_CLIENT_URI", "tcp://127.0.0.1:10351")
     tts_enabled = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
     ha = HaClient(settings)
-    assistant = Assistant(settings, ha)
+    assistant = Assistant(settings, ha, NotesBook(Path(os.environ.get("NOTES_FILE", "/data/notes.json"))))
     modes = Modes(settings)
     hub = SatelliteHub(settings, runtime, assistant, stt_uri, tts_uri, modes, ha)
     assistant.hub = hub

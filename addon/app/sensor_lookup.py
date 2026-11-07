@@ -25,9 +25,16 @@ _ACTION_STEMS = (
     "пониз", "повыс", "измени", "настрой", "увелич", "уменьш",
 )
 _OTHER_STEMS = (
-    "почему", "зачем", "когда", "вчера", "завтра", "будет", "была", "был", "прогноз", "погод", "улиц", "снаружи",
+    "почему", "зачем", "когда", "вчера", "завтра", "будет", "была", "был", "прогноз", "погод",
     "средн", "минимал", "максимал", "выше", "ниже", "больше", "меньше", "разниц", "сравн",
 )
+# «температура на улице»: a sensor with that hint, otherwise the weather entity
+_OUTSIDE_STEMS = ("улиц", "снаруж")
+WEATHER_ATTRS = {
+    "температура": ("temperature", "temperature_unit"),
+    "влажность": ("humidity", ""),
+    "давление": ("pressure", "pressure_unit"),
+}
 _PREPS = {"в", "во", "внутри", "на", "у", "около", "возле", "рядом", "под", "над", "за", "при", "с", "со", "из"}
 _INSIDE = {"в", "во", "внутри"}
 _STOP = {
@@ -35,6 +42,7 @@ _STOP = {
     "проверь", "там", "тут", "здесь", "а", "и", "ну", "мне", "пожалуйста", "дома", "доме", "дом", "это", "что", "как",
     "есть", "сегодня", "текущая", "текущую", "значение", "показания", "датчик", "датчика", "датчике", "датчиков",
     "комната", "комнате", "комнаты", "этой", "этом", "нас", "тебя", "меня", "же", "ли", "по", "от", "о",
+    "которая", "который", "которое", "которую",
 }
 MAX_WORDS = 10
 MAX_ANSWERS = 2
@@ -46,6 +54,7 @@ class Lookup:
     rows: list[dict[str, Any]] = field(default_factory=list)
     missing: str = ""                # the place was named, but there is no such sensor
     scores: dict[str, int] = field(default_factory=dict)
+    where: str = ""                  # the place as it was said: the answer repeats it
 
 
 def _norm(text: str) -> str:
@@ -88,6 +97,10 @@ def asked_measure(text: str) -> str | None:
     return next((m for m, (stems, _, _) in MEASURES.items() if _has_stem(words, stems)), None)
 
 
+def asks_outside(text: str) -> bool:
+    return _has_stem(_words(_first_sentence(text)), _OUTSIDE_STEMS)
+
+
 def _place_tokens(words: list[str], measure: str) -> list[tuple[str, str]]:
     """(word, its preposition) for the words that can name a place."""
     stems = MEASURES[measure][0]
@@ -111,8 +124,13 @@ def _is_measure(row: dict[str, Any], measure: str) -> bool:
     return any(n in _norm(f"{row.get('name', '')} {row.get('entity_id', '')}") for n in names)
 
 
-def find_sensors(text: str, rows: list[dict[str, Any]], hints: dict[str, str], room_hints: dict[str, str], room: str | None) -> Lookup | None:
-    """rows: sensors the assistant may see. hints: entity_id -> its hints. room: where the board is."""
+def find_sensors(
+    text: str, rows: list[dict[str, Any]], hints: dict[str, str], room_hints: dict[str, str], room: str | None,
+    followup: bool = False,
+) -> Lookup | None:
+    """rows: sensors the assistant may see. hints: entity_id -> its hints. room: where the board is.
+    followup: the measure came from the previous question («а в зале?»), so every word
+    has to name a place: «свет в зале» is not about the temperature."""
     sentence = _first_sentence(text)
     words = _words(sentence)
     if not words or len(words) > MAX_WORDS:
@@ -161,6 +179,8 @@ def find_sensors(text: str, rows: list[dict[str, Any]], hints: dict[str, str], r
                 total += 1
                 matched.add(token)
         scores[r["entity_id"]] = total
+    if followup and (not named or any(token not in matched for token, _ in tokens)):
+        return None
     if not named and not any(scores.values()):
         scores = {r["entity_id"]: 1 for r in sensors}
 
@@ -172,7 +192,8 @@ def find_sensors(text: str, rows: list[dict[str, Any]], hints: dict[str, str], r
         where = next((f"{prep} {token}" for token, prep in tokens if prep), "")
         return Lookup(measure, missing=where, scores=scores) if where else None
     top = [r for r in sensors if scores[r["entity_id"]] == best]
-    return Lookup(measure, rows=top[:MAX_ANSWERS], scores=scores)
+    where = next((f"{prep} {token}" for token, prep in tokens if prep and named and token in matched), "")
+    return Lookup(measure, rows=top[:MAX_ANSWERS], scores=scores, where=where)
 
 
 # ------------------------------------------------------------- spoken values

@@ -19,13 +19,15 @@ from collections import deque
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from difflib import get_close_matches
+from difflib import get_close_matches, ndiff
+from pathlib import Path
 from typing import Any, Callable
 
 import aiohttp
 
 from ha_client import HaClient, HaError
-from sensor_lookup import MAX_ANSWERS, asked_measure, find_sensors, spoken_value
+from notes import NOTES_RULES, NOTES_TOOLS, NotesBook, Reply, in_domain
+from sensor_lookup import MAX_ANSWERS, WEATHER_ATTRS, asked_measure, asks_outside, find_sensors, spoken_value
 from settings import SettingsStore
 
 _LOGGER = logging.getLogger("ha-voice.assistant")
@@ -59,7 +61,7 @@ ACTION_DOMAINS = {
     "input_boolean", "vacuum", "humidifier", "lock", "valve", "water_heater", "button", "input_button",
 }
 
-SYSTEM_PROMPT = """Ты — голосовой ассистент умного дома Home Assistant. Тебя слышат через колонку, ответ озвучивается.
+SYSTEM_RULES = """Ты — голосовой ассистент умного дома Home Assistant. Тебя слышат через колонку, ответ озвучивается.
 Правила:
 - Отвечай по-русски, коротко: одно-два предложения, без markdown, списков и эмодзи.
 - Чтобы управлять устройствами, вызывай call_service. Чтобы узнать состояние — get_state или list_entities.
@@ -73,13 +75,20 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент умного �
 - Текущие значения датчиков и состояния устройств узнавай через get_state.
 - Никогда не отвечай «сейчас узнаю», «посмотрю», «проверю»: второго шанса не будет. Сразу вызови функцию и ответь результатом.
 - Одинаковые имена датчиков в одной комнате — это разные приборы; смотри имя прибора и подсказки.
-- В начале сообщения пользователя в квадратных скобках — время, кто говорит и комната колонки.
-Справочник устройств: комната, в ней прибор, в нём entity_id — имя (подсказки).
-{entities}
-{extra}"""
+- В начале сообщения пользователя в квадратных скобках — время, кто говорит и комната колонки."""
+CATALOG_HEADER = "Справочник устройств: комната, в ней прибор, в нём entity_id — имя (подсказки)."
 # The system prompt holds nothing that changes between requests (no time, no
 # states): llama.cpp then reuses its cache and reads only the new words, instead
 # of the whole device list on every command (tens of seconds on a CPU).
+PROMPT_NAMES = {"home": "дом", "notes": "списки и заметки"}
+# llama-server slots: each prompt keeps its own place in the cache
+SLOT_HOME = 0
+SLOT_NOTES = 1
+# how long a question back waits for its answer; later the phrase is a new command
+PENDING_TTL_S = 45
+# «а в зале?» right after «температура на кухне»
+FOLLOWUP_TTL_S = 120
+MAX_DIFF_LINES = 60
 
 TOOLS = [
     {
@@ -229,6 +238,9 @@ _PROMISE_RE = re.compile(
     re.IGNORECASE,
 )
 PROMISE_NUDGE = "(Не обещай. Вызови нужную функцию прямо сейчас и ответь результатом.)"
+# «двадцать четыре и десять десятых градуса» with nothing read: a value written in
+# words, as the rules ask, is made up just the same as one written in digits
+_SPOKEN_VALUE_RE = re.compile(r"\b(?:градус|процент|гектопаскал|люкс|миллиметр)", re.IGNORECASE)
 
 
 def is_promise(content: str) -> bool:
@@ -250,12 +262,22 @@ class _Conversation:
     updated: float
     ha_conversation_id: str | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # a question about a list waiting for its answer
+    pending: dict[str, Any] | None = None
+    pending_until: float = 0.0
+    # what the last direct answer measured, for «а в зале?»
+    last_measure: str = ""
+    last_measure_at: float = 0.0
 
 
 class Assistant:
-    def __init__(self, settings: SettingsStore, ha: HaClient) -> None:
+    def __init__(self, settings: SettingsStore, ha: HaClient, notes: NotesBook | None = None) -> None:
         self.settings = settings
         self.ha = ha
+        self.notes = notes or NotesBook(Path("/data/notes.json"))
+        # the prompt last sent, per prompt: the log shows only what changed
+        self._last_prompts: dict[str, str] = {}
+        self._cached_notes: str | None = None
         self.log: deque[dict[str, Any]] = deque(maxlen=200)
         self._next_id = 1
         # command audio by log id: "чей это голос?" in the log teaches the voice
@@ -327,7 +349,10 @@ class Assistant:
         _trace.set(trace)
         _note("input", text=text, backend=backend, room=room, speaker=speaker, device_id=device_id)
         try:
-            if backend == "off":
+            notes = await self._notes(text, conv, speaker, on_llm) if backend != "off" and s.notes_enabled else None
+            if notes is not None:
+                result = notes
+            elif backend == "off":
                 result = AssistantResult(backend="off")
             elif backend == "openai":
                 result = await self._llm(text, conv, speaker, room, on_llm)
@@ -558,8 +583,50 @@ class Assistant:
                 break
         return "\n".join(lines) if lines else "(нет доступных устройств — отметьте их на вкладке «Устройства»)"
 
+    def _rules(self) -> str:
+        return self.settings.get().llm_system_prompt.strip() or SYSTEM_RULES
+
+    def _notes_rules(self) -> str:
+        return self.settings.get().llm_notes_prompt.strip() or NOTES_RULES
+
     async def _system(self) -> str:
-        return SYSTEM_PROMPT.format(entities=await self._entities_text(), extra=self.settings.get().llm_prompt.strip())
+        parts = [self._rules(), CATALOG_HEADER, await self._entities_text()]
+        extra = self.settings.get().llm_prompt.strip()
+        if extra:
+            parts.append(extra)
+        return "\n".join(parts)
+
+    async def prompt_view(self) -> dict[str, Any]:
+        """The prompts as the panel shows them: rules to edit, the rest is assembled."""
+        s = self.settings.get()
+        full = await self._system()
+        return {
+            "home": {
+                "rules": self._rules(),
+                "default": SYSTEM_RULES,
+                "custom": bool(s.llm_system_prompt.strip()),
+                "catalog": f"{CATALOG_HEADER}\n{await self._entities_text()}",
+                "chars": len(full),
+            },
+            "notes": {
+                "rules": self._notes_rules(),
+                "default": NOTES_RULES,
+                "custom": bool(s.llm_notes_prompt.strip()),
+                "chars": len(self._notes_rules()),
+            },
+        }
+
+    def _note_prompt(self, name: str, text: str) -> None:
+        """The prompt is long and nearly always the same: the log says so, or shows the change."""
+        last = self._last_prompts.get(name)
+        self._last_prompts[name] = text
+        data: dict[str, Any] = {"name": PROMPT_NAMES.get(name, name), "chars": len(text)}
+        if last is None:
+            data["first"] = True
+        elif last != text:
+            changed = [ln for ln in ndiff(last.splitlines(), text.splitlines()) if ln[:1] in "+-"]
+            data["changes"] = changed[:MAX_DIFF_LINES]
+        _note("system", **data)
 
     def _local_llm(self) -> bool:
         return self.settings.get().llm_url.rstrip("/").startswith("http://127.0.0.1:10360")
@@ -574,6 +641,15 @@ class Assistant:
             await self._chat([{"role": "system", "content": system}, {"role": "user", "content": "привет"}], max_tokens=1)
             self._cached_system = system
             _LOGGER.info("LLM prompt cached in %.1f s", time.monotonic() - t0)
+            if self.settings.get().notes_enabled:
+                t0 = time.monotonic()
+                rules = self._notes_rules()
+                await self._chat(
+                    [{"role": "system", "content": rules}, {"role": "user", "content": "привет"}],
+                    max_tokens=1, tools=NOTES_TOOLS, slot=SLOT_NOTES,
+                )
+                self._cached_notes = rules
+                _LOGGER.info("LLM notes prompt cached in %.1f s", time.monotonic() - t0)
         except Exception as err:
             _LOGGER.info("LLM prewarm failed: %s", err)
 
@@ -638,13 +714,37 @@ class Assistant:
             parts.append(f"{attrs.get('friendly_name') or 'Значение'}: {value}")
         return ". ".join(parts) + "." if parts else ""
 
+    async def _outside_read(self, measure: str, rows: list[dict[str, Any]], catalog: dict[str, Any]) -> tuple[str, str] | None:
+        """«Температура на улице» with no such sensor: the weather entity knows. (value, unit)"""
+        attr, unit_attr = WEATHER_ATTRS.get(measure, ("", ""))
+        weather = [r for r in rows if r.get("domain") == "weather"]
+        if not attr or not weather:
+            return None
+        weather.sort(key=lambda r: "улиц" not in self._hints(r["entity_id"], catalog).lower())
+        attrs = (await self.ha.state(weather[0]["entity_id"])).get("attributes") or {}
+        if attrs.get(attr) is None:
+            return None
+        unit = str(attrs.get(unit_attr) or "") if unit_attr else "%"
+        _note("direct", measure=measure, chosen=[weather[0]["entity_id"]], attribute=attr)
+        return str(attrs[attr]), unit
+
     async def _direct_read(self, text: str, conv: _Conversation, room: str | None) -> AssistantResult | None:
         """A question about a sensor's value: answered from HA itself, see sensor_lookup."""
         try:
             catalog = self._catalog()
             rows = [r for r in await self._all_rows() if self._exposed(r, catalog)]
             hints = {r["entity_id"]: self._hints(r["entity_id"], catalog) for r in rows}
-            found = find_sensors(text, rows, hints, self.room_hints(), room)
+            now = time.time()
+            followup = not asked_measure(text) and bool(conv.last_measure) and now - conv.last_measure_at < FOLLOWUP_TTL_S
+            asked = f"{conv.last_measure} {text}" if followup else text
+            found = find_sensors(asked, rows, hints, self.room_hints(), room, followup=followup)
+            measure = found.measure if found is not None else asked_measure(asked)
+            if measure and asks_outside(asked) and (found is None or not found.rows):
+                outside = await self._outside_read(measure, rows, catalog)
+                if outside is not None:
+                    speech = f"На улице, {measure} {spoken_value(outside[0], outside[1], measure)}."
+                    conv.last_measure, conv.last_measure_at = measure, now
+                    return AssistantResult(speech=speech, backend="direct")
             if found is None:
                 return None
             parts = []
@@ -658,6 +758,8 @@ class Assistant:
                 place = row.get("area") or row.get("device") or row["name"]
                 if len(found.rows) > 1:
                     place = f"{place}, {row.get('device') or row['name']}"
+                elif found.where:
+                    place = found.where.capitalize()  # the way it was asked: «в спальне», not «Кабинет»
                 parts.append(f"{place}, {found.measure} {said}")
         except HaError as err:
             _LOGGER.info("Sensor lookup failed, asking the LLM: %s", err)
@@ -667,8 +769,79 @@ class Assistant:
             "direct", measure=found.measure, scores=found.scores, chosen=[r["entity_id"] for r in found.rows],
             missing=found.missing, speech=speech,
         )
-        conv.messages += [{"role": "user", "content": text}, {"role": "assistant", "content": speech}]
+        # not in the model's history: it copies old numbers from there instead of reading
+        conv.last_measure, conv.last_measure_at = found.measure, time.time()
         return AssistantResult(speech=speech, backend="direct")
+
+    # ------------------------------------------------- lists, notes, journal
+    def _notes_result(self, reply: Reply, conv: _Conversation, backend: str = "notes") -> AssistantResult:
+        conv.pending = reply.pending
+        conv.pending_until = time.time() + PENDING_TTL_S if reply.pending else 0.0
+        _note("notes", speech=reply.speech, pending=reply.pending, actions=reply.actions)
+        return AssistantResult(speech=reply.speech, expect_reply=reply.expect_reply, backend=backend, actions=reply.actions)
+
+    async def _notes(
+        self, text: str, conv: _Conversation, speaker: str | None, on_llm: Callable[[float | None], None] | None
+    ) -> AssistantResult | None:
+        """The first stop of every phrase, and instant. None: not about lists."""
+        pending, conv.pending = conv.pending, None
+        if pending and time.time() < conv.pending_until:
+            if pending.get("op") == "again":
+                # the model asked: it hears its own command again, now with the answer
+                return await self._notes_llm(f"{pending.get('text', '')}. {text}", conv, speaker, on_llm)
+            reply = self.notes.answer(text, pending, speaker)
+            if reply is not None:
+                return self._notes_result(reply, conv)
+        reply = self.notes.handle(text, speaker)
+        if reply is not None:
+            return self._notes_result(reply, conv)
+        if in_domain(text) and self._llm_usable():
+            return await self._notes_llm(text, conv, speaker, on_llm)
+        return None
+
+    def _llm_usable(self) -> bool:
+        s = self.settings.get()
+        return bool(s.llm_url) and (s.assistant_backend == "openai" or s.llm_fallback)
+
+    async def _notes_llm(
+        self, text: str, conv: _Conversation, speaker: str | None, on_llm: Callable[[float | None], None] | None
+    ) -> AssistantResult | None:
+        """About lists, but in words the code cannot read: a short prompt and one call.
+        The model only says what to do; the same code does it and words the answer."""
+        rules = self._notes_rules()
+        self._note_prompt("notes", rules)
+        self._stage("LLM разбирает команду про списки")
+        if on_llm is not None:
+            cached = not self._local_llm() or rules == self._cached_notes
+            on_llm(None if cached else float("inf"))
+        messages = [
+            {"role": "system", "content": rules},
+            {"role": "user", "content": f"[{self.notes.names_line()}]\n{text}"},
+        ]
+        try:
+            msg = await self._chat(messages, max_tokens=120, tools=NOTES_TOOLS, slot=SLOT_NOTES)
+        except (HaError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            _LOGGER.info("LLM for notes unavailable: %s", err)
+            return None
+        self._cached_notes = rules
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            found = _json_tool_calls((msg.get("content") or "").strip())
+            calls = [{"function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}} for n, a in found]
+        if not calls:
+            return self._notes_result(
+                Reply("Не поняла, что сделать со списком. Скажите, например: добавь в список покупок молоко."), conv
+            )
+        fn = calls[0].get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        _note("tool", name=fn.get("name"), args=args)
+        reply = self.notes.run_tool(fn.get("name", ""), args, speaker)
+        if reply.pending and reply.pending.get("op") == "again":
+            reply.pending["text"] = text
+        return self._notes_result(reply, conv, "notes+llm")
 
     async def _llm(
         self,
@@ -683,7 +856,7 @@ class Assistant:
             if direct is not None:
                 return direct
         system = await self._system()
-        _note("system", content=system)
+        self._note_prompt("home", system)
         if on_llm is not None:
             on_llm(self._predict_llm_s(system))
         t0 = time.monotonic()
@@ -721,7 +894,9 @@ class Assistant:
                     _LOGGER.info("LLM wrote a tool call as text, executing it: %r", content)
                     msg = {"role": "assistant", "content": "", "tool_calls": calls}
             # a number nobody has read: the model made it up («22 градусов»)
-            invented = not calls and not tools_ran and bool(re.search(r"\d", content)) and bool(asked_measure(text))
+            invented = not calls and not tools_ran and (
+                (bool(re.search(r"\d", content)) and bool(asked_measure(text))) or bool(_SPOKEN_VALUE_RE.search(content))
+            )
             if invented or (not calls and self._reads_as_ids(content)):
                 _LOGGER.info("LLM wrote service names or an unread value instead of an answer: %r", content)
                 if not tools_ran:
@@ -781,19 +956,25 @@ class Assistant:
         return result
 
     async def _chat(
-        self, messages: list[dict[str, Any]], max_tokens: int = 300, tool_choice: str | None = None
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 300,
+        tool_choice: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        slot: int = SLOT_HOME,
     ) -> dict[str, Any]:
         s = self.settings.get()
         headers = {"Content-Type": "application/json"}
         if s.llm_api_key:
             headers["Authorization"] = f"Bearer {s.llm_api_key}"
         body: dict[str, Any] = {
-            "model": s.llm_model, "messages": messages, "tools": TOOLS, "temperature": 0.2, "max_tokens": max_tokens,
+            "model": s.llm_model, "messages": messages, "tools": tools or TOOLS, "temperature": 0.2, "max_tokens": max_tokens,
         }
         if tool_choice:
             body["tool_choice"] = tool_choice
         if self._local_llm():
             body["cache_prompt"] = True
+            body["id_slot"] = slot
         session = await self._http()
         _note(
             "llm_request", model=s.llm_model, tool_choice=tool_choice,

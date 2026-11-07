@@ -231,7 +231,10 @@ def create_app(ctx: AppContext) -> web.Application:
             await hub.set_sleep(hub.modes.sleeping(), "panel")
         if before["sat_rooms"] != after["sat_rooms"]:
             await hub.refresh_rooms()
-        if any(before.get(k) != after.get(k) for k in ("entity_catalog", "assistant_domains", "llm_prompt")):
+        if any(
+            before.get(k) != after.get(k)
+            for k in ("entity_catalog", "assistant_domains", "llm_prompt", "llm_system_prompt", "llm_notes_prompt")
+        ):
             assistant.invalidate_entities()
             asyncio.create_task(assistant.prewarm())
         if any(before[k] != after[k] for k in ("thinking_cue", "thinking_phrases", "tts_voice")):
@@ -744,6 +747,49 @@ def create_app(ctx: AppContext) -> web.Application:
     async def assistant_agents(_: web.Request) -> web.Response:
         return web.json_response({"agents": await ctx.ha.agents()})
 
+    async def assistant_prompt(_: web.Request) -> web.Response:
+        return web.json_response(await assistant.prompt_view())
+
+    # ------------------------------------------------- lists, notes, journal
+    async def notes_list(_: web.Request) -> web.Response:
+        return web.json_response({"collections": assistant.notes.all()})
+
+    async def notes_create(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        return web.json_response(assistant.notes.create(data.get("name") or "", data.get("kind") or "list"))
+
+    async def notes_rename(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        try:
+            return web.json_response(assistant.notes.rename(request.match_info["cid"], data.get("name") or ""))
+        except KeyError:
+            return _err("Такой записи нет", 404)
+
+    async def notes_delete(request: web.Request) -> web.Response:
+        try:
+            assistant.notes.delete(request.match_info["cid"])
+        except KeyError:
+            return _err("Такой записи нет", 404)
+        return web.json_response({"ok": True})
+
+    async def notes_add_item(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        text = str(data.get("text") or "").strip()
+        if not text:
+            raise ValueError("Введите текст")
+        try:
+            assistant.notes.add_items(request.match_info["cid"], [text])
+            return web.json_response(assistant.notes.get(request.match_info["cid"]))
+        except KeyError:
+            return _err("Такой записи нет", 404)
+
+    async def notes_delete_item(request: web.Request) -> web.Response:
+        try:
+            assistant.notes.remove_item(request.match_info["cid"], request.match_info["item_id"])
+        except KeyError:
+            return _err("Такой записи нет", 404)
+        return web.json_response(assistant.notes.get(request.match_info["cid"]))
+
     async def ha_media_players(_: web.Request) -> web.Response:
         states = await ctx.ha.request("GET", "/states")
         players = [
@@ -921,6 +967,13 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_post("/api/assistant/log/{entry_id:\\d+}/assign", assistant_log_assign)
     r.add_post("/api/assistant/ask", assistant_ask)
     r.add_get("/api/assistant/agents", assistant_agents)
+    r.add_get("/api/assistant/prompt", assistant_prompt)
+    r.add_get("/api/notes", notes_list)
+    r.add_post("/api/notes", notes_create)
+    r.add_patch("/api/notes/{cid}", notes_rename)
+    r.add_delete("/api/notes/{cid}", notes_delete)
+    r.add_post("/api/notes/{cid}/items", notes_add_item)
+    r.add_delete("/api/notes/{cid}/items/{item_id}", notes_delete_item)
     r.add_get("/api/ha", ha_status)
     r.add_get("/api/ha/media_players", ha_media_players)
     r.add_get("/api/wake/models", wake_models)

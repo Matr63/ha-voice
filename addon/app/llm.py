@@ -279,8 +279,10 @@ class LlmManager:
             "--alias", path.stem, "-c", str(s.llm_ctx), "-t", str(threads),
             # chat template from the GGUF: tool calling needs it
             "--jinja",
-            # one voice at a time: the whole context and its prompt cache for one slot
-            "-np", "1",
+            # one voice at a time, two prompts: the house with its devices and the short
+            # one for lists. A slot each, so neither pushes the other out of the cache
+            # (reading the device list again takes tens of seconds); the context is shared
+            "-np", "2", "--kv-unified",
         ]
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "wb")

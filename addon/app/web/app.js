@@ -4,7 +4,7 @@
   const BASE = String(window.HV_BASE || "").replace(/\/+$/, "");
   const PAGE = 50;
   const POLL_MS = 4000;
-  const TABS = ["speaker", "diary", "voices", "tts", "assistant", "devices", "settings"];
+  const TABS = ["speaker", "diary", "voices", "tts", "assistant", "notes", "devices", "settings"];
   const TAB_ALIASES = { overview: "speaker", assist: "assistant", test: "voices", catalog: "devices" };
   const SECURE = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
 
@@ -30,6 +30,8 @@
     check: '<polyline points="20 6 9 17 4 12"/>',
     x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
     book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/>',
+    list: '<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
     wave: '<path d="M2 12h2"/><path d="M6 8v8"/><path d="M10 4v16"/><path d="M14 7v10"/><path d="M18 9v6"/><path d="M22 12h-2"/>',
     info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
     alert: '<path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
@@ -2061,7 +2063,14 @@
   };
 
   async function loadAssistant() {
-    const jobs = [api("/api/assistant/log?limit=100").then((r) => { state.assistantLog = r.log || []; }), loadLlm().catch(() => {})];
+    const jobs = [
+      api("/api/assistant/log?limit=100").then((r) => {
+        state.assistantLog = r.log || [];
+        state.assistantLogKey = JSON.stringify(state.assistantLog);
+      }),
+      loadLlm().catch(() => {}),
+      loadPrompt().catch(() => { state.prompt = null; }),
+    ];
     if (!state.wakeModels) jobs.push(api("/api/wake/models").then((r) => { state.wakeModels = r.models || []; }));
     if (!state.agents)
       jobs.push(
@@ -2072,27 +2081,111 @@
     await Promise.all(jobs);
   }
 
+  const loadPrompt = async () => { state.prompt = await api("/api/assistant/prompt"); };
+
   const TRACE_TITLES = {
     input: "Запрос к ассистенту",
-    system: "Системный промпт модели",
     llm_request: "Сообщения, отправленные модели",
     llm_reply: "Ответ модели",
     tool: "Вызов функции и результат",
     direct: "Датчик найден без модели",
+    notes: "Списки и заметки: без модели",
     ha_request: "Запрос к Home Assistant",
     ha_reply: "Ответ Home Assistant",
   };
+  const TRACE_ROLES = { user: "Запрос", assistant: "Модель", tool: "Результат функции" };
+
+  function traceMessage(m) {
+    const calls = (m.tool_calls || []).map((c) => `${(c.function || {}).name}(${(c.function || {}).arguments || ""})`);
+    return `${TRACE_ROLES[m.role] || m.role}: ${[m.content, ...calls].filter(Boolean).join("\n")}`;
+  }
+
+  function traceBody(kind, data) {
+    if (kind === "llm_request" && data.messages) return data.messages.map(traceMessage).join("\n\n");
+    if (kind === "llm_reply" && data.message) {
+      const u = data.usage || {};
+      const cached = (u.prompt_tokens_details || {}).cached_tokens;
+      const stats = [
+        data.seconds != null ? `${data.seconds} с` : "",
+        u.prompt_tokens != null ? `прочитано токенов: ${u.prompt_tokens}${cached != null ? `, из них из кеша: ${cached}` : ""}` : "",
+        u.completion_tokens != null ? `написано: ${u.completion_tokens}` : "",
+      ].filter(Boolean).join(" · ");
+      return `${traceMessage(data.message)}${stats ? `\n\n${stats}` : ""}`;
+    }
+    return JSON.stringify(data, null, 2);
+  }
+
+  // The prompt is the same on nearly every command, so a command shows only what
+  // changed; the text itself lives in the «Промпт модели» card.
+  function tracePrompt(data) {
+    const head = `Системный промпт «${esc(data.name)}» · ${data.chars} символов`;
+    if (data.changes) {
+      return `<div class="small trace-title">${head} · изменился с прошлого раза</div><pre class="trace-pre">${esc(data.changes.join("\n"))}</pre>`;
+    }
+    return `<div class="small trace-title">${head} <span class="muted" style="font-weight:400">· ${data.first ? "первый запрос после запуска" : "без изменений"}, текст — в блоке «Промпт модели»</span></div>`;
+  }
 
   function traceHtml(trace) {
     if (!trace) return `<div class="small muted">Загружаю…</div>`;
-    return trace.map(({ kind, ...data }) => {
-      const body = kind === "system" ? data.content : JSON.stringify(data, null, 2);
-      const title = TRACE_TITLES[kind] || kind;
-      // the prompt is long and the same every time: closed until asked for
-      return kind === "system"
-        ? `<details><summary class="small">${esc(title)} · ${String(body).length} символов</summary><pre class="trace-pre">${esc(body)}</pre></details>`
-        : `<div class="small trace-title">${esc(title)}</div><pre class="trace-pre">${esc(body)}</pre>`;
-    }).join("");
+    return trace.map(({ kind, ...data }) => (kind === "system"
+      ? tracePrompt(data)
+      : `<div class="small trace-title">${esc(TRACE_TITLES[kind] || kind)}</div><pre class="trace-pre">${esc(traceBody(kind, data))}</pre>`
+    )).join("");
+  }
+
+  function promptCard() {
+    const p = state.prompt;
+    if (!p) return `<h3>${icon("edit")}Промпт модели</h3><p class="card-sub">Не удалось получить.</p>`;
+    const s = state.settings;
+    const mark = (x) => (x.custom ? `<span class="pill" style="margin-left:6px">изменён</span>` : "");
+    return `
+      <h3>${icon("edit")}Промпт модели</h3>
+      <p class="card-sub">Текст один и тот же для каждой команды, поэтому в журнале показываются только его изменения. Значения датчиков и обычные команды про списки выполняются сразу, без модели; модель получает только то, что не понял код. После сохранения модель перечитает новый текст заранее.</p>
+      <div class="field">
+        <label for="f_llm_system_prompt">Правила: дом${mark(p.home)} <span class="small muted">· весь промпт ${p.home.chars} символов</span></label>
+        <textarea class="input prompt-text" id="f_llm_system_prompt" name="llm_system_prompt" rows="16" spellcheck="false">${esc(p.home.rules)}</textarea>
+        <div class="row" style="margin-top:4px"><button type="button" class="btn ghost sm" data-prompt-reset="llm_system_prompt">${icon("refresh")}Вернуть стандартный текст</button></div>
+      </div>
+      <div class="field"><label for="f_llm_prompt">Дополнительные указания</label><textarea class="input" id="f_llm_prompt" name="llm_prompt" rows="2" placeholder="Например: обращайся ко мне на «ты», детскую называй комнатой Маши">${esc(s.llm_prompt || "")}</textarea><div class="hint">Дописываются в конец промпта «дом».</div></div>
+      <details style="margin-bottom:12px"><summary class="small">Справочник устройств — собирается сам из вкладки «Устройства», ${p.home.catalog.length} символов</summary><pre class="trace-pre">${esc(p.home.catalog)}</pre></details>
+      <div class="field">
+        <label for="f_llm_notes_prompt">Правила: списки и заметки${mark(p.notes)} <span class="small muted">· короткий промпт, не сбрасывает кеш большого</span></label>
+        <textarea class="input prompt-text" id="f_llm_notes_prompt" name="llm_notes_prompt" rows="7" spellcheck="false">${esc(p.notes.rules)}</textarea>
+        <div class="row" style="margin-top:4px"><button type="button" class="btn ghost sm" data-prompt-reset="llm_notes_prompt">${icon("refresh")}Вернуть стандартный текст</button></div>
+      </div>
+      ${saveRow()}`;
+  }
+
+  function bindPromptForm() {
+    const form = $("#promptForm");
+    if (!form) return;
+    form.innerHTML = promptCard();
+    const standard = { llm_system_prompt: () => state.prompt.home.default, llm_notes_prompt: () => state.prompt.notes.default };
+    form.onclick = (e) => {
+      const b = e.target.closest("[data-prompt-reset]");
+      if (b) form.elements[b.dataset.promptReset].value = standard[b.dataset.promptReset]();
+    };
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      if (!state.prompt) return;
+      // the standard text is stored as empty: a new version of it then reaches this setup too
+      const value = (name) => {
+        const v = form.elements[name].value.trim();
+        return v === standard[name]().trim() ? "" : v;
+      };
+      try {
+        state.settings = await postJson("/api/settings", {
+          llm_system_prompt: value("llm_system_prompt"),
+          llm_notes_prompt: value("llm_notes_prompt"),
+          llm_prompt: form.elements.llm_prompt.value,
+        });
+        await loadPrompt();
+        bindPromptForm();
+        toast("Промпт сохранён");
+      } catch (err) {
+        showError(err);
+      }
+    };
   }
 
   async function onTraceToggle(ev) {
@@ -2140,6 +2233,8 @@
           ${e.error ? `<div class="small bad" style="margin-top:4px">${esc(HA_ERRORS[e.error] || e.error)}</div>` : ""}
           ${e.backend === "ha+openai" ? `<div class="small muted" style="margin-top:4px">HA не понял — ответила LLM</div>` : ""}
           ${e.backend === "direct" ? `<div class="small muted" style="margin-top:4px">Без модели: датчик найден по комнатам и подсказкам</div>` : ""}
+          ${e.backend === "notes" ? `<div class="small muted" style="margin-top:4px">Без модели: команда про списки и заметки</div>` : ""}
+          ${e.backend === "notes+llm" ? `<div class="small muted" style="margin-top:4px">Списки и заметки: фразу разобрала модель</div>` : ""}
           ${e.heard && e.heard !== e.text ? `<div class="small muted" style="margin-top:4px">Распознано целиком: «${esc(e.heard)}»</div>` : ""}
           ${e.has_trace ? `<details class="trace" data-trace="${e.id}" ${(state.traceOpen || new Set()).has(e.id) ? "open" : ""}><summary class="small">Что ушло ассистенту и что вернулось</summary><div class="trace-body">${traceHtml((state.traces || {})[e.id])}</div></details>` : ""}
           ${e.has_audio ? `<audio controls preload="none" src="${BASE}/api/assistant/log/${e.id}/audio" style="height:30px;margin-top:6px;max-width:100%"></audio>` : ""}
@@ -2350,12 +2445,12 @@
             ${switchField("llm_fallback", "Если HA не понял — спросить LLM", s.llm_fallback, "Встроенный агент знает только свои шаблоны («какая температура на кухне») и точные имена устройств. Остальное («выключи тв», «температура кухни») разберёт LLM ниже — своя модель на этом сервере или Ollama.")}
           </div>
           ${switchField("direct_reads", "Значения датчиков — без модели", s.direct_reads, "«Температура в зале», «влажность на кухне»: датчик находится по комнатам и подсказкам на вкладке «Устройства», значение берётся из HA. Быстро и без выдуманных чисел. Всё остальное идёт в LLM.")}
+          ${switchField("notes_enabled", "Списки, заметки и журнал голосом", s.notes_enabled, "«Добавь в список покупок на дачу молоко», «какие есть списки», «запиши заметку», «запиши в журнал». Записи видны на вкладке <a href=\"#notes\">Списки</a>.")}
           <div data-show="openai ha">
             ${textField("llm_url", "Адрес API", s.llm_url, "Ollama на этом ПК: <span class='mono'>http://127.0.0.1:11434/v1</span> (в compose — <span class='mono'>http://host.docker.internal:11434/v1</span>)")}
             ${textField("llm_model", "Модель", s.llm_model, "Нужна модель с tool calling, например qwen2.5:7b или llama3.1:8b.")}
             ${textField("llm_api_key", "API-ключ", s.llm_api_key, "Для Ollama не нужен.", 'type="password"')}
             ${textField("assistant_domains", "Что доступно ассистенту", s.assistant_domains, "Домены через запятую. Конкретные датчики, реле и подсказки — вкладка <a href=\"#devices\">Устройства</a>.")}
-            <div class="field"><label for="f_llm_prompt">Дополнительные указания</label><textarea class="input" id="f_llm_prompt" name="llm_prompt" rows="3" placeholder="Например: обращайся ко мне на «ты», детскую называй комнатой Маши">${esc(s.llm_prompt || "")}</textarea></div>
           </div>
           ${saveRow()}
         </form>
@@ -2372,6 +2467,7 @@
           ${saveRow()}
         </form>
       </div>
+      <form class="card" style="margin-top:14px" id="promptForm" autocomplete="off" data-show="openai ha"></form>
       <div class="card" style="margin-top:14px" id="llmCard"></div>
       <div class="card" style="margin-top:14px">
         <h3>${icon("flask")}Проверить фразу</h3>
@@ -2397,6 +2493,7 @@
     syncShow();
     bindSettingsForm($("#asForm"));
     bindSettingsForm($("#wwForm"));
+    bindPromptForm();
     $("#asLog").addEventListener("change", onLearnChange);
     if (!(state.speakers || []).length) loadSpeakers().then(renderAssistantLog).catch(() => {});
     renderLlm();
@@ -2434,6 +2531,124 @@
       }
     });
     renderAssistantLog();
+  }
+
+  /* ---------------- lists, notes, journal ---------------- */
+  const NOTE_KINDS = { list: ["list", "Список"], notes: ["edit", "Заметки"], journal: ["book", "Журнал"] };
+
+  async function loadNotes() {
+    state.notes = (await api("/api/notes")).collections || [];
+    state.notesKey = JSON.stringify(state.notes);
+  }
+
+  const noteTitle = (c) => (c.kind === "notes" ? "Заметки" : `${NOTE_KINDS[c.kind][1]}${c.name ? ` ${c.name}` : ""}`);
+
+  function noteCard(c) {
+    const rows = c.items.length
+      ? (c.kind === "list" ? c.items : [...c.items].reverse()).map((i) => `
+        <div class="note-item">
+          <div class="note-text">${esc(i.text)}${c.kind === "list" ? "" : `<div class="small muted">${esc(dayLabel(i.ts))}, ${esc(fmtTime(i.ts))}${i.who ? ` · ${esc(i.who)}` : ""}</div>`}</div>
+          <button type="button" class="btn ghost icon sm" data-note-del-item="${esc(i.id)}" data-note="${esc(c.id)}" title="Убрать">${icon("x")}</button>
+        </div>`).join("")
+      : `<p class="small muted">Пока пусто.</p>`;
+    return `
+      <div class="card" data-note-card="${esc(c.id)}">
+        <div class="row between">
+          <h3>${icon(NOTE_KINDS[c.kind][0])}${esc(noteTitle(c))}</h3>
+          <div class="row">
+            ${c.kind === "notes" ? "" : `<button type="button" class="btn ghost icon sm" data-note-rename="${esc(c.id)}" title="Переименовать">${icon("edit")}</button>`}
+            <button type="button" class="btn ghost icon sm" data-note-del="${esc(c.id)}" title="Удалить целиком">${icon("trash")}</button>
+          </div>
+        </div>
+        ${rows}
+        <form class="row" data-note-add="${esc(c.id)}" autocomplete="off" style="margin-top:8px">
+          <input class="input" name="text" maxlength="500" placeholder="${c.kind === "list" ? "Новый пункт" : "Новая запись"}" style="flex:1;min-width:0">
+          <button type="submit" class="btn" title="Добавить">${icon("plus")}</button>
+        </form>
+      </div>`;
+  }
+
+  function renderNotes() {
+    const v = view("notes");
+    const all = state.notes || [];
+    v.innerHTML = `
+      <div class="card">
+        <h3>${icon("list")}Списки, заметки и журнал</h3>
+        <p class="card-sub">Ассистент ведёт их голосом и отвечает сразу: обычные фразы понимает без модели. Что-то неясно — переспросит.</p>
+        <details><summary class="small">Что можно сказать</summary>
+          <ul class="small" style="margin:8px 0 0;padding-left:18px">
+            <li>«Добавь в список покупок на дачу молоко и хлеб», «добавь в список покупок на дачу» — спросит, что добавить</li>
+            <li>«Что в списке для дачи», «какие есть списки», «что купить на дачу»</li>
+            <li>«Вычеркни молоко из списка покупок», «удали список на дачу», «очисти список дел»</li>
+            <li>«Запиши заметку: фильтр менять в марте», «запомни, что ключи у соседа», «прочитай заметки»</li>
+            <li>«Запиши в журнал: полил теплицу», «что в журнале»</li>
+          </ul>
+        </details>
+        <form class="row" id="noteNew" autocomplete="off" style="margin-top:12px;flex-wrap:wrap">
+          <input class="input" name="name" maxlength="80" placeholder="Название, например: покупок на дачу" style="flex:1;min-width:200px">
+          <select class="input" name="kind" style="width:auto"><option value="list">Список</option><option value="journal">Журнал</option></select>
+          <button type="submit" class="btn primary">${icon("plus")}Создать</button>
+        </form>
+      </div>
+      <div class="grid grid-2" style="margin-top:14px">${all.map(noteCard).join("")}</div>
+      ${all.length ? "" : emptyBox("list", "Пока ничего нет. Скажите колонке: «добавь в список покупок молоко».")}`;
+  }
+
+  async function notesChanged() {
+    await loadNotes();
+    renderNotes();
+  }
+
+  async function onNotesClick(ev) {
+    const del = ev.target.closest("[data-note-del]");
+    const item = ev.target.closest("[data-note-del-item]");
+    const ren = ev.target.closest("[data-note-rename]");
+    try {
+      if (item) {
+        await api(`/api/notes/${item.dataset.note}/items/${item.dataset.noteDelItem}`, { method: "DELETE" });
+        await notesChanged();
+      } else if (del) {
+        const c = state.notes.find((x) => x.id === del.dataset.noteDel);
+        if (!c || !(await confirmDialog("Удалить целиком?", `${noteTitle(c)}: записей ${c.items.length}. Это не отменить.`))) return;
+        await api(`/api/notes/${c.id}`, { method: "DELETE" });
+        await notesChanged();
+      } else if (ren) {
+        const c = state.notes.find((x) => x.id === ren.dataset.noteRename);
+        if (!c) return;
+        openModal({
+          title: "Новое название",
+          body: `<input class="input" id="noteName" maxlength="80" value="${esc(c.name)}" style="width:100%">`,
+          actions: [
+            { label: "Отмена" },
+            { label: "Сохранить", kind: "primary", onClick: async (dlg) => {
+              await postJson(`/api/notes/${c.id}`, { name: $("#noteName", dlg).value }, "PATCH");
+              await notesChanged();
+            } },
+          ],
+        });
+      }
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  async function onNotesSubmit(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    try {
+      if (form.id === "noteNew") {
+        await postJson("/api/notes", { name: form.elements.name.value, kind: form.elements.kind.value });
+      } else if (form.dataset.noteAdd) {
+        const text = form.elements.text.value.trim();
+        if (!text) return;
+        await postJson(`/api/notes/${form.dataset.noteAdd}/items`, { text });
+      } else {
+        return;
+      }
+      await notesChanged();
+    } catch (err) {
+      showError(err);
+    }
   }
 
   /* ---------------- devices (HA catalog) ---------------- */
@@ -2874,6 +3089,10 @@
           await Promise.all([loadSettings(), loadAssistant()]);
           renderAssistant();
           break;
+        case "notes":
+          await loadNotes();
+          renderNotes();
+          break;
         case "devices":
           await loadCatalog();
           renderDevices();
@@ -2924,12 +3143,23 @@
         await Promise.all([loadOverviewData(), fw ? loadFirmware() : null, usb ? loadSerial() : null]);
         renderSpeaker();
       } else if (state.tab === "assistant") {
-        state.assistantLog = (await api("/api/assistant/log?limit=100")).log || [];
-        renderAssistantLog();
+        // repainted only when something new came: otherwise opened blocks, the scroll
+        // inside them, a selection and a playing recording would reset on every poll
+        const log = (await api("/api/assistant/log?limit=100")).log || [];
+        const key = JSON.stringify(log);
+        if (key !== state.assistantLogKey) {
+          state.assistantLogKey = key;
+          state.assistantLog = log;
+          renderAssistantLog();
+        }
         if (llmBusy() && !state.llmUpload && !editing("assistant")) {
           await loadLlm();
           renderLlm();
         }
+      } else if (state.tab === "notes" && !editing("notes")) {
+        const before = state.notesKey;
+        await loadNotes();
+        if (state.notesKey !== before) renderNotes();
       } else if (state.tab === "diary" && state.diary.items.length <= PAGE && state.playingId == null) {
         await loadDiary();
       } else if (state.tab === "tts" && !editing("tts")) {
@@ -2976,6 +3206,8 @@
     if (ev.key === "Enter" && ev.target.id === "spSay") $("#spSayBtn").click();
   });
   document.addEventListener("toggle", onTraceToggle, true);
+  view("notes").addEventListener("click", onNotesClick);
+  view("notes").addEventListener("submit", onNotesSubmit);
   view("devices").addEventListener("change", onDevicesChange);
   view("devices").addEventListener("click", onDevicesClick);
   view("devices").addEventListener("focusout", onDevicesHints);

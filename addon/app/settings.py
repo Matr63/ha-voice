@@ -140,6 +140,11 @@ class Settings:
     llm_model: str = "qwen2.5:7b"
     llm_api_key: str = ""
     llm_prompt: str = ""
+    # the model's rules as edited in the panel; empty = the standard ones
+    llm_system_prompt: str = ""
+    llm_notes_prompt: str = ""
+    # lists, notes and journal by voice
+    notes_enabled: bool = True
     # with the HA agent: phrases HA did not understand go to the LLM above
     llm_fallback: bool = True
     # room per board, JSON {"<board name>": "<HA area>"}; a board not listed

@@ -44,7 +44,7 @@ esphome:
     - xvf_dsp.h
   project:
     name: matr63.ha-voice-xvf3800
-    version: "2.3.1"
+    version: "2.3.2"
   on_boot:
     - priority: 600
       then:
@@ -509,6 +509,8 @@ switch:
   # On = the mics work. Same state as the mute key on the board (red marks on the ring when off).
   - platform: template
     id: mic_switch
+    # the state lives in the chip; any other mode runs turn_off on boot, which mutes it
+    restore_mode: DISABLED
     name: "Микрофон"
     web_server:
       sorting_group_id: web_control

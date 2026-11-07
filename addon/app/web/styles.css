@@ -415,6 +415,11 @@ a { color: var(--accent); }
   .cat-hint.input { grid-column: 2 / -1; }
 }
 
+/* ---------- lists and notes ---------- */
+.note-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); }
+.note-text { min-width: 0; overflow-wrap: anywhere; }
+.prompt-text { width: 100%; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 0.82rem; line-height: 1.45; resize: vertical; }
+
 /* ---------- assistant log: what was sent ---------- */
 .trace { margin-top: 6px; }
 .trace summary { cursor: pointer; color: var(--muted); }
