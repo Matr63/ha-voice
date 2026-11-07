@@ -318,6 +318,7 @@ class Satellite:
         self._wake_pcm: bytes | None = None  # XVF3800: the ASR channel, for the wake word only
         self.dsp_chip: dict[str, float | None] = {}  # XVF3800: what the chip reports, None = no answer
         self.voice_dir: int | None = None            # XVF3800: direction of the last voice, degrees
+        self.live: dict[asyncio.Queue, str] = {}     # panels listening now -> "speech" or "wake"
         self.last_wake: dict[str, Any] | None = None
         self.last_wake_ts = 0.0
         self.ch_rms = [0.0, 0.0]      # long-term level per ES7210 slot
@@ -708,11 +709,19 @@ class Satellite:
         self.raw_rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
         return apply_gain(audio, s.mic_boost_db)
 
+    def feed_live(self, pcm: bytes) -> None:
+        """The mic as recognition and the wake word get it, to the panels listening.
+        A panel that falls behind loses audio; the board's stream must not wait for it."""
+        for queue, channel in self.live.items():
+            if not queue.full():
+                queue.put_nowait(self._wake_pcm if channel == "wake" and self._wake_pcm else pcm)
+
     async def on_audio(self, pcm: bytes, real: bool = True) -> None:
         if real:
             self.last_audio_at = time.time()
             self.live_rms = rms(pcm)
             self.hub.runtime.feed_capture(pcm, self.id)
+            self.feed_live(pcm)
         if not self.can_listen:
             return
         s = self.hub.settings.get()
@@ -1055,6 +1064,10 @@ class Satellite:
 
     async def close(self) -> None:
         self._closed = True
+        for queue in self.live:
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(None)   # ends the panel's stream
         for task in list(self._tasks):
             task.cancel()
         seg = self.diary_seg.flush()

@@ -621,6 +621,34 @@ def create_app(ctx: AppContext) -> web.Application:
         await sat.set_dsp(values if isinstance(values, dict) else {}, bool(data.get("reset")))
         return web.json_response(sat.to_dict()["dsp"])
 
+    async def satellite_live(request: web.Request) -> web.StreamResponse:
+        """The board's mic to the panel while it is open: PCM16, 16 kHz, mono."""
+        sat = _satellite({"id": request.query.get("id")})
+        channel = "wake" if request.query.get("channel") == "wake" else "speech"
+        ws = web.WebSocketResponse(heartbeat=20)
+        await ws.prepare(request)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+        async def pump() -> None:
+            try:
+                while (chunk := await queue.get()) is not None:
+                    await ws.send_bytes(chunk)
+                await ws.close()
+            except ConnectionError:
+                pass
+
+        sat.live[queue] = channel
+        _LOGGER.info("%s: the panel listens to the %s channel", sat.id, channel)
+        task = asyncio.create_task(pump())
+        try:
+            async for _ in ws:
+                pass
+        finally:
+            sat.live.pop(queue, None)
+            task.cancel()
+            _LOGGER.info("%s: the panel stopped listening", sat.id)
+        return ws
+
     async def mode_get(_: web.Request) -> web.Response:
         return web.json_response(hub.modes.status())
 
@@ -866,6 +894,7 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_post("/api/satellites/listen", satellite_listen)
     r.add_post("/api/satellites/microphone", satellite_listen_switch)
     r.add_post("/api/satellites/dsp", satellite_dsp)
+    r.add_get("/api/satellites/live", satellite_live)
     r.add_get("/api/mode", mode_get)
     r.add_post("/api/mode", mode_set)
     r.add_get("/api/assistant/log", assistant_log)

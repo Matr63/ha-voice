@@ -913,6 +913,7 @@
         </div>
         <p class="card-sub">Применяются сразу, без перепрошивки, и только к этой плате. Чип забывает их при выключении, панель отправляет их заново при каждом подключении. Записываются только значения, которые вы изменили.</p>
         ${silent ? banner("warn", "Плата не сообщает значения чипа", "Обновите прошивку платы (карточка «Прошивка»): без этого настройки ниже не применятся.") : ""}
+        ${liveRow()}
         <div class="grid grid-2">
           <div>
             <div class="stat-label">Шумоподавление (канал речи)</div>
@@ -941,6 +942,62 @@
         </div>
         ${saveRow()}
       </form>`;
+  }
+
+  function liveRow() {
+    const wakeOk = ((state.settings || {}).mic_channel || "auto") === "auto";
+    const btn = (channel, label, enabled = true) =>
+      `<button type="button" class="btn sm ${live.channel === channel ? "primary" : ""}" data-live="${channel}" ${enabled ? "" : "disabled"}>${icon(live.channel === channel ? "speaker" : "mic")}${label}</button>`;
+    return `
+      <div class="field">
+        <div class="row" style="flex-wrap:wrap;align-items:center">
+          ${btn("speech", "Слушать канал речи")}
+          ${btn("wake", "Слушать канал ключевого слова", wakeOk)}
+          ${live.channel ? `<button type="button" class="btn sm" data-live="stop">${icon("x")}Стоп</button><span class="pill"><span class="dot warn"></span>Микрофон транслируется в этот браузер</span>` : ""}
+        </div>
+        <div class="hint">Звук в реальном времени, с задержкой около секунды: меняйте настройки и сразу слушайте разницу. Лучше в наушниках, иначе звук попадёт обратно в микрофоны.${wakeOk ? "" : " Канал ключевого слова доступен, когда «Канал микрофона» стоит на «Автоматически»."}</div>
+      </div>`;
+  }
+
+  // The board's mic in this browser: starts only on a click, ends with the tab or the board.
+  const live = { channel: null, ws: null, ctx: null, next: 0 };
+
+  function stopLive() {
+    if (live.ws) {
+      live.ws.onclose = null;
+      live.ws.close();
+    }
+    if (live.ctx) live.ctx.close().catch(() => {});
+    live.channel = live.ws = live.ctx = null;
+  }
+
+  function startLive(channel) {
+    stopLive();
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}${BASE}/api/satellites/live?id=${encodeURIComponent(satId())}&channel=${channel}`);
+    ws.binaryType = "arraybuffer";
+    const ctx = new AudioContext({ sampleRate: 16000 });
+    Object.assign(live, { channel, ws, ctx, next: 0 });
+    ws.onmessage = (ev) => {
+      const pcm = new Int16Array(ev.data);
+      if (!pcm.length) return;
+      const buf = ctx.createBuffer(1, pcm.length, 16000);
+      const out = buf.getChannelData(0);
+      for (let i = 0; i < pcm.length; i++) out[i] = pcm[i] / 32768;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      // a small reserve against Wi-Fi gaps; start over when it runs out or grows too long
+      const now = ctx.currentTime;
+      if (live.next < now || live.next > now + 1) live.next = now + 0.25;
+      src.start(live.next);
+      live.next += buf.duration;
+    };
+    ws.onclose = () => {
+      stopLive();
+      toast("Трансляция микрофона прервалась", "bad");
+      renderSpeaker();
+    };
   }
 
   function bindDspForm(form) {
@@ -1003,9 +1060,18 @@
     const t = ev.target;
     const pick = t.closest("[data-sat]");
     if (pick) {
+      if (pick.dataset.sat !== satId()) stopLive();
       state.satId = pick.dataset.sat;
       renderSpeaker();
       renderPills();
+      return;
+    }
+    const liveBtn = t.closest("[data-live]");
+    if (liveBtn) {
+      const channel = liveBtn.dataset.live;
+      if (channel === "stop" || channel === live.channel) stopLive();
+      else startLive(channel);
+      renderSpeaker();
       return;
     }
     const dspBtn = t.closest("[data-dsp]");
@@ -2763,6 +2829,7 @@
   function setTab(tab) {
     tab = TAB_ALIASES[tab] || tab;
     if (!TABS.includes(tab)) tab = "speaker";
+    if (tab !== "speaker") stopLive();
     state.tab = tab;
     $$("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
     $$(".view").forEach((v) => v.classList.toggle("active", v.dataset.view === tab));
