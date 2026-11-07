@@ -409,7 +409,7 @@ void HaVoiceSat::handle_frame_() {
       break;
     case FRAME_SET: {
       std::lock_guard<std::mutex> lock(this->settings_mutex_);
-      if (this->settings_.size() < 16)
+      if (this->settings_.size() < 32)
         this->settings_.emplace_back(this->rx_small_.begin(), this->rx_small_.end());
       break;
     }

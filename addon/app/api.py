@@ -612,6 +612,15 @@ def create_app(ctx: AppContext) -> web.Application:
         await hub.set_listen(bool(data.get("listen", True)), data.get("id") or None)
         return web.json_response({"ok": True})
 
+    async def satellite_dsp(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        sat = _satellite(data)
+        if sat.info.get("board") != "xvf3800":
+            raise ValueError("Эти настройки есть только у ReSpeaker XVF3800")
+        values = data.get("values")
+        await sat.set_dsp(values if isinstance(values, dict) else {}, bool(data.get("reset")))
+        return web.json_response(sat.to_dict()["dsp"])
+
     async def mode_get(_: web.Request) -> web.Response:
         return web.json_response(hub.modes.status())
 
@@ -856,6 +865,7 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_delete("/api/sounds/{kind}", sound_reset)
     r.add_post("/api/satellites/listen", satellite_listen)
     r.add_post("/api/satellites/microphone", satellite_listen_switch)
+    r.add_post("/api/satellites/dsp", satellite_dsp)
     r.add_get("/api/mode", mode_get)
     r.add_post("/api/mode", mode_set)
     r.add_get("/api/assistant/log", assistant_log)

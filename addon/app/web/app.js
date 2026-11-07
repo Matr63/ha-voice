@@ -708,6 +708,7 @@
         ${boardSettingsCard(sat, st)}
         ${sleepCard(s.mode, st)}
       </div>
+      ${sat && sat.dsp ? dspCard(sat) : ""}
       <div class="grid grid-4" style="margin-top:14px">
         ${statCard("Голосов записано", s.speakers, s.speakers ? "узнаются по голосу" : "пока никого")}
         ${statCard("Реплик сегодня", today.period, `из них неизвестных: ${today.period_unknown}`)}
@@ -741,6 +742,8 @@
     if (bf) bindSettingsForm(bf, async () => renderSpeaker());
     const sf = $("#sleepForm");
     if (sf) bindSettingsForm(sf, async () => renderSpeaker());
+    const df = $("#dspForm");
+    if (df) bindDspForm(df);
   }
 
   function satRooms() {
@@ -867,9 +870,9 @@
         <h3>${icon("settings")}Настройки колонки</h3>
         <p class="card-sub">Применяются к плате сразу, без перепрошивки.${sat ? ` Микрофон: до усиления ${raw.toFixed(4)}, после — ${sat.live_rms.toFixed(4)}.` : ""}</p>
         ${rangeField("sat_volume", "Громкость динамика", st.sat_volume ?? 60, 0, 100, 5, "vol")}
-        ${rangeField("sat_mic_gain", "Усиление микрофона на плате (ES7210)", st.sat_mic_gain ?? 36, 0, 36, 3, "db", "Аппаратное усиление. На Waveshare микрофоны тихие — держите 30–36 дБ.")}
+        ${sat && sat.dsp ? "" : rangeField("sat_mic_gain", "Усиление микрофона на плате (ES7210)", st.sat_mic_gain ?? 36, 0, 36, 3, "db", "Аппаратное усиление. На Waveshare микрофоны тихие — держите 30–36 дБ.")}
         ${rangeField("mic_boost_db", "Цифровое усиление на ПК", st.mic_boost_db ?? 6, 0, 36, 1, "db", "Поднимает уровень для распознавания, записи голосов и дневника. Если речь «хрипит» — уменьшите. Порог громкости речи в «Настройках» сравнивается с уровнем после усиления.")}
-        ${selectField("mic_channel", "Канал микрофона", st.mic_channel || "auto", [["auto", "Автоматически"], ["left", "Левый"], ["right", "Правый"], ["mix", "Смесь двух"]], "Автоматически: Waveshare — громкий канал ES7210; ReSpeaker XVF3800 — речь из канала с шумоподавлением чипа (comms, его громкость — «AGC max gain»), ключевое слово из канала ASR («ASR output gain»).")}
+        ${selectField("mic_channel", "Канал микрофона", st.mic_channel || "auto", [["auto", "Автоматически"], ["left", "Левый"], ["right", "Правый"], ["mix", "Смесь двух"]], "Автоматически: Waveshare — громкий канал ES7210; ReSpeaker XVF3800 — речь из канала с шумоподавлением чипа (comms), ключевое слово из канала ASR. Их настройки — в карточке «Звук чипа XVF3800».")}
         ${chLevels}
         ${rangeField("sat_led_brightness", "Яркость подсветки", st.sat_led_brightness ?? 80, 0, 100, 5, "vol", "0 — кольцо не светится совсем.")}
         <div class="row" style="margin-top:6px;flex-wrap:wrap">
@@ -879,6 +882,95 @@
           <button type="submit" class="btn primary">${icon("check")}Сохранить</button>
         </div>
       </form>`;
+  }
+
+  // XVF3800: what the chip reported for this parameter, next to what the panel asked for
+  function dspChipNote(dsp, key) {
+    const chip = dsp.chip[key];
+    if (chip === undefined) return "Чип ещё не ответил.";
+    if (chip === null) return `<span class="warn">Чип не отвечает на эту команду, настройка может не работать.</span>`;
+    const near = (a, b) => Math.abs(a - b) <= Math.abs(b) * 0.01 + 1e-7;
+    const want = dsp.set[key];
+    if (want !== undefined) return near(chip, want) ? `Чип подтвердил: ${chip}.` : `<span class="warn">Чип держит ${chip}, а не ${want}.</span>`;
+    // driver and board values, the chip's own default says nothing about these
+    if (key === "agc_max_gain" || key === "asr_gain" || near(chip, dsp.defaults[key])) return `В чипе: ${chip}.`;
+    return `<span class="warn">В чипе ${chip}, а по документации должно быть ${dsp.defaults[key]}. Возможно, у этой прошивки другая команда — лучше не менять.</span>`;
+  }
+
+  function dspCard(sat) {
+    const dsp = sat.dsp;
+    const val = (k) => dsp.set[k] ?? dsp.chip[k] ?? dsp.defaults[k];
+    const range = (k, label, min, max, step, fmt, hint, scale) => rangeField(k, label, val(k), min, max, step, fmt, "", scale).replace(/<\/div>\s*$/, `<div class="hint">${esc(hint)} ${dspChipNote(dsp, k)}</div></div>`);
+    const toggle = (k, label, hint) => switchField(k, label, Number(val(k)) === 1).replace(/<\/div>\s*$/, `<div class="hint">${esc(hint)} ${dspChipNote(dsp, k)}</div></div>`);
+    const answered = Object.keys(dsp.chip).length > 0;
+    const silent = !answered && sat.connected_s > 15;
+    const mode = dsp.set.beam_mode ?? 0;
+    return `
+      <form class="card" id="dspForm" autocomplete="off" style="margin-top:14px">
+        <div class="row between">
+          <h3>${icon("settings")}Звук чипа XVF3800</h3>
+          <button type="button" class="btn sm ghost" data-dsp="reset">${icon("refresh")}Сбросить</button>
+        </div>
+        <p class="card-sub">Применяются сразу, без перепрошивки, и только к этой плате. Чип забывает их при выключении, панель отправляет их заново при каждом подключении. Записываются только значения, которые вы изменили.</p>
+        ${silent ? banner("warn", "Плата не сообщает значения чипа", "Обновите прошивку платы (карточка «Прошивка»): без этого настройки ниже не применятся.") : ""}
+        <div class="grid grid-2">
+          <div>
+            <div class="stat-label">Шумоподавление (канал речи)</div>
+            ${range("min_ns", "Постоянный шум: вентилятор, гул", 0, 1, 0.01, "n2", "До какого уровня глушить такой шум.", ["глушить сильнее", "слабее"])}
+            ${range("min_nn", "Непостоянный шум: посуда, голоса фоном", 0, 1, 0.01, "n2", "Сильное подавление может резать тихую речь.", ["глушить сильнее", "слабее"])}
+            ${toggle("attns_mode", "Приглушать паузы между словами", "Ближе всего к порогу шума: между фразами фон становится тише.")}
+            ${range("attns_nominal", "Насколько приглушать паузы", 0, 1, 0.01, "n2", "При обычной громкости речи.", ["сильнее", "слабее"])}
+            ${range("attns_slope", "Добавка, когда говорят тихо", 0, 5, 0.1, "n2", "При 1 фон остаётся примерно одинаковым, как бы ни росло автоусиление.")}
+            ${selectField("hpf", "Срез низких частот", val("hpf"), [[0, "Выключен"], [1, "70 Гц"], [2, "125 Гц"], [3, "150 Гц"], [4, "180 Гц"]], `Убирает гул и топот. ${dspChipNote(dsp, "hpf")}`)}
+          </div>
+          <div>
+            <div class="stat-label">Усиление</div>
+            ${toggle("agc_on", "Автоусиление речи", "Выровняет тихую и громкую речь в канале речи.")}
+            ${range("agc_level", "Целевая громкость речи", 0.0005, 0.05, 0.0005, "n4", "Чем больше, тем громче выходит речь.")}
+            ${range("agc_max_gain", "Максимум автоусиления", 1, 125, 1, "x", "Меньше — тише тянет дальнюю речь, но и фон не вырастет.")}
+            ${range("agc_time", "Скорость автоусиления", 0.5, 4, 0.1, "s", "За сколько секунд усиление подстраивается.", ["быстрее", "медленнее"])}
+            ${range("asr_gain", "Усиление канала ключевого слова", 1, 8, 0.1, "x", "Сюда не действуют настройки шумоподавления и автоусиления.")}
+            <div class="stat-label" style="margin-top:12px">Луч микрофонов</div>
+            ${selectField("beam_mode", "Куда слушать", mode, [[0, "Чип выбирает сам"], [1, "Держать на говорящем до конца команды"], [2, "Только заданное направление"]], "Заданное направление помогает, если рядом шумит ТВ или другая колонка.")}
+            ${rangeField("beam_azimuth", "Направление", dsp.set.beam_azimuth ?? 0, 0, 359, 1, "deg", "Работает в режиме «Только заданное направление».")}
+            <div class="row" style="flex-wrap:wrap;align-items:center">
+              <button type="button" class="btn sm" data-dsp="aim" ${dsp.direction == null ? "disabled" : ""}>${icon("mic")}Навести на последний голос</button>
+              <span class="small muted">Последний голос: ${dsp.direction == null ? "скажите что-нибудь" : `${dsp.direction}°`}</span>
+            </div>
+          </div>
+        </div>
+        ${saveRow()}
+      </form>`;
+  }
+
+  function bindDspForm(form) {
+    // as the inputs show them: a slider rounds the chip's value to its own step
+    const read = (el) => (el.type === "checkbox" ? el.checked : el.value);
+    const initial = new Map([...form.elements].filter((el) => el.name).map((el) => [el, read(el)]));
+    form.addEventListener("input", (e) => {
+      if (e.target.type === "range" && e.target.dataset.fmt) e.target.nextElementSibling.textContent = FMT[e.target.dataset.fmt](Number(e.target.value));
+    });
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      // only what was changed: an untouched value stays as the chip has it
+      const values = {};
+      for (const [el, was] of initial) {
+        if (read(el) !== was) values[el.name] = Number(el.type === "checkbox" ? el.checked : el.value);
+      }
+      await saveDsp({ values });
+    });
+  }
+
+  async function saveDsp(body) {
+    try {
+      await postJson("/api/satellites/dsp", { id: satId(), ...body });
+      toast("Сохранено");
+      if (document.activeElement) document.activeElement.blur();
+      await poll();
+      renderSpeaker();
+    } catch (err) {
+      showError(err);
+    }
   }
 
   function sleepCard(mode, st) {
@@ -914,6 +1006,13 @@
       state.satId = pick.dataset.sat;
       renderSpeaker();
       renderPills();
+      return;
+    }
+    const dspBtn = t.closest("[data-dsp]");
+    if (dspBtn) {
+      const dsp = (satellite() || {}).dsp;
+      if (dspBtn.dataset.dsp === "reset") await saveDsp({ reset: true });
+      else if (dsp && dsp.direction != null) await saveDsp({ values: { beam_azimuth: dsp.direction, beam_mode: 2 } });
       return;
     }
     const fw = t.closest("[data-fw]");
@@ -1615,6 +1714,10 @@
     vol: (x) => `${x}%`,
     s: (x) => `${x} с`,
     db: (x) => `${x} дБ`,
+    n2: (x) => Number(x).toFixed(2),
+    n4: (x) => Number(x).toFixed(4),
+    x: (x) => `×${x}`,
+    deg: (x) => `${x}°`,
     threads: (x) => (Number(x) ? String(x) : "авто"),
   };
   const switchField = (name, label, checked, hint) =>

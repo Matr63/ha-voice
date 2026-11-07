@@ -32,14 +32,14 @@ namespace ha_voice_sat {
 enum FrameType : uint8_t {
   FRAME_AUDIO = 0x01,      // up: mic PCM, down: TTS PCM
   FRAME_HELLO = 0x02,      // up: "key=value\n" device info
-  FRAME_EVENT = 0x03,      // up: text event (tts_done, button:2, listen:on)
+  FRAME_EVENT = 0x03,      // up: text event (tts_done, button:2, listen:on, dsp:min_ns=0.15)
   FRAME_PING = 0x04,       // both: keepalive
   FRAME_TTS_START = 0x10,  // down: rate/channels in header
   FRAME_TTS_END = 0x11,    // down: no more TTS audio
   FRAME_STATE = 0x12,      // down: 1 byte, see SatState
   FRAME_VOLUME = 0x13,     // down: 1 byte 0..100
   FRAME_TTS_ABORT = 0x14,  // down: drop queued TTS now
-  FRAME_SET = 0x15,        // down: "key=value" board setting (mic_gain, led_brightness, listen)
+  FRAME_SET = 0x15,        // down: "key=value" board setting (mic_gain, led_brightness, listen, XVF3800 audio)
 };
 
 enum SatState : uint8_t {

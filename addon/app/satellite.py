@@ -1,6 +1,6 @@
 """Satellite link: one TCP connection per board on :10500.
 
-Up:   microphone PCM, hello, events (tts_done, button:2, listen:on/off)
+Up:   microphone PCM, hello, events (tts_done, button:2, listen:on/off, dsp:min_ns=0.15)
 Down: TTS PCM, ring state, volume
 
 Everything is decided on the PC, per board:
@@ -36,7 +36,7 @@ from audio_utils import (
     split_stereo,
 )
 from modes import Modes
-from settings import SettingsStore
+from settings import DSP_PARAMS, SettingsStore, clean_dsp
 from stt_client import transcribe
 from tts_client import synthesize_stream
 from tts_engine import resolve_voice
@@ -316,6 +316,8 @@ class Satellite:
         self.board_device_id: str | None = None  # ESPHome device of this board (catalog)
         self.stop_seg = Segmenter(preroll_ms=200)
         self._wake_pcm: bytes | None = None  # XVF3800: the ASR channel, for the wake word only
+        self.dsp_chip: dict[str, float | None] = {}  # XVF3800: what the chip reports, None = no answer
+        self.voice_dir: int | None = None            # XVF3800: direction of the last voice, degrees
         self.last_wake: dict[str, Any] | None = None
         self.last_wake_ts = 0.0
         self.ch_rms = [0.0, 0.0]      # long-term level per ES7210 slot
@@ -350,6 +352,37 @@ class Satellite:
         except (ValueError, AttributeError):
             cfg = {}
         return cfg if isinstance(cfg, dict) else {}
+
+    def _dsp_all(self) -> dict[str, Any]:
+        try:
+            all_cfg = json.loads(self.hub.settings.get().sat_dsp or "{}")
+        except (ValueError, AttributeError):
+            all_cfg = {}
+        return all_cfg if isinstance(all_cfg, dict) else {}
+
+    def _dsp_cfg(self) -> dict[str, Any]:
+        cfg = self._dsp_all().get(self.id)
+        return clean_dsp(cfg) if isinstance(cfg, dict) else {}
+
+    def _dsp_default(self, key: str) -> float:
+        if key == "asr_gain":
+            # before the panel had this slider, the ES7210 gain (0..36 dB) mapped onto x1..x8
+            return round(1.0 + self.hub.settings.get().sat_mic_gain / 36.0 * 7.0, 2)
+        return DSP_PARAMS[key][2]
+
+    async def set_dsp(self, values: dict[str, Any], reset: bool = False) -> None:
+        """Saves the panel's XVF3800 values and sends the board what changed."""
+        old = self._dsp_cfg()
+        new = {} if reset else {**old, **clean_dsp(values)}
+        all_cfg = self._dsp_all()
+        if new:
+            all_cfg[self.id] = new
+        else:
+            all_cfg.pop(self.id, None)
+        self.hub.settings.update({"sat_dsp": json.dumps(all_cfg)})
+        for key in DSP_PARAMS:
+            if new.get(key) != old.get(key):
+                await self.send_setting(key, new.get(key, self._dsp_default(key)))
 
     @property
     def has_speaker(self) -> bool:
@@ -409,6 +442,12 @@ class Satellite:
             "raw_rms": round(self.raw_rms, 4),
             "channel_rms": [round(x, 4) for x in self.ch_rms],
             "channel_active": ["left", "right"][self.ch_active] if self.info.get("mic_channels") == "2" else None,
+            "dsp": {
+                "set": self._dsp_cfg(),
+                "chip": self.dsp_chip,
+                "direction": self.voice_dir,
+                "defaults": {k: self._dsp_default(k) for k in DSP_PARAMS},
+            } if self.info.get("board") == "xvf3800" else None,
         }
 
     def _spawn(self, coro: Any) -> asyncio.Task:
@@ -449,8 +488,19 @@ class Satellite:
     async def push_board_settings(self) -> None:
         s = self.hub.settings.get()
         await self.set_volume(s.sat_volume)
-        await self.send_setting("mic_gain", s.sat_mic_gain)
         await self.send_setting("led_brightness", s.sat_led_brightness)
+        if self.info.get("board") != "xvf3800":
+            await self.send_setting("mic_gain", s.sat_mic_gain)
+            return
+        # The chip forgets these on power-up. What the panel did not change stays
+        # untouched and is only read, so a command the chip knows differently is
+        # seen in the panel before anything is written to it.
+        cfg = self._dsp_cfg()
+        cfg.setdefault("asr_gain", self._dsp_default("asr_gain"))
+        for key in DSP_PARAMS:
+            if key in cfg:
+                await self.send_setting(key, cfg[key])
+        await self.send_setting("dsp_read", 1)
 
     def idle_state(self) -> int:
         return ST_SLEEP if self.hub.modes.sleeping() else ST_IDLE
@@ -576,6 +626,16 @@ class Satellite:
             self.listening = False
             self.diary_seg.reset()
             self.command = None
+        elif text.startswith("dsp:"):
+            key, _, value = text[4:].partition("=")
+            try:
+                num = float(value)
+            except ValueError:
+                num = None
+            if key == "direction":
+                self.voice_dir = None if num is None else int(num)
+            else:
+                self.dsp_chip[key] = num
         elif text.startswith("button:2"):
             if self.speaking or self.hub.any_speaking():
                 await self.hub.interrupt_speech()

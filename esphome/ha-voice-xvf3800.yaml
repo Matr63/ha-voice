@@ -40,9 +40,11 @@ esphome:
   friendly_name: ${friendly_name}
   name_add_mac_suffix: true
   min_version: 2026.10.0
+  includes:
+    - xvf_dsp.h
   project:
     name: matr63.ha-voice-xvf3800
-    version: "2.2.0"
+    version: "2.3.0"
   on_boot:
     - priority: 600
       then:
@@ -289,9 +291,15 @@ ha_voice_sat:
     - script.execute:
         id: ring_state
         state: -1
+    - script.execute:
+        id: beam_follow
+        state: -1
   on_state:
     - script.execute:
         id: ring_state
+        state: !lambda return x;
+    - script.execute:
+        id: beam_follow
         state: !lambda return x;
   on_volume:
     - media_player.volume_set:
@@ -305,11 +313,32 @@ ha_voice_sat:
           id(ring_state).execute(id(ring_last));
         } else if (key == "listen") {
           if (v > 0) id(listen_switch).turn_on(); else id(listen_switch).turn_off();
-        } else if (key == "mic_gain") {
-          // the Waveshare ES7210 gain (0..36 dB) maps onto the XVF3800 ASR output gain (x1..x8)
+        } else if (key == "asr_gain") {
+          // through the number: it keeps the value for the next boot and shows it in HA
           auto call = id(asr_out_gain).make_call();
-          call.set_value(clamp(1.0f + v / 36.0f * 7.0f, 1.0f, 8.0f));
+          call.set_value(clamp(v, 1.0f, 8.0f));
           call.perform();
+          xvf_dsp::set(key, clamp(v, 1.0f, 8.0f));
+        } else if (key == "agc_max_gain") {
+          auto call = id(agc_max_gain).make_call();
+          call.set_value(clamp(v, 1.0f, 125.0f));
+          call.perform();
+          xvf_dsp::set(key, clamp(v, 1.0f, 125.0f));
+        } else if (key == "dsp_read") {
+          xvf_dsp::read_all();
+        } else if (key == "beam_azimuth") {
+          id(beam_azimuth) = v;
+          if (id(beam_mode) == 2)
+            xvf_dsp::fix_beam(*id(respeaker), v);
+        } else if (key == "beam_mode") {
+          id(beam_mode) = (int) v;
+          id(beam_held) = false;
+          if (id(beam_mode) == 2)
+            xvf_dsp::fix_beam(*id(respeaker), id(beam_azimuth));
+          else
+            id(respeaker).unlock_beam();
+        } else {
+          xvf_dsp::set(key, v);
         }
   on_tts_start:
     - mixer_speaker.apply_ducking:
@@ -333,8 +362,39 @@ globals:
   - id: ring_tick
     type: uint32_t
     initial_value: '0'
+  # 0 the chip picks the beam, 1 held on the speaker for a command, 2 fixed direction
+  - id: beam_mode
+    type: int
+    initial_value: '0'
+  - id: beam_azimuth
+    type: float
+    initial_value: '0'
+  - id: beam_held
+    type: bool
+    initial_value: 'false'
+  - id: voice_dir
+    type: int
+    initial_value: '-1'
 
 script:
+  # «Держать на говорящем»: the beam stays on whoever said the wake word until
+  # the board is idle again.
+  - id: beam_follow
+    mode: queued
+    parameters:
+      state: int
+    then:
+      - lambda: |-
+          if (id(beam_mode) != 1)
+            return;
+          const bool command = state >= 1 && state <= 4;
+          if (command && !id(beam_held)) {
+            id(respeaker).lock_beam();
+            id(beam_held) = true;
+          } else if (!command && id(beam_held)) {
+            id(respeaker).unlock_beam();
+            id(beam_held) = false;
+          }
   # -1 = no link to HA Voice, 0 idle, 1 wake word, 2 listening, 3 thinking,
   # 4 replying, 5 error, 6 sleep. The 12-LED ring belongs to the XVF3800 and
   # is written over I2C by the interval below.
@@ -354,6 +414,32 @@ script:
             - lambda: id(ring_last) = 0;
 
 interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          if (id(respeaker).is_failed())
+            return;
+          const std::string report = xvf_dsp::tick(*id(respeaker));
+          if (!report.empty())
+            id(sat).send_event("dsp:" + report);
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (id(respeaker).is_failed() || xvf_dsp::busy())
+            return;
+          // lock_beam() prefers the azimuth this poll leaves in the driver
+          if (id(beam_mode) == 1 && !id(beam_held))
+            id(respeaker).read_led_beam_direction();
+          int degrees;
+          const bool fixed = id(beam_mode) == 2 || id(beam_held);
+          if (!xvf_dsp::read_direction(*id(respeaker), fixed, degrees))
+            return;
+          const int was = id(voice_dir);
+          const int diff = abs(degrees - was);
+          if (was < 0 || std::min(diff, 360 - diff) >= 5) {
+            id(voice_dir) = degrees;
+            id(sat).send_event("dsp:direction=" + std::to_string(degrees));
+          }
   - interval: 60ms
     then:
       - lambda: |-

@@ -52,6 +52,37 @@ DEFAULT_DOMAINS = (
 
 TTS_VOICES = ("sveta", "masha", "dima")
 
+# XVF3800 chip, per board in sat_dsp: name -> (min, max, default, type). Defaults
+# are the chip's own (XMOS control commands), agc_max_gain is the driver's.
+# Azimuth before mode: a board entering fixed mode must already know the direction.
+DSP_PARAMS: dict[str, tuple[float, float, float, type]] = {
+    "min_ns": (0.0, 1.0, 0.15, float),
+    "min_nn": (0.0, 1.0, 0.51, float),
+    "attns_mode": (0, 1, 0, int),
+    "attns_nominal": (0.0, 1.0, 1.0, float),
+    "attns_slope": (0.0, 5.0, 1.0, float),
+    "hpf": (0, 4, 2, int),
+    "agc_on": (0, 1, 1, int),
+    "agc_max_gain": (1.0, 125.0, 32.0, float),
+    "agc_level": (1e-8, 1.0, 0.0045, float),
+    "agc_time": (0.5, 4.0, 0.9, float),
+    "asr_gain": (1.0, 8.0, 1.0, float),
+    "beam_azimuth": (0, 359, 0, int),
+    "beam_mode": (0, 2, 0, int),
+}
+
+
+def clean_dsp(data: dict[str, Any]) -> dict[str, Any]:
+    """Known parameters only, within the chip's limits."""
+    out: dict[str, Any] = {}
+    for key, (lo, hi, _, cast) in DSP_PARAMS.items():
+        if key in data:
+            try:
+                out[key] = cast(min(max(float(data[key]), lo), hi))
+            except (TypeError, ValueError):
+                continue
+    return out
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -116,6 +147,9 @@ class Settings:
     # sound per board, JSON {"<board>": {"speaker": false, "listen": false}}:
     # «Говорит» / «Слушает»; answers go to sat_voice_out or the board that heard
     sat_audio: str = "{}"
+    # XVF3800 chip per board, JSON {"<board>": {"min_ns": 0.1}}: only what the panel
+    # changed, the rest stays as the chip has it (see DSP_PARAMS)
+    sat_dsp: str = "{}"
     # empty = the board that heard; otherwise that board speaks for everyone
     sat_voice_out: str = ""
     # JSON {"entity_id": {"enabled": false, "hints": "у телевизора"}}
