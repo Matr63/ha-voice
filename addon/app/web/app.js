@@ -633,6 +633,15 @@
     document.head.appendChild(sc);
   }
 
+  function wakeCheckRow(sat) {
+    const w = sat && sat.last_wake;
+    if (!w || w.ignored) return "";
+    if (w.pending) return `<dt>Проверка</dt><dd>слушаю слово</dd><dd></dd>`;
+    if (w.confirmed === false) return `<dt>Проверка</dt><dd>отклонено${w.heard ? `, «${esc(w.heard)}»` : ""}</dd><dd></dd>`;
+    if (w.heard) return `<dt>Проверка</dt><dd>подтверждено, «${esc(w.heard)}»</dd><dd></dd>`;
+    return "";
+  }
+
   function renderSpeaker() {
     const v = view("speaker");
     const s = state.status;
@@ -695,6 +704,7 @@
           <dl class="kv" style="margin-top:12px">
             <dt>Адрес</dt><dd class="mono">${esc(sat.ip)}</dd><dd><a class="btn ghost icon sm" href="http://${esc(sat.ip)}" target="_blank" rel="noopener" title="Веб-страница платы">${icon("link")}</a></dd>
             <dt>Ключевое слово</dt><dd>${esc(wakeLabel)} · уверенность ${pct(sat.wake_score)}</dd><dd></dd>
+            ${wakeCheckRow(sat)}
             <dt>Прошивка</dt><dd class="small">${sat.proto >= 2 ? `HA Voice · ESPHome ${esc(sat.esphome || "?")}` : "room_diary (старая)"}</dd><dd></dd>
             <dt>На связи</dt><dd>${fmtUptime(sat.connected_s)}</dd><dd></dd>
           </dl>
@@ -2456,10 +2466,12 @@
         </form>
         <form class="card" id="wwForm" autocomplete="off">
           <h3>${icon("mic")}Фраза активации</h3>
-          <p class="card-sub">Два способа, работают вместе. Модель openWakeWord реагирует мгновенно, но знает только готовые английские слова. Свои фразы — любые русские слова: они ищутся в распознанном тексте, поэтому срабатывают после того, как вы договорили (≈1 с).</p>
+          <p class="card-sub">Два способа, работают вместе. Модель openWakeWord реагирует сразу. Если проверка включена, распознавание смотрит только короткий кусок вокруг слова и не ждёт тишины. Свои фразы ищутся в тексте после того, как фраза договорена.</p>
           ${textField("wake_phrases", "Свои фразы (по тексту)", s.wake_phrases, "Через запятую, например: <span class='mono'>алекса, колонка, дом</span>. «Колонка, включи свет» выполнится целиком; просто «колонка» — колонка начнёт слушать команду. Пусто — выключено.")}
           ${selectField("wake_word", "Модель openWakeWord", s.wake_word, wake.length ? wake : [[s.wake_word, s.wake_word]], "Своё слово: положите обученную модель <span class='mono'>.onnx</span> в папку <span class='mono'>wakewords</span> дополнения и перезапустите.")}
           ${rangeField("wake_threshold", "Чувствительность", s.wake_threshold, 0.2, 0.9, 0.05, "pct", "Ниже — откликается легче (и чаще ошибается).", ["чутче", "строже"])}
+          ${switchField("wake_confirm", "Проверять вызов распознаванием", s.wake_confirm !== false, "После срабатывания GigaAM слушает короткий кусок вокруг слова. Команда начнётся, только если слово правда сказано. Телевизор до этого не трогается.")}
+          ${rangeField("wake_confirm_ms", "Окно проверки", s.wake_confirm_ms ?? 400, 200, 1000, 50, "ms", "Сколько звука после срабатывания добавить к уже услышанному слову. Это время, не пауза.")}
           ${rangeField("command_wait_s", "Сколько ждать команду", s.command_wait_s ?? 6, 2, 30, 1, "s", "После ключевого слова: если за это время не начать говорить, колонка перестаёт слушать.")}
           ${rangeField("command_silence_ms", "Пауза — конец команды", s.command_silence_ms, 300, 2000, 100, "ms")}
           ${selectField("wake_backend", "Где работает", s.wake_backend, [["local", "В этом дополнении (рекомендуется)"], ["wyoming", "Внешний Wyoming openWakeWord"]])}

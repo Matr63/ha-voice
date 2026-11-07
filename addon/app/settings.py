@@ -19,6 +19,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "diary_max_utterance_ms": (2000, 60000),
     "diary_keep_audio": (0, 20000),
     "wake_threshold": (0.1, 0.95),
+    "wake_confirm_ms": (200, 1000),
     "command_silence_ms": (300, 3000),
     "command_max_ms": (3000, 30000),
     "command_wait_s": (2, 30),
@@ -129,6 +130,9 @@ class Settings:
     wake_uri: str = "tcp://127.0.0.1:10400"
     # any Russian phrase, matched in the recognised text (no model training)
     wake_phrases: str = "алекса, колонка"
+    # after a streaming hit, the recogniser must hear the word in a short window
+    wake_confirm: bool = True
+    wake_confirm_ms: int = 400
     command_silence_ms: int = 800
     command_max_ms: int = 10000
     # after the wake word: how long to wait for the command to start

@@ -26,7 +26,8 @@ from typing import Any, Callable
 import aiohttp
 
 from ha_client import HaClient, HaError
-from notes import NOTES_RULES, NOTES_TOOLS, NotesBook, Reply, in_domain
+from media_control import service_data, service_name, supports, twins, without_unnamed_twins
+from notes import HOLD_OPEN_S, HOLD_SETTLE_S, NOTES_RULES, NOTES_TOOLS, NotesBook, Reply, in_domain
 from sensor_lookup import MAX_ANSWERS, WEATHER_ATTRS, asked_measure, asks_outside, find_sensors, spoken_value
 from settings import SettingsStore
 
@@ -121,7 +122,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "call_service",
-            "description": "Вызвать сервис Home Assistant, например light.turn_on для light.kitchen.",
+            "description": (
+                "Вызвать сервис Home Assistant, например light.turn_on для light.kitchen. "
+                "Сервисы media_player: turn_on, turn_off, media_play, media_pause, media_stop, media_next_track, "
+                "media_previous_track, volume_up, volume_down, volume_mute, "
+                "volume_set с data.volume_level в процентах от 0 до 100."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -247,6 +253,31 @@ def is_promise(content: str) -> bool:
     return bool(_PROMISE_RE.search(content))
 
 
+# «Не могу определить, какой телевизор» with no call made. Left in the history it comes
+# back word for word on every next command, so a refused exchange is not kept there.
+_REFUSAL_RE = re.compile(
+    r"\bне\s+(?:мог(?:у|ла)\b|удал|получ|найд|нашл)|\bпроизошла\s+ошибк|\bпопробуйте\b|\bукажите\b",
+    re.IGNORECASE,
+)
+# «Видеоролик воспроизведён» with no call made: nothing happened, whatever the model says
+_CLAIM_RE = re.compile(
+    r"\b(?:вы?ключ(?:[её]н|ил)|воспроизв(?:[её]д|ож)|запустил|запущен|останов(?:ил|лен)|постав(?:ил|лен)|на\s+паузе)",
+    re.IGNORECASE,
+)
+UNBACKED_NUDGE = (
+    "(Функцию ты не вызвал, значит ничего не сделано. Если это команда устройству, вызови call_service "
+    "с entity_id из справочника. Если это не команда, ответь коротко.)"
+)
+
+
+def is_refusal(content: str) -> bool:
+    return bool(_REFUSAL_RE.search(content))
+
+
+def is_claim(content: str) -> bool:
+    return not content.endswith("?") and bool(_CLAIM_RE.search(content))
+
+
 @dataclass
 class AssistantResult:
     speech: str = ""
@@ -255,6 +286,10 @@ class AssistantResult:
     actions: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     trace: list[dict[str, Any]] = field(default_factory=list)
+    # seconds to keep the mic open after this answer; None uses the usual follow-up wait
+    hold_s: float | None = None
+    # False: the pause already running is not restarted (another voice, or talk that is not the list)
+    extend: bool = True
 
 
 @dataclass
@@ -265,6 +300,8 @@ class _Conversation:
     # a question about a list waiting for its answer
     pending: dict[str, Any] | None = None
     pending_until: float = 0.0
+    # said before the next answer when a list was written because the talk moved on
+    list_prefix: str = ""
     # what the last direct answer measured, for «а в зале?»
     last_measure: str = ""
     last_measure_at: float = 0.0
@@ -338,6 +375,7 @@ class Assistant:
         device_id: str | None = None,
         room: str | None = None,
         on_llm: Callable[[float | None], None] | None = None,
+        speaker_id: str | None = None,
     ) -> AssistantResult:
         """on_llm: called when the LLM is about to start, with the seconds it is expected to take."""
         s = self.settings.get()
@@ -349,7 +387,7 @@ class Assistant:
         _trace.set(trace)
         _note("input", text=text, backend=backend, room=room, speaker=speaker, device_id=device_id)
         try:
-            notes = await self._notes(text, conv, speaker, on_llm) if backend != "off" and s.notes_enabled else None
+            notes = await self._notes(text, conv, speaker, on_llm, speaker_id) if backend != "off" and s.notes_enabled else None
             if notes is not None:
                 result = notes
             elif backend == "off":
@@ -364,9 +402,11 @@ class Assistant:
         except (HaError, aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.warning("Assistant %s failed: %s", backend, err)
             result = AssistantResult(speech="Не получилось связаться с сервером.", backend=backend, error=str(err))
+            conv.list_prefix = ""
         except Exception as err:
             _LOGGER.exception("Assistant %s failed", backend)
             result = AssistantResult(speech="Что-то пошло не так.", backend=backend, error=str(err))
+            conv.list_prefix = ""
         self.busy = None
         result.trace = trace
         if result.error:
@@ -380,6 +420,10 @@ class Assistant:
             while tail and tail[0].get("role") != "user":
                 tail.pop(0)
             conv.messages = tail
+        prefix = conv.list_prefix
+        conv.list_prefix = ""
+        if prefix:
+            result.speech = f"{prefix} {result.speech}".strip()
         return result
 
     # ------------------------------------------------------------- helpers
@@ -557,6 +601,7 @@ class Assistant:
             return f"(не удалось получить список: {err})"
         catalog = self._catalog()
         rows = [r for r in rows if self._exposed(r, catalog)]
+        rows = without_unnamed_twins(rows, lambda eid: self._hints(eid, catalog))
         groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
         for r in rows:
             key = (r.get("device") or r["name"], r.get("area") or "", r.get("device_id") or r["entity_id"])
@@ -774,27 +819,68 @@ class Assistant:
         return AssistantResult(speech=speech, backend="direct")
 
     # ------------------------------------------------- lists, notes, journal
-    def _notes_result(self, reply: Reply, conv: _Conversation, backend: str = "notes") -> AssistantResult:
-        conv.pending = reply.pending
-        conv.pending_until = time.time() + PENDING_TTL_S if reply.pending else 0.0
-        _note("notes", speech=reply.speech, pending=reply.pending, actions=reply.actions)
-        return AssistantResult(speech=reply.speech, expect_reply=reply.expect_reply, backend=backend, actions=reply.actions)
+    def _notes_result(
+        self, reply: Reply, conv: _Conversation, backend: str = "notes", speaker_id: str | None = None
+    ) -> AssistantResult:
+        pending = reply.pending
+        if pending and pending.get("op") == "list_more" and speaker_id and not pending.get("speaker_id"):
+            pending["speaker_id"] = speaker_id
+        conv.pending = pending
+        conv.pending_until = time.time() + PENDING_TTL_S if pending else 0.0
+        hold_s = None
+        if pending and pending.get("op") == "list_more":
+            hold_s = float(HOLD_OPEN_S if pending.get("open") else HOLD_SETTLE_S)
+        _note("notes", speech=reply.speech, pending=pending, actions=reply.actions)
+        return AssistantResult(
+            speech=reply.speech,
+            expect_reply=reply.expect_reply,
+            backend=backend,
+            actions=reply.actions,
+            hold_s=hold_s,
+            extend=reply.extend,
+        )
+
+    def _voices_known(self) -> bool:
+        hub = self.hub
+        return bool(hub is not None and hub.runtime.store.has_speakers())
+
+    def finish_list(self, conv_key: str) -> AssistantResult | None:
+        """The open list was left in silence: write it, or ask what to add."""
+        conv = self._convs.get(conv_key)
+        pending = conv.pending if conv is not None else None
+        if conv is None or not pending or pending.get("op") != "list_more":
+            return None
+        conv.pending = None
+        conv.pending_until = 0.0
+        return self._notes_result(self.notes.finish_more(pending), conv)
 
     async def _notes(
-        self, text: str, conv: _Conversation, speaker: str | None, on_llm: Callable[[float | None], None] | None
+        self,
+        text: str,
+        conv: _Conversation,
+        speaker: str | None,
+        on_llm: Callable[[float | None], None] | None,
+        speaker_id: str | None = None,
     ) -> AssistantResult | None:
         """The first stop of every phrase, and instant. None: not about lists."""
         pending, conv.pending = conv.pending, None
         if pending and time.time() < conv.pending_until:
-            if pending.get("op") == "again":
+            if pending.get("op") == "list_more":
+                more = self.notes.take_more(text, pending, speaker, speaker_id, self._voices_known())
+                if more.kind == "handoff":
+                    conv.list_prefix = more.reply.speech
+                else:
+                    return self._notes_result(more.reply, conv, speaker_id=speaker_id)
+            elif pending.get("op") == "again":
                 # the model asked: it hears its own command again, now with the answer
                 return await self._notes_llm(f"{pending.get('text', '')}. {text}", conv, speaker, on_llm)
-            reply = self.notes.answer(text, pending, speaker)
-            if reply is not None:
-                return self._notes_result(reply, conv)
+            else:
+                reply = self.notes.answer(text, pending, speaker)
+                if reply is not None:
+                    return self._notes_result(reply, conv, speaker_id=speaker_id)
         reply = self.notes.handle(text, speaker)
         if reply is not None:
-            return self._notes_result(reply, conv)
+            return self._notes_result(reply, conv, speaker_id=speaker_id)
         if in_domain(text) and self._llm_usable():
             return await self._notes_llm(text, conv, speaker, on_llm)
         return None
@@ -914,10 +1000,12 @@ class Assistant:
                     result.speech = "Не получилось разобраться с запросом."
                     result.error = f"Модель ответила служебным текстом: {content[:200]}"
                     return result
-            if not calls and not tools_ran and not nudged and is_promise(content):
-                _LOGGER.info("LLM promised instead of calling a tool, asking again: %r", content)
+            promised = is_promise(content)
+            if not calls and not tools_ran and not nudged and (promised or is_refusal(content) or is_claim(content)):
+                _LOGGER.info("LLM answered without calling a tool, asking again: %r", content)
                 nudged = True
-                extra = [{"role": "assistant", "content": content}, {"role": "user", "content": PROMISE_NUDGE}]
+                nudge = PROMISE_NUDGE if promised else UNBACKED_NUDGE
+                extra = [{"role": "assistant", "content": content}, {"role": "user", "content": nudge}]
                 continue
             if not calls and not tools_ran and nudged and is_promise(content):
                 # a second promise: an answer that never comes is worse than "no"
@@ -925,10 +1013,18 @@ class Assistant:
                 result.speech = "Не получилось это узнать."
                 result.error = f"Модель пообещала, но не вызвала функцию: {content[:200]}"
                 return result
+            if not calls and not tools_ran and nudged and is_claim(content):
+                _LOGGER.warning("LLM claimed an action again without a tool call: %r", content)
+                del conv.messages[keep:]
+                result.speech = "Не получилось выполнить команду."
+                result.error = f"Модель сказала, что сделала, но не вызвала функцию: {content[:200]}"
+                return result
             conv.messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
             if not calls:
                 result.speech = content
                 result.expect_reply = result.speech.endswith("?")
+                if is_refusal(content) and not result.actions and not reads:
+                    del conv.messages[keep:]
                 return result
             for call in calls:
                 fn = call.get("function") or {}
@@ -992,6 +1088,23 @@ class Assistant:
         _note("llm_reply", message=msg, finish_reason=choice.get("finish_reason"), usage=data.get("usage"), seconds=round(time.monotonic() - t0, 1))
         return msg
 
+    async def _able_players(self, service: str, targets: list[str]) -> list[str] | str:
+        """Each player, or its twin if only the twin can do this. A str: the one nobody can stand in for."""
+        able: list[str] = []
+        for eid in targets:
+            if supports(service, await self.ha.state(eid)):
+                able.append(eid)
+                continue
+            catalog = self._catalog()
+            rows = [r for r in await self._all_rows() if self._exposed(r, catalog)]
+            for twin in twins(eid, rows):
+                if supports(service, await self.ha.state(twin)):
+                    able.append(twin)
+                    break
+            else:
+                return eid
+        return list(dict.fromkeys(able))
+
     async def _tool(self, name: str, args: dict[str, Any], result: AssistantResult) -> Any:
         domains = self._domains()
         try:
@@ -1046,9 +1159,20 @@ class Assistant:
                     if not await self._allow_entity(eid):
                         return {"error": f"{eid} недоступна ассистенту"}
                 data = dict(args.get("data") or {})
-                data["entity_id"] = args.get("entity_id")
+                target = args.get("entity_id")
+                if domain == "media_player":
+                    service = service_name(service)
+                    try:
+                        data = service_data(service, data)
+                    except ValueError as err:
+                        return {"error": str(err)}
+                    able = await self._able_players(service, targets)
+                    if isinstance(able, str):
+                        return {"error": f"{able} не умеет {service}"}
+                    target = able[0] if len(able) == 1 else able
+                data["entity_id"] = target
                 await self.ha.call_service(domain, service, data)
-                result.actions.append({"service": f"{domain}.{service}", "target": args.get("entity_id"), "data": args.get("data")})
+                result.actions.append({"service": f"{domain}.{service}", "target": target, "data": data if domain == "media_player" else args.get("data")})
                 return {"ok": True}
         except HaError as err:
             return {"error": str(err)}

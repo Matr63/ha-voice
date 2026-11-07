@@ -85,6 +85,104 @@ def match_prefix(text: str, phrases: list[str]) -> tuple[str, str] | None:
     return None
 
 
+def match_anywhere(text: str, phrases: list[str]) -> tuple[str, str] | None:
+    """('алекса', 'включи свет') when a whole-word phrase sits anywhere in the text.
+
+    The check window often starts with the TV, so the wake word is not a prefix.
+    """
+    words = normalize(text).split()
+    if not words:
+        return None
+    for phrase in phrases:
+        parts = phrase.split()
+        n = len(parts)
+        if not n or n > len(words):
+            continue
+        for i in range(len(words) - n + 1):
+            if words[i : i + n] == parts:
+                return phrase, " ".join(words[i + n :])
+    return None
+
+
+def confirm_phrases(wake_word: str, wake_phrases: str) -> list[str]:
+    """What the second pass must hear: the model's spellings plus custom phrases."""
+    spoken = model_phrases(wake_word)
+    if not spoken and wake_word and wake_word != NO_MODEL:
+        spoken = [normalize(wake_word.replace("_", " "))]
+    return phrase_list(",".join([*spoken, wake_phrases]))
+
+
+# The second pass is one STT call on a short clip. Longer than this is a miss:
+# waiting out the TV would bring the false hits back.
+CONFIRM_TIMEOUT_S = 3.0
+
+
+class WakeVerdict:
+    """Result of the second pass. A later model fills the same fields."""
+
+    def __init__(self, accepted: bool, heard: str, phrase: str) -> None:
+        self.accepted = accepted
+        self.heard = heard
+        self.phrase = phrase
+
+
+class WakeConfirm:
+    """Audio around a streaming wake hit. The satellite pushes frames and reads a verdict.
+
+    The window is a fixed time after the hit, not a pause. Today the verdict is one
+    call to the existing recogniser; a streaming model replaces run() only.
+    """
+
+    def __init__(self, pre: bytes, phrases: list[str], tail_ms: int, stt_uri: str) -> None:
+        self.pre = pre
+        self.phrases = list(phrases)
+        self.tail_ms = max(0, int(tail_ms))
+        self.stt_uri = stt_uri
+        self._tail = bytearray()
+        self._after = bytearray()
+        self._window = b""
+        self._cmd_tail = b""
+        self._opened = time.monotonic()
+        self.pending = False
+        self.done = False
+
+    def push(self, pcm: bytes) -> None:
+        if self.pending or self.done:
+            self._after.extend(pcm)
+        else:
+            self._tail.extend(pcm)
+
+    def due(self) -> bool:
+        if self.pending or self.done:
+            return False
+        return (time.monotonic() - self._opened) * 1000.0 >= self.tail_ms
+
+    def begin(self) -> None:
+        if self.pending or self.done:
+            return
+        self._window = self.pre + bytes(self._tail)
+        self._cmd_tail = bytes(self._tail)
+        self.pending = True
+
+    def command_audio(self) -> bytes:
+        """Frames from the hit until the verdict: the command may already have started."""
+        return self._cmd_tail + bytes(self._after)
+
+    def finish(self, heard: str) -> WakeVerdict:
+        text = (heard or "").strip()
+        hit = match_anywhere(text, self.phrases) if text else None
+        self.done = True
+        self.pending = False
+        return WakeVerdict(accepted=hit is not None, heard=text, phrase=hit[0] if hit else "")
+
+    async def run(self) -> WakeVerdict:
+        from stt_client import transcribe
+
+        self.begin()
+        heard = await transcribe(self.stt_uri, self._window, timeout=CONFIRM_TIMEOUT_S)
+        return self.finish(heard)
+
+
 # Two boards load their models in parallel threads; importing openwakeword from
 # both at once fails with "partially initialized module".
 _LOAD_LOCK = threading.Lock()

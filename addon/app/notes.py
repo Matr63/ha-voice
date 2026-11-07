@@ -4,6 +4,8 @@
 списки», «запиши заметку», «запиши в журнал»: an answer has to come at once and
 a small model mixes up names, so ordinary phrases are understood by code here.
 A question back («Что добавить?») is a pending step answered by the next phrase.
+An unfinished list («хлеб и», «а-а») is kept in memory and listened to; it is written
+when the phrase is whole, the pause runs out, or the talk moves on.
 Only the phrases the code cannot read go to the model, with a prompt of their own
 (see NOTES_RULES); what it asks for is carried out by the same functions.
 """
@@ -94,12 +96,36 @@ NOTES_TOOLS = [
 ]
 
 
+# while a list is still being spoken: long pause if the phrase broke off, shorter once it sounds finished
+HOLD_OPEN_S = 20
+HOLD_SETTLE_S = 12
+_HESITATION_RE = re.compile(r"^(?:а|э|м)(?:[-–—\s]?(?:а|э|м))+$")
+_HESITATION_WORDS = {"ну", "так", "э", "эм", "гм", "мм"}
+_TRAIL = {"и", "а", "ещё", "еще", "плюс", "также", "потом"}
+_CLOSE_WORDS = {"всё", "все", "хватит", "достаточно"}
+_CHATTER = {"привет", "здравствуй", "здравствуйте", "спасибо", "слушай", "смотрите", "смотри", "кстати", "ладно", "пока", "алло"}
+_HOME = ("включ", "выключ", "откры", "закры", "зажг", "погас", "прибав", "убав", "громч", "тише", "игра", "вруби", "выруби", "постав", "запуст", "пауз")
+_BUFFER_READ = ("прочит", "прочт", "повтор", "зачит", "озвуч")
+# a breath of groceries is a few words; a longer sentence is someone talking, not dictating
+_ITEM_WORDS = 8
+
+
 @dataclass
 class Reply:
     speech: str
     expect_reply: bool = False
     pending: dict[str, Any] | None = None
     actions: list[dict[str, Any]] = field(default_factory=list)
+    # False: keep listening, but this phrase was not more of the list, so the pause is not restarted
+    extend: bool = True
+
+
+@dataclass
+class More:
+    """What to do with the next phrase while a list is still open."""
+
+    kind: str  # hold, done, handoff
+    reply: Reply
 
 
 def _low(word: str) -> str:
@@ -127,6 +153,49 @@ def _lower_first(item: str) -> str:
 
 def split_items(text: str) -> list[str]:
     return [_lower_first(p) for p in (x.strip(_PUNCT + " ") for x in _ITEM_SPLIT.split(text or "")) if p]
+
+
+def _hesitation(word: str) -> bool:
+    w = _low(word)
+    return w in _HESITATION_WORDS or bool(_HESITATION_RE.fullmatch(w))
+
+
+def item_phrase(text: str) -> tuple[list[str], bool]:
+    """Items with hesitations taken out, and whether the person is still going.
+
+    «и» between items is just a separator. «и» or «а-а» at the end, a comma left
+    hanging, or no real item yet means the list is still open.
+    """
+    raw = (text or "").strip()
+    toks = _tokens(raw)
+    open_end = raw.rstrip().endswith(",")
+    hesitated = False
+    while toks and (_hesitation(_low(toks[-1])) or _low(toks[-1]) in _TRAIL):
+        open_end = True
+        toks = toks[:-1]
+    while toks and _hesitation(_low(toks[0])):
+        hesitated = True
+        toks = toks[1:]
+    kept: list[str] = []
+    for word in toks:
+        if _hesitation(_low(word)):
+            hesitated = True
+            continue
+        kept.append(word)
+    items: list[str] = []
+    for part in split_items(_join(kept)):
+        words = _tokens(part)
+        while words and _low(words[0]) in _TRAIL:
+            words = words[1:]
+        words = [w for w in words if not _hesitation(_low(w))]
+        if words:
+            items.append(_lower_first(_join(words)))
+    return items, open_end or hesitated or not items
+
+
+def _closing(low: list[str]) -> bool:
+    words = [w for w in low if w != "это" and not _hesitation(w) and w not in _FILLERS]
+    return bool(words) and all(w in _CLOSE_WORDS for w in words)
 
 
 def in_domain(text: str) -> bool:
@@ -489,7 +558,12 @@ class NotesBook:
             return self._create(tail, who)
         if is_add:
             name, rest = self._resolve(tail)
-            items = split_items(_join(head)) + split_items(_join(rest))
+            raw = " ".join(part for part in (_join(head), _join(rest)) if part)
+            items, opened = item_phrase(raw)
+            if opened:
+                held = self._hold_known(name, items, who, opened)
+                if held is not None:
+                    return held
             return self._act("add", "list", name, items, who)
         if is_clear:
             return self._act("clear", "list", tail, [], who)
@@ -592,7 +666,178 @@ class NotesBook:
             for i in range(1, len(toks) - 1):
                 if low[i] in _PREPS and i > 1 and self.find(toks[i:]):
                     return self._act("add", "list", toks[i:], split_items(_join(toks[1:i])), who)
+        if verb.startswith(_ADD):
+            for i in range(1, len(toks) - 1):
+                if low[i] in _PREPS and i > 1 and self.find(toks[i:]):
+                    items, opened = item_phrase(_join(toks[1:i]))
+                    if opened:
+                        held = self._hold_known(toks[i:], items, who, opened)
+                        if held is not None:
+                            return held
+                    return self._act("add", "list", toks[i:], items, who)
         return None
+
+    # ------------------------------------------------- an unfinished list
+    def _hold(self, coll: dict[str, Any], items: list[str], who: str | None, opened: bool, speaker_id: str | None, extend: bool = True) -> Reply:
+        return Reply(
+            "",
+            expect_reply=True,
+            extend=extend,
+            pending={
+                "op": "list_more",
+                "id": coll["id"],
+                "items": list(items),
+                "open": opened,
+                "who": who,
+                "speaker_id": speaker_id,
+            },
+        )
+
+    def _hold_known(self, query: list[str], items: list[str], who: str | None, opened: bool) -> Reply | None:
+        """Hold only when the list is already known. Otherwise the usual question."""
+        colls = self.of_kind("list")
+        if not _content(query):
+            coll = colls[0] if len(colls) == 1 else None
+        else:
+            found = self.find(query, "list")
+            coll = found[0] if len(found) == 1 else None
+        if coll is None:
+            return None
+        return self._hold(coll, items, who, opened, None)
+
+    def _merge(self, old: list[str], new: list[str]) -> list[str]:
+        seen = {_low(item) for item in old}
+        out = list(old)
+        for item in new:
+            key = _low(item)
+            if key and key not in seen:
+                out.append(item)
+                seen.add(key)
+        return out
+
+    def _commit_items(self, coll: dict[str, Any], items: list[str], who: str | None) -> Reply:
+        if not items:
+            return self._ask(f"Что добавить в {self._to_title(coll)}?", op="items", id=coll["id"])
+        return self._do_add(coll, items, who)
+
+    def _save_prefix(self, coll: dict[str, Any], items: list[str], who: str | None) -> str:
+        """Write the buffer because the talk moved on. A short line to put before the other answer."""
+        if not items:
+            return ""
+        added, known = self.add_items(coll["id"], items, who)
+        if added:
+            return f"Записала: {', '.join(added)}."
+        if known:
+            return f"Уже есть: {', '.join(known)}."
+        return ""
+
+    def _same_voice(self, pending: dict[str, Any], speaker_id: str | None, voices_known: bool) -> bool:
+        owner = pending.get("speaker_id")
+        if not voices_known or not owner:
+            return True
+        return bool(speaker_id) and speaker_id == owner
+
+    def _reads_buffer(self, low: list[str]) -> bool:
+        if not low or self._marker(low) is not None:
+            return False
+        if low[0] in _ASK and any(w.startswith(("запис", "набра")) for w in low):
+            return True
+        return len(low) <= 3 and any(w.startswith(_BUFFER_READ) for w in low)
+
+    def _removes_buffer(self, low: list[str]) -> bool:
+        return bool(low) and low[0].startswith(_REMOVE) and self._marker(low) is None
+
+    def _switches_away(self, text: str, low: list[str]) -> bool:
+        """A command to the assistant, not another item."""
+        if not low:
+            return False
+        if low[0].startswith(_DEVICE_VERBS) or low[0].startswith(_HOME) or asked_measure(text):
+            return True
+        if self._marker(low) is None:
+            return False
+        verb = low[0]
+        return (
+            verb in _ASK
+            or verb.startswith(_READ)
+            or verb.startswith(_REMOVE)
+            or verb.startswith(_CLEAR)
+            or verb.startswith(_CREATE)
+            or verb.startswith(_ADD)
+            or verb.startswith(_NOTE_VERBS)
+        )
+
+    def _chatter(self, low: list[str]) -> bool:
+        if not low:
+            return True
+        if low[0] in _CHATTER:
+            return True
+        return len(low) > _ITEM_WORDS
+
+    def _drop_buffered(self, text: str, items: list[str]) -> tuple[list[str], list[str]]:
+        low = [_low(w) for w in _tokens(text)]
+        if any(w.startswith(_LAST) for w in low):
+            if not items:
+                return items, []
+            return items[:-1], [items[-1]]
+        rest = _tokens(text)[1:]
+        while rest and (_low(rest[0]) in _PREPS or _low(rest[0]) in _FILLERS or _low(rest[0]) in {"это", "ещё", "еще"}):
+            rest = rest[1:]
+        while rest and _low(rest[-1]) in _FILLERS:
+            rest = rest[:-1]
+        want = _content(_tokens(_join(rest)))
+        if not want:
+            return items, []
+        exact = [item for item in items if _content(_tokens(item)) == want]
+        hits = exact or [item for item in items if all(_word_in(w, _content(_tokens(item))) for w in want)]
+        gone = set(hits)
+        return [item for item in items if item not in gone], hits
+
+    def _keep(
+        self, coll: dict[str, Any], pending: dict[str, Any], items: list[str], speech: str, opened: bool, extend: bool
+    ) -> More:
+        reply = self._hold(coll, items, pending.get("who"), opened, pending.get("speaker_id"), extend)
+        reply.speech = speech
+        return More("hold", reply)
+
+    def take_more(
+        self, text: str, pending: dict[str, Any], who: str | None, speaker_id: str | None, voices_known: bool
+    ) -> More:
+        """The next phrase while items are still only in memory."""
+        coll = self.get(pending.get("id") or "")
+        if coll is None:
+            return More("done", Reply("Этого уже нет."))
+        items = list(pending.get("items") or [])
+        low = [_low(w) for w in _tokens(text)]
+        if not self._same_voice(pending, speaker_id, voices_known):
+            if self._switches_away(text, low):
+                return More("handoff", Reply(self._save_prefix(coll, items, pending.get("who"))))
+            return self._keep(coll, pending, items, "", bool(pending.get("open")), False)
+        if _closing(low):
+            return More("done", self._commit_items(coll, items, pending.get("who")))
+        if self._reads_buffer(low):
+            speech = "Пока ничего." if not items else f"Пока: {', '.join(items)}."
+            return self._keep(coll, pending, items, speech, bool(pending.get("open")), True)
+        if self._removes_buffer(low):
+            kept, removed = self._drop_buffered(text, items)
+            if not _content(_tokens(" ".join(_tokens(text)[1:]))):
+                speech = "Что убрать?"
+                kept = items
+            else:
+                speech = f"Убрано: {', '.join(removed)}." if removed else "Этого пока нет."
+            return self._keep(coll, pending, kept, speech, bool(pending.get("open")), True)
+        if self._switches_away(text, low):
+            return More("handoff", Reply(self._save_prefix(coll, items, pending.get("who"))))
+        if self._chatter(low):
+            return self._keep(coll, pending, items, "", bool(pending.get("open")), False)
+        added, opened = item_phrase(text)
+        return self._keep(coll, pending, self._merge(items, added), "", opened, True)
+
+    def finish_more(self, pending: dict[str, Any]) -> Reply:
+        """The pause ran out: write what was said, or ask if nothing was."""
+        coll = self.get(pending.get("id") or "")
+        if coll is None:
+            return Reply("Этого уже нет.")
+        return self._commit_items(coll, list(pending.get("items") or []), pending.get("who"))
 
     # ------------------------------------------------------ the answer to a question
     def answer(self, text: str, pending: dict[str, Any], who: str | None = None) -> Reply | None:
@@ -618,7 +863,10 @@ class NotesBook:
             if first.startswith(_ADD):
                 text = _join(toks[1:])
             if coll["kind"] == "list":
-                return self._do_add(coll, split_items(text), who)
+                items, opened = item_phrase(text)
+                if opened:
+                    return self._hold(coll, items, who, opened, pending.get("speaker_id"))
+                return self._do_add(coll, items, who)
             return self._do_add(coll, [text.strip(_PUNCT + " ")], who)
         if op == "text":
             if says_no:

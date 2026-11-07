@@ -5,7 +5,7 @@ Down: TTS PCM, ring state, volume
 
 Everything is decided on the PC, per board:
   audio -> VAD -> speaker id + GigaAM -> room diary (always)
-        -> openWakeWord -> command capture -> GigaAM -> assistant -> Kokoro -> board
+        -> openWakeWord -> short GigaAM check -> command capture -> GigaAM -> assistant -> Kokoro -> board
 
 Frame header (16 bytes, big endian): b"HV02", type, channels, bits, 0,
 rate (u32), payload bytes (u32). Old room_diary firmware sends b"HV01" +
@@ -40,7 +40,16 @@ from settings import DSP_PARAMS, SettingsStore, clean_dsp
 from stt_client import transcribe
 from tts_client import synthesize_stream
 from tts_engine import resolve_voice
-from wake import WakeDetector, match_prefix, model_phrases, normalize, phrase_list, strip_wake_word
+from wake import (
+    WakeConfirm,
+    WakeDetector,
+    confirm_phrases,
+    match_prefix,
+    model_phrases,
+    normalize,
+    phrase_list,
+    strip_wake_word,
+)
 
 try:
     import webrtcvad  # type: ignore
@@ -168,7 +177,9 @@ class Segmenter:
                 return True
         return True
 
-    def feed(self, pcm: bytes, threshold: float, silence_ms: int, max_ms: int) -> list[bytes]:
+    def feed(
+        self, pcm: bytes, threshold: float, silence_ms: int, max_ms: int, *, end_on_silence: bool = True
+    ) -> list[bytes]:
         out: list[bytes] = []
         data = self._rest + pcm
         usable = len(data) - len(data) % FRAME_BYTES
@@ -186,7 +197,7 @@ class Segmenter:
             elif self.in_speech:
                 self.buf.extend(frame)
                 self.silence_ms += 20
-                if self.silence_ms >= silence_ms:
+                if end_on_silence and self.silence_ms >= silence_ms:
                     out.append(self._take())
                     continue
             else:
@@ -222,9 +233,10 @@ class CommandCapture:
 
     TIMEOUT = object()
 
-    def __init__(self, reason: str, silent: bool = False) -> None:
+    def __init__(self, reason: str, silent: bool = False, wait_s: float | None = None) -> None:
         self.reason = reason
         self.silent = silent  # TV on: show nothing until the voice is recognised
+        self.wait_s = wait_s  # None: the usual wait for a command to start
         self.seg = Segmenter(preroll_ms=200)
         self.started = time.monotonic()
         self.wake_pcm = b""
@@ -235,6 +247,22 @@ class CommandCapture:
             return done[0]
         if not self.seg.in_speech and time.monotonic() - self.started > wait_s:
             return self.TIMEOUT
+        return None
+
+    def absorb(self, pcm: bytes, threshold: float, silence_ms: int, max_ms: int) -> bytes | None:
+        """Audio gathered while the wake word was checked.
+
+        A pause already long enough ends the command. A shorter one stays open,
+        so the words said straight after the name are not cut off and a breath
+        after the name does not finish the command by itself.
+        """
+        if not pcm:
+            return None
+        done = self.seg.feed(pcm, threshold, silence_ms, max_ms, end_on_silence=False)
+        if done:
+            return done[0]
+        if self.seg.in_speech and self.seg.silence_ms >= silence_ms:
+            return self.seg._take()
         return None
 
 
@@ -307,6 +335,11 @@ class Satellite:
         self.busy = False
         self.mute_until = 0.0
         self.command: CommandCapture | None = None
+        self.confirm: WakeConfirm | None = None
+        self._preroll = b""
+        self.list_hold_s = 0.0       # >0 while an unfinished list is being dictated
+        self.list_hold_until = 0.0   # monotonic deadline of that pause
+        self.list_hold_extend = True
         self.thinking_since: float | None = None
         self.empty_streak = 0
         self.wake_pause_until = 0.0
@@ -507,7 +540,33 @@ class Satellite:
         return ST_SLEEP if self.hub.modes.sleeping() else ST_IDLE
 
     async def go_idle(self) -> None:
+        # dictation was left (stop, sleep, error): write what was already said
+        self.confirm = None
+        self._preroll = b""
+        hold = self.list_hold_s > 0
+        self.list_hold_s = 0.0
+        self.list_hold_until = 0.0
         await self.set_state(self.idle_state())
+        if not hold:
+            return
+        result = self.hub.assistant.finish_list(self.id)
+        if result is None:
+            return
+        self.hub.assistant.record(
+            {
+                "satellite": self.id,
+                "text": "",
+                "reply": result.speech,
+                "backend": result.backend,
+                "actions": result.actions,
+                "expect_reply": result.expect_reply,
+            }
+        )
+        _LOGGER.info("%s: list hold closed -> «%s»", self.id, result.speech)
+        if result.speech and self.voice_out() is not None:
+            self.reply(result.speech, expect_reply=result.expect_reply)
+        elif result.expect_reply:
+            await self.start_command("follow_up")
 
     async def earcon(self, kind: str) -> None:
         """This board's sound, played wherever its answers play."""
@@ -723,17 +782,32 @@ class Satellite:
             self.hub.runtime.feed_capture(pcm, self.id)
             self.feed_live(pcm)
         if not self.can_listen:
+            self.confirm = None
+            self._preroll = b""
             return
         s = self.hub.settings.get()
         # while any board speaks: ignore commands, but listen for «стоп»
-        if self.speaking or self.hub.any_speaking():
+        speaking = self.speaking or self.hub.any_speaking()
+        if speaking:
             for seg in self.stop_seg.feed(pcm, s.diary_vad_rms, STOP_SILENCE_MS, STOP_MAX_MS):
                 if duration_ms(seg) >= 250:
                     self._spawn(self._hear_stop(seg))
+        if self.confirm is not None:
+            self.confirm.push(pcm)
+            self.recent_audio.append(pcm)
+            if self.confirm.due():
+                self.confirm.begin()
+                self._spawn(self._finish_confirm(self.confirm))
+            # keep the streaming detector in step; a hit here is already being checked
+            if not speaking:
+                wake_in = self._wake_pcm if real and self._wake_pcm and len(self._wake_pcm) == len(pcm) else pcm
+                await self.wake.feed(wake_in)
+            return
+        if speaking:
             return
         if time.monotonic() < self.mute_until:
             return
-        if self.command is None:
+        if self.command is None and self.confirm is None:
             self.recent_audio.append(pcm)
         # utterances go through GigaAM for the diary and for phrase commands
         # ("алекса ...", "не спи"), even when the diary itself is off
@@ -744,18 +818,13 @@ class Satellite:
                 self.hub.runtime.submit(seg, source=self.id)
 
         if self.command is not None:
-            res = self.command.feed(pcm, s.diary_vad_rms, s.command_silence_ms, s.command_max_ms, s.command_wait_s)
-            if res is CommandCapture.TIMEOUT:
-                _LOGGER.info("%s: no command after %s", self.id, self.command.reason)
-                self.command = None
-                await self.go_idle()
-            elif res:
-                silent, wake_pcm = self.command.silent, self.command.wake_pcm
-                self.command = None
-                self.diary_seg.reset()
-                self._spawn(self.run_command(res, silent=silent, wake_pcm=wake_pcm))
-                # the command is recorded: the TV may play again while it is handled
-                self._spawn(self.hub.unduck_tv(listening_only=True))
+            if self._preroll:
+                buf, self._preroll = self._preroll, b""
+                absorbed = self.command.absorb(buf, s.diary_vad_rms, s.command_silence_ms, s.command_max_ms)
+                if absorbed:
+                    await self._finish_capture(absorbed)
+                    return
+            await self._consume_command(pcm)
             return
 
         if self.busy:
@@ -772,11 +841,18 @@ class Satellite:
                 self.last_wake["ignored"] = "sleep"
                 return
             _LOGGER.info("%s: wake word '%s' (%.2f)", self.id, s.wake_word, score)
+            if s.wake_confirm:
+                pre = b"".join(self.recent_audio)
+                pre = pre[-int(WAKE_AUDIO_S * TARGET_RATE) * 2 :]
+                self.confirm = WakeConfirm(pre, confirm_phrases(s.wake_word, s.wake_phrases), s.wake_confirm_ms, self.hub.stt_uri)
+                self.last_wake["pending"] = True
+                return
+            self.last_wake["confirmed"] = True
             await self.start_command("wake")
 
     async def on_transcript(self, text: str, match: Any, pcm: bytes) -> None:
         """Every recognised utterance: sleep phrases and custom activation phrases."""
-        if not self.can_listen or self.speaking or self.busy or self.command is not None:
+        if not self.can_listen or self.speaking or self.busy or self.command is not None or self.confirm is not None:
             return
         if self.hub.any_speaking():
             if is_command_phrase(text, phrase_list(self.hub.settings.get().stop_phrases)):
@@ -841,26 +917,135 @@ class Satellite:
         await self.on_audio(b"\0" * (ms * TARGET_RATE * 2 // 1000), real=False)
 
     # ---------------------------------------------------------- dialogue
-    async def start_command(self, reason: str) -> None:
+    def _arm_hold(self, result: Any) -> None:
+        self.list_hold_s = float(result.hold_s or 0)
+        self.list_hold_extend = bool(result.extend)
+        if result.extend:
+            self.list_hold_until = 0.0
+
+    async def _listen_hold(self) -> None:
+        """Keep the mic open for the rest of an unfinished list. A phrase that was not more items does not restart the pause."""
+        if not self.list_hold_s:
+            await self.go_idle()
+            return
+        if self.list_hold_extend or self.list_hold_until <= 0:
+            self.list_hold_until = time.monotonic() + self.list_hold_s
+        remain = self.list_hold_until - time.monotonic()
+        self.list_hold_extend = False
+        if remain <= 0.3:
+            await self._end_list_hold()
+            return
+        await self.start_command("list_hold", wait_s=remain)
+
+    async def _end_list_hold(self) -> None:
+        self.list_hold_s = 0.0
+        self.list_hold_until = 0.0
+        result = self.hub.assistant.finish_list(self.id)
+        if result is None:
+            await self.go_idle()
+            return
+        self.hub.assistant.record(
+            {
+                "satellite": self.id,
+                "text": "",
+                "reply": result.speech,
+                "backend": result.backend,
+                "actions": result.actions,
+                "expect_reply": result.expect_reply,
+            }
+        )
+        _LOGGER.info("%s: list hold ended -> «%s»", self.id, result.speech)
+        if result.speech and self.voice_out() is not None:
+            self.reply(result.speech, expect_reply=result.expect_reply)
+        elif result.expect_reply:
+            await self.start_command("follow_up")
+        else:
+            await self.go_idle()
+
+    async def _consume_command(self, pcm: bytes) -> None:
+        if self.command is None:
+            return
+        s = self.hub.settings.get()
+        wait_s = s.command_wait_s if self.command.wait_s is None else self.command.wait_s
+        res = self.command.feed(pcm, s.diary_vad_rms, s.command_silence_ms, s.command_max_ms, wait_s)
+        if res is None:
+            return
+        if res is CommandCapture.TIMEOUT:
+            reason = self.command.reason
+            _LOGGER.info("%s: no command after %s", self.id, reason)
+            self.command = None
+            if reason == "list_hold":
+                self._spawn(self._end_list_hold())
+            else:
+                await self.go_idle()
+            return
+        await self._finish_capture(res)
+
+    async def _finish_capture(self, pcm: bytes) -> None:
+        if self.command is None:
+            return
+        silent, wake_pcm = self.command.silent, self.command.wake_pcm
+        self.command = None
+        self._preroll = b""
+        self.diary_seg.reset()
+        self._spawn(self.run_command(pcm, silent=silent, wake_pcm=wake_pcm))
+        # the command is recorded: the TV may play again while it is handled
+        self._spawn(self.hub.unduck_tv(listening_only=True))
+
+    async def _finish_confirm(self, session: WakeConfirm) -> None:
+        verdict = await session.run()
+        if self.confirm is not session or self._closed:
+            return
+        if self.last_wake is not None:
+            self.last_wake.pop("pending", None)
+            self.last_wake["confirmed"] = verdict.accepted
+            self.last_wake["heard"] = verdict.heard
+            if verdict.phrase:
+                self.last_wake["phrase"] = verdict.phrase
+        self.confirm = None
+        if not verdict.accepted:
+            _LOGGER.info("%s: wake rejected, heard %r", self.id, verdict.heard)
+            return
+        if self.hub.modes.sleeping():
+            _LOGGER.info("%s: wake confirmed, ignored, sleep mode", self.id)
+            if self.last_wake is not None:
+                self.last_wake["ignored"] = "sleep"
+            return
+        _LOGGER.info("%s: wake confirmed %r, heard %r", self.id, verdict.phrase, verdict.heard)
+        self._preroll = session.command_audio()
+        await self.start_command("wake", wake_pcm=session.pre)
+        if self.command is None:
+            self._preroll = b""
+            return
+        if not self._preroll:
+            return
+        buf, self._preroll = self._preroll, b""
+        s = self.hub.settings.get()
+        absorbed = self.command.absorb(buf, s.diary_vad_rms, s.command_silence_ms, s.command_max_ms)
+        if absorbed:
+            await self._finish_capture(absorbed)
+
+    async def start_command(self, reason: str, wait_s: float | None = None, wake_pcm: bytes | None = None) -> None:
         if self.hub.modes.sleeping() and reason != "button":
             return
         # two boards heard the same wake word: the first one takes it
         if reason == "wake" and not self.hub.claim(self):
             return
         silent = reason == "wake" and self.hub.tv_guard()
-        self.command = CommandCapture(reason, silent=silent)
+        self.command = CommandCapture(reason, silent=silent, wait_s=wait_s)
         # the background level the board has been hearing: the command starts with it
         self.command.seg.seed_noise(self.diary_seg)
         self.diary_seg.reset()
         if reason == "wake":
-            pre = b"".join(self.recent_audio)
-            self.command.wake_pcm = pre[-int(WAKE_AUDIO_S * TARGET_RATE) * 2 :]
+            if wake_pcm is None:
+                wake_pcm = b"".join(self.recent_audio)
+            self.command.wake_pcm = wake_pcm[-int(WAKE_AUDIO_S * TARGET_RATE) * 2 :]
         self.recent_audio.clear()
         if not silent:
             # right away: the request itself must be heard without the TV
             self._spawn(self.hub.duck_tv())
             await self.set_state(ST_LISTENING)
-            if self.hub.settings.get().sound_wake:
+            if reason != "list_hold" and self.hub.settings.get().sound_wake:
                 # not awaited: the mic loop must keep running (mute_until covers the sound)
                 self._spawn(self.earcon("wake"))
 
@@ -878,7 +1063,11 @@ class Satellite:
             _LOGGER.exception("%s: command STT failed", self.id)
             hub.assistant.record({"satellite": self.id, "error": str(err), "duration_ms": duration_ms(pcm)})
             self.busy = False
-            await self.flash_error()
+            if self.list_hold_s:
+                self.list_hold_extend = False
+                await self._listen_hold()
+            else:
+                await self.flash_error()
             return
         text = strip_wake_word(raw, s.wake_word)
         hit = match_prefix(text, phrase_list(s.wake_phrases))
@@ -899,6 +1088,11 @@ class Satellite:
             "score": round(float(match.score), 3),
         }
         if not text:
+            if self.list_hold_s:
+                _LOGGER.info("%s: empty recognition during list hold", self.id)
+                self.list_hold_extend = False
+                await self._listen_hold()
+                return
             entry["error"] = "Пустое распознавание"
             _LOGGER.info("%s: command STT empty (%d ms)", self.id, entry["duration_ms"])
             self.empty_streak += 1
@@ -926,6 +1120,11 @@ class Satellite:
         self.busy = True
         try:
             if not hub.voice_allowed(match):
+                if self.list_hold_s:
+                    _LOGGER.info("%s: other voice during list hold, ignored", self.id)
+                    self.list_hold_extend = False
+                    await self._listen_hold()
+                    return
                 tv = hub.tv_guard()
                 entry.update(
                     rejected=True,
@@ -946,7 +1145,7 @@ class Satellite:
             try:
                 result = await hub.assistant.handle(
                     text, conv_key=self.id, speaker=speaker, device_id=self.ha_device_id, room=self.room or None,
-                    on_llm=cue.llm_started,
+                    on_llm=cue.llm_started, speaker_id=match.speaker_id if match.matched else None,
                 )
             finally:
                 cue.done()
@@ -959,10 +1158,17 @@ class Satellite:
             )
             hub.assistant.record(entry, pcm, trace=result.trace)
             _LOGGER.info("%s: «%s» -> «%s»", self.id, text, result.speech)
+            if result.hold_s:
+                self._arm_hold(result)
+            else:
+                self.list_hold_s = 0.0
+                self.list_hold_until = 0.0
             if hub.speak_gen != gen:
                 await self.go_idle()
             elif result.speech and self.voice_out() is not None:
                 self.reply(result.speech, expect_reply=result.expect_reply)
+            elif result.hold_s:
+                await self._listen_hold()
             elif result.error:
                 self._spawn(self.flash_error())
             else:
@@ -971,7 +1177,11 @@ class Satellite:
             _LOGGER.exception("%s: command failed", self.id)
             entry["error"] = str(err)
             hub.assistant.record(entry, pcm)
-            self._spawn(self.flash_error())
+            if self.list_hold_s:
+                self.list_hold_extend = False
+                await self._listen_hold()
+            else:
+                self._spawn(self.flash_error())
         finally:
             self.busy = False
 
@@ -1074,7 +1284,10 @@ class Satellite:
         if listener is not self:
             await self.go_idle()
         if expect_reply:
-            await listener.start_command("follow_up")
+            if listener.list_hold_s:
+                await listener._listen_hold()
+            else:
+                await listener.start_command("follow_up")
         else:
             await listener.go_idle()
 
@@ -1182,6 +1395,8 @@ class SatelliteHub:
         self.speak_gen += 1
         for sat in list(self.satellites.values()):
             sat.command = None
+            sat.confirm = None
+            sat._preroll = b""
             sat.busy = False
             await sat.stop_speaking()
             if sat.state not in (ST_IDLE, ST_SLEEP):
