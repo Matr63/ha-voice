@@ -126,6 +126,8 @@ class More:
 
     kind: str  # hold, done, handoff
     reply: Reply
+    # done/handoff with the buffer still unwritten: these items are checked, then save_more()
+    save: list[str] | None = None
 
 
 def _low(word: str) -> str:
@@ -810,10 +812,10 @@ class NotesBook:
         low = [_low(w) for w in _tokens(text)]
         if not self._same_voice(pending, speaker_id, voices_known):
             if self._switches_away(text, low):
-                return More("handoff", Reply(self._save_prefix(coll, items, pending.get("who"))))
+                return More("handoff", Reply(""), save=items)
             return self._keep(coll, pending, items, "", bool(pending.get("open")), False)
         if _closing(low):
-            return More("done", self._commit_items(coll, items, pending.get("who")))
+            return More("done", Reply(""), save=items)
         if self._reads_buffer(low):
             speech = "Пока ничего." if not items else f"Пока: {', '.join(items)}."
             return self._keep(coll, pending, items, speech, bool(pending.get("open")), True)
@@ -826,18 +828,25 @@ class NotesBook:
                 speech = f"Убрано: {', '.join(removed)}." if removed else "Этого пока нет."
             return self._keep(coll, pending, kept, speech, bool(pending.get("open")), True)
         if self._switches_away(text, low):
-            return More("handoff", Reply(self._save_prefix(coll, items, pending.get("who"))))
+            return More("handoff", Reply(""), save=items)
         if self._chatter(low):
             return self._keep(coll, pending, items, "", bool(pending.get("open")), False)
         added, opened = item_phrase(text)
         return self._keep(coll, pending, self._merge(items, added), "", opened, True)
 
-    def finish_more(self, pending: dict[str, Any]) -> Reply:
-        """The pause ran out: write what was said, or ask if nothing was."""
+    def save_more(self, pending: dict[str, Any], items: list[str], handoff: bool = False) -> Reply:
+        """The dictation ended: write the (checked) items, or ask if nothing is left.
+        handoff: the talk moved on, the answer is only a short line before the other one."""
         coll = self.get(pending.get("id") or "")
         if coll is None:
-            return Reply("Этого уже нет.")
-        return self._commit_items(coll, list(pending.get("items") or []), pending.get("who"))
+            return Reply("" if handoff else "Этого уже нет.")
+        if handoff:
+            return Reply(self._save_prefix(coll, items, pending.get("who")))
+        return self._commit_items(coll, items, pending.get("who"))
+
+    def list_title(self, pending: dict[str, Any]) -> str:
+        coll = self.get(pending.get("id") or "")
+        return self.title(coll) if coll is not None else ""
 
     # ------------------------------------------------------ the answer to a question
     def answer(self, text: str, pending: dict[str, Any], who: str | None = None) -> Reply | None:

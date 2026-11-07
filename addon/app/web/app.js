@@ -4,7 +4,7 @@
   const BASE = String(window.HV_BASE || "").replace(/\/+$/, "");
   const PAGE = 50;
   const POLL_MS = 4000;
-  const TABS = ["speaker", "diary", "voices", "tts", "assistant", "notes", "devices", "settings"];
+  const TABS = ["speaker", "diary", "voices", "tts", "assistant", "notes", "plugins", "devices", "settings"];
   const TAB_ALIASES = { overview: "speaker", assist: "assistant", test: "voices", catalog: "devices" };
   const SECURE = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
 
@@ -2100,8 +2100,15 @@
     tool: "Вызов функции и результат",
     direct: "Датчик найден без модели",
     notes: "Списки и заметки: без модели",
+    plugin: "Ответ плагина: без модели",
+    plugin_call: "Ключевая фраза: вопрос ушёл плагину",
+    web_search: "Поиск в интернете",
+    brother_request: "Вопрос брату",
+    brother_reply: "Ответ брата",
     ha_request: "Запрос к Home Assistant",
     ha_reply: "Ответ Home Assistant",
+    ha_call: "Обращение к Home Assistant",
+    ha_cache: "Взято из кеша, без обращения к Home Assistant",
   };
   const TRACE_ROLES = { user: "Запрос", assistant: "Модель", tool: "Результат функции" };
 
@@ -2122,6 +2129,16 @@
       ].filter(Boolean).join(" · ");
       return `${traceMessage(data.message)}${stats ? `\n\n${stats}` : ""}`;
     }
+    if (kind === "ha_call") {
+      const head = [`${data.method} ${data.path}`, data.what || "", data.status ? `ответ ${data.status}` : "", data.seconds != null ? `${data.seconds} с` : ""]
+        .filter(Boolean).join(" · ");
+      const parts = [head];
+      if (data.payload !== undefined) parts.push(`Отправлено:\n${JSON.stringify(data.payload, null, 2)}`);
+      if (data.error) parts.push(`Ошибка: ${data.error}`);
+      else if (data.result !== undefined) parts.push(`Получено:\n${typeof data.result === "string" ? data.result : JSON.stringify(data.result, null, 2)}`);
+      return parts.join("\n\n");
+    }
+    if (kind === "ha_cache") return `${data.what}: ${data.count} шт., получен ${data.age_s} с назад`;
     return JSON.stringify(data, null, 2);
   }
 
@@ -2157,6 +2174,7 @@
         <div class="row" style="margin-top:4px"><button type="button" class="btn ghost sm" data-prompt-reset="llm_system_prompt">${icon("refresh")}Вернуть стандартный текст</button></div>
       </div>
       <div class="field"><label for="f_llm_prompt">Дополнительные указания</label><textarea class="input" id="f_llm_prompt" name="llm_prompt" rows="2" placeholder="Например: обращайся ко мне на «ты», детскую называй комнатой Маши">${esc(s.llm_prompt || "")}</textarea><div class="hint">Дописываются в конец промпта «дом».</div></div>
+      ${p.home.plugins ? `<details style="margin-bottom:8px"><summary class="small">Правила от плагинов — добавляются сами, пока плагин включён (вкладка «Плагины»)</summary><pre class="trace-pre">${esc(p.home.plugins)}</pre></details>` : ""}
       <details style="margin-bottom:12px"><summary class="small">Справочник устройств — собирается сам из вкладки «Устройства», ${p.home.catalog.length} символов</summary><pre class="trace-pre">${esc(p.home.catalog)}</pre></details>
       <div class="field">
         <label for="f_llm_notes_prompt">Правила: списки и заметки${mark(p.notes)} <span class="small muted">· короткий промпт, не сбрасывает кеш большого</span></label>
@@ -2245,6 +2263,9 @@
           ${e.backend === "direct" ? `<div class="small muted" style="margin-top:4px">Без модели: датчик найден по комнатам и подсказкам</div>` : ""}
           ${e.backend === "notes" ? `<div class="small muted" style="margin-top:4px">Без модели: команда про списки и заметки</div>` : ""}
           ${e.backend === "notes+llm" ? `<div class="small muted" style="margin-top:4px">Списки и заметки: фразу разобрала модель</div>` : ""}
+          ${e.backend === "plugin" ? `<div class="small muted" style="margin-top:4px">Без модели: ответил плагин по прочитанной странице</div>` : ""}
+          ${e.backend === "web" ? `<div class="small muted" style="margin-top:4px">Поиск в интернете</div>` : ""}
+          ${e.backend === "brother" ? `<div class="small muted" style="margin-top:4px">Ответил брат — другая модель через интернет</div>` : ""}
           ${e.heard && e.heard !== e.text ? `<div class="small muted" style="margin-top:4px">Распознано целиком: «${esc(e.heard)}»</div>` : ""}
           ${e.has_trace ? `<details class="trace" data-trace="${e.id}" ${(state.traceOpen || new Set()).has(e.id) ? "open" : ""}><summary class="small">Что ушло ассистенту и что вернулось</summary><div class="trace-body">${traceHtml((state.traces || {})[e.id])}</div></details>` : ""}
           ${e.has_audio ? `<audio controls preload="none" src="${BASE}/api/assistant/log/${e.id}/audio" style="height:30px;margin-top:6px;max-width:100%"></audio>` : ""}
@@ -2660,6 +2681,137 @@
       await notesChanged();
     } catch (err) {
       showError(err);
+    }
+  }
+
+  /* ---------------- plugins ---------------- */
+  const PLUGIN_ICONS = { weather_page: "cloud", web_search: "search", brother: "robot" };
+
+  async function loadPlugins() {
+    state.plugins = (await api("/api/plugins")).plugins || [];
+    state.pluginsKey = JSON.stringify(state.plugins);
+  }
+
+  function pluginField(p, f) {
+    const id = `pl_${p.id}_${f.name}`;
+    const v = p.config[f.name];
+    const hint = f.hint ? `<div class="hint">${esc(f.hint)}</div>` : "";
+    if (f.type === "bool") {
+      return `<div class="field"><label class="switch"><input type="checkbox" name="${esc(f.name)}" ${v ? "checked" : ""}><span class="track"></span>${esc(f.label)}</label>${hint}</div>`;
+    }
+    const label = `<label for="${id}">${esc(f.label)}</label>`;
+    if (f.type === "textarea") {
+      return `<div class="field">${label}<textarea class="input" id="${id}" name="${esc(f.name)}" rows="2">${esc(v)}</textarea>${hint}</div>`;
+    }
+    if (f.type === "secret") {
+      const set = (p.secret_set || {})[f.name];
+      return `<div class="field">${label}<input class="input" id="${id}" name="${esc(f.name)}" type="password" value="" autocomplete="new-password" spellcheck="false" placeholder="${set ? "сохранён — пусто, чтобы не менять" : "не задан"}">${hint}</div>`;
+    }
+    const attrs = f.type === "number"
+      ? `type="number" min="${f.min}" max="${f.max}" step="1" style="max-width:140px"`
+      : f.type === "url" ? 'type="url" placeholder="https://…" spellcheck="false"' : 'spellcheck="false"';
+    return `<div class="field">${label}<input class="input" id="${id}" name="${esc(f.name)}" value="${esc(v ?? "")}" autocomplete="off" ${attrs}>${hint}</div>`;
+  }
+
+  function pluginPill(p) {
+    if (p.running) return `<span class="pill">${icon("refresh", "spin")}${esc(p.stage || "работает")}</span>`;
+    if (!p.enabled) return pill("", "выключен");
+    if (p.status.error) return pill("bad", "ошибка");
+    if (p.has_data || p.on_demand) return pill("ok", p.on_demand ? "готов" : "работает");
+    return pill("warn", "ждёт первого захода");
+  }
+
+  const fmtWhen = (ts) => `${dayLabel(ts).toLowerCase()}, ${parseTs(ts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
+
+  function pluginResult(p) {
+    const st = p.status || {};
+    const d = p.debug || {};
+    const lines = [
+      st.last_ok ? `Последнее обновление: ${esc(fmtWhen(st.last_ok))}` : "",
+      st.last_try && st.error ? `Последняя попытка: ${esc(fmtWhen(st.last_try))}` : "",
+      p.next_run && !p.running ? `Следующий заход: ${esc(fmtWhen(p.next_run))}` : "",
+    ].filter(Boolean);
+    const rows = (p.summary || []).map(([k, v]) => `<div class="plugin-kv"><span class="muted">${esc(k)}</span><span>${esc(v)}</span></div>`).join("");
+    const dropped = (d.dropped || []).length
+      ? `<div class="small muted" style="margin-top:6px">Отброшены — этих чисел нет на странице: <span class="mono">${esc(d.dropped.join(", "))}</span></div>`
+      : "";
+    return `
+      ${p.running ? `<div class="small">${icon("refresh", "spin")} ${esc(p.stage)}…</div>` : ""}
+      ${st.error && !p.running ? banner("bad", "Не получилось", ` ${esc(st.error)}`) : ""}
+      ${lines.length ? `<div class="small muted">${lines.join("<br>")}</div>` : ""}
+      ${rows ? `<div class="plugin-table">${rows}</div>` : p.enabled && !p.on_demand ? "" : `<p class="small muted">${esc(p.idle_hint || "")}</p>`}
+      ${p.preview ? `<div class="small" style="margin-top:10px"><span class="muted">${esc(p.preview_label || "Колонка скажет:")}</span><div class="phrase" style="margin-top:4px">${icon("speaker")} ${esc(p.preview)}</div></div>` : ""}
+      ${dropped}
+      ${d.page ? `<details data-pl-open="${esc(p.id)}-page" style="margin-top:10px"><summary class="small">${esc(p.page_label || "Что получила модель")} — ${d.page_chars && d.page_chars !== d.page.length ? `${d.page.length} из ${d.page_chars}` : d.page.length} символов</summary>${d.url ? `<div class="small muted mono" style="overflow-wrap:anywhere">${esc(d.url)}</div>` : ""}<pre class="trace-pre">${esc(d.page)}</pre></details>` : ""}
+      ${d.reply ? `<details data-pl-open="${esc(p.id)}-reply"><summary class="small">Ответ модели${d.seconds != null ? ` · ${d.seconds} с` : ""}</summary><pre class="trace-pre">${esc(d.reply)}</pre></details>` : ""}`;
+  }
+
+  function pluginCard(p) {
+    return `
+      <div class="card" style="margin-top:14px" data-plugin="${esc(p.id)}">
+        <div class="row between"><h3>${icon(PLUGIN_ICONS[p.id] || "grid")}${esc(p.title)}</h3>${pluginPill(p)}</div>
+        <p class="card-sub">${esc(p.about)}</p>
+        <div class="grid grid-2">
+          <form data-plugin-form="${esc(p.id)}" autocomplete="off">
+            ${p.fields.map((f) => pluginField(p, f)).join("")}
+            ${(p.examples || []).length ? `<div class="small muted" style="margin-bottom:8px">Можно спросить: ${p.examples.map((x) => `«${esc(x)}»`).join(", ")}</div>` : ""}
+            <div class="row" style="margin-top:6px;flex-wrap:wrap">
+              <button type="button" class="btn" data-plugin-run="${esc(p.id)}" ${p.running || !p.enabled ? "disabled" : ""}>${icon("refresh")}${esc(p.run_label || "Обновить сейчас")}</button>
+              <span class="spacer"></span>
+              <button type="submit" class="btn primary">${icon("check")}Сохранить</button>
+            </div>
+          </form>
+          <div>${pluginResult(p)}</div>
+        </div>
+      </div>`;
+  }
+
+  function renderPlugins() {
+    const v = view("plugins");
+    const open = new Set($$("details[data-pl-open]", v).filter((d) => d.open).map((d) => d.dataset.plOpen));
+    const all = state.plugins || [];
+    v.innerHTML = `
+      <div class="card">
+        <h3>${icon("grid")}Плагины для LLM</h3>
+        <p class="card-sub">Плагин приносит ассистенту то, чего нет в Home Assistant. Простые вопросы он закрывает сам и сразу; остальное модель решает с его данными — плагин даёт ей свою функцию и строку правил в промпте «дом». Модель для плагинов — та же, что в «Ассистенте», страницы она читает в отдельном слоте и не сбрасывает кеш команд.</p>
+      </div>
+      ${all.map(pluginCard).join("") || emptyBox("grid", "Плагинов нет")}`;
+    $$("details[data-pl-open]", v).forEach((d) => { if (open.has(d.dataset.plOpen)) d.open = true; });
+  }
+
+  async function onPluginsSubmit(ev) {
+    const form = ev.target.closest("[data-plugin-form]");
+    if (!form) return;
+    ev.preventDefault();
+    const payload = {};
+    for (const el of form.elements) {
+      if (!el.name) continue;
+      payload[el.name] = el.type === "checkbox" ? el.checked : el.type === "number" ? Number(el.value) : el.value;
+    }
+    const btn = $("button[type=submit]", form);
+    btn.disabled = true;
+    try {
+      const p = await postJson(`/api/plugins/${form.dataset.pluginForm}`, payload);
+      state.plugins = state.plugins.map((x) => (x.id === p.id ? p : x));
+      toast(p.running ? "Сохранено — открываю страницу" : "Сохранено");
+      renderPlugins();
+    } catch (err) {
+      showError(err);
+      btn.disabled = false;
+    }
+  }
+
+  async function onPluginsClick(ev) {
+    const b = ev.target.closest("[data-plugin-run]");
+    if (!b) return;
+    b.disabled = true;
+    try {
+      const p = await postJson(`/api/plugins/${b.dataset.pluginRun}/run`, {});
+      state.plugins = state.plugins.map((x) => (x.id === p.id ? p : x));
+      renderPlugins();
+    } catch (err) {
+      showError(err);
+      b.disabled = false;
     }
   }
 
@@ -3105,6 +3257,10 @@
           await loadNotes();
           renderNotes();
           break;
+        case "plugins":
+          await loadPlugins();
+          renderPlugins();
+          break;
         case "devices":
           await loadCatalog();
           renderDevices();
@@ -3172,6 +3328,10 @@
         const before = state.notesKey;
         await loadNotes();
         if (state.notesKey !== before) renderNotes();
+      } else if (state.tab === "plugins" && !editing("plugins")) {
+        const before = state.pluginsKey;
+        await loadPlugins();
+        if (state.pluginsKey !== before) renderPlugins();
       } else if (state.tab === "diary" && state.diary.items.length <= PAGE && state.playingId == null) {
         await loadDiary();
       } else if (state.tab === "tts" && !editing("tts")) {
@@ -3220,6 +3380,8 @@
   document.addEventListener("toggle", onTraceToggle, true);
   view("notes").addEventListener("click", onNotesClick);
   view("notes").addEventListener("submit", onNotesSubmit);
+  view("plugins").addEventListener("submit", onPluginsSubmit);
+  view("plugins").addEventListener("click", onPluginsClick);
   view("devices").addEventListener("change", onDevicesChange);
   view("devices").addEventListener("click", onDevicesClick);
   view("devices").addEventListener("focusout", onDevicesHints);

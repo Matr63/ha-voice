@@ -274,6 +274,7 @@ class ThinkingCue:
         self.sat = sat
         self.after = float(sat.hub.settings.get().thinking_after_s)
         self.predicted: float | None = None
+        self.phrase: str | None = None  # said at once instead of a random «думаю»
         self.finished = False
         self._wake = asyncio.Event()
         sat._spawn(self._run())
@@ -283,23 +284,30 @@ class ThinkingCue:
             self.predicted = predicted_s
             self._wake.set()
 
+    def announce(self, phrase: str) -> None:
+        """«Записываю»: said now, even with the thinking phrases turned off."""
+        self.phrase = phrase
+        self._wake.set()
+
     def done(self) -> None:
         self.finished = True
         self._wake.set()
 
     async def _run(self) -> None:
         sat, hub = self.sat, self.sat.hub
-        if not hub.settings.get().thinking_cue:
-            return
+        enabled = hub.settings.get().thinking_cue
         gen = hub.speak_gen
         try:
-            await asyncio.wait_for(self._wake.wait(), self.after)
+            # turned off: only an announce() or done() wakes it
+            await asyncio.wait_for(self._wake.wait(), self.after if enabled else None)
         except asyncio.TimeoutError:
             pass
         out = sat.voice_out()
         if self.finished or out is None or hub.modes.sleeping():
             return
-        phrase = hub.next_cue_phrase()
+        if not self.phrase and not enabled:
+            return
+        phrase = self.phrase or hub.next_cue_phrase()
         if not phrase:
             return
         try:
@@ -549,7 +557,7 @@ class Satellite:
         await self.set_state(self.idle_state())
         if not hold:
             return
-        result = self.hub.assistant.finish_list(self.id)
+        result = await self._finish_list()
         if result is None:
             return
         self.hub.assistant.record(
@@ -937,10 +945,20 @@ class Satellite:
             return
         await self.start_command("list_hold", wait_s=remain)
 
+    async def _finish_list(self) -> Any:
+        """Write the dictated list: «Записываю» while the model checks it."""
+        cue = ThinkingCue(self)
+        try:
+            return await self.hub.assistant.finish_list(self.id, on_saving=cue.announce)
+        finally:
+            cue.done()
+
     async def _end_list_hold(self) -> None:
         self.list_hold_s = 0.0
         self.list_hold_until = 0.0
-        result = self.hub.assistant.finish_list(self.id)
+        if self.state != ST_THINKING:
+            await self.set_state(ST_THINKING)
+        result = await self._finish_list()
         if result is None:
             await self.go_idle()
             return
@@ -1146,6 +1164,7 @@ class Satellite:
                 result = await hub.assistant.handle(
                     text, conv_key=self.id, speaker=speaker, device_id=self.ha_device_id, room=self.room or None,
                     on_llm=cue.llm_started, speaker_id=match.speaker_id if match.matched else None,
+                    on_saving=cue.announce,
                 )
             finally:
                 cue.done()

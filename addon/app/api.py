@@ -21,6 +21,7 @@ from gate_server import GateState
 from ha_client import HaClient, HaError
 from llm import PRESETS, LlmManager
 import models_archive
+from plugins import PluginManager
 from satellite import SatelliteHub, ThinkingCue
 from settings import SettingsStore
 from speakers import SpeakerStore
@@ -46,6 +47,7 @@ class AppContext:
     ha: HaClient
     firmware: FirmwareStore
     llm: LlmManager
+    plugins: PluginManager
     stt_uri: str
     stt_model: str
     tts_uri: str
@@ -790,6 +792,24 @@ def create_app(ctx: AppContext) -> web.Application:
             return _err("Такой записи нет", 404)
         return web.json_response(assistant.notes.get(request.match_info["cid"]))
 
+    # ------------------------------------------------------------ plugins
+    async def plugins_list(_: web.Request) -> web.Response:
+        return web.json_response({"plugins": ctx.plugins.view()})
+
+    async def plugin_configure(request: web.Request) -> web.Response:
+        data = await _json_obj(request)
+        try:
+            view = ctx.plugins.configure(request.match_info["pid"], data)
+        except KeyError:
+            return _err("Такого плагина нет", 404)
+        return web.json_response(view)
+
+    async def plugin_run(request: web.Request) -> web.Response:
+        try:
+            return web.json_response(ctx.plugins.run(request.match_info["pid"]))
+        except KeyError:
+            return _err("Такого плагина нет", 404)
+
     async def ha_media_players(_: web.Request) -> web.Response:
         states = await ctx.ha.request("GET", "/states")
         players = [
@@ -974,6 +994,9 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_delete("/api/notes/{cid}", notes_delete)
     r.add_post("/api/notes/{cid}/items", notes_add_item)
     r.add_delete("/api/notes/{cid}/items/{item_id}", notes_delete_item)
+    r.add_get("/api/plugins", plugins_list)
+    r.add_post("/api/plugins/{pid}", plugin_configure)
+    r.add_post("/api/plugins/{pid}/run", plugin_run)
     r.add_get("/api/ha", ha_status)
     r.add_get("/api/ha/media_players", ha_media_players)
     r.add_get("/api/wake/models", wake_models)

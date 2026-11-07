@@ -16,7 +16,6 @@ import logging
 import re
 import time
 from collections import deque
-from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from difflib import get_close_matches, ndiff
@@ -28,24 +27,19 @@ import aiohttp
 from ha_client import HaClient, HaError
 from media_control import service_data, service_name, supports, twins, without_unnamed_twins
 from notes import HOLD_OPEN_S, HOLD_SETTLE_S, NOTES_RULES, NOTES_TOOLS, NotesBook, Reply, in_domain
+from plugins import PLUGIN_TOOL_NAMES
 from sensor_lookup import MAX_ANSWERS, WEATHER_ATTRS, asked_measure, asks_outside, find_sensors, spoken_value
 from settings import SettingsStore
+from tracing import note as _note, start as _start_trace
 
 _LOGGER = logging.getLogger("ha-voice.assistant")
 
 CONVERSATION_TTL_S = 300
 KEEP_AUDIO = 40
 KEEP_TRACES = 40
-# everything sent to the model or HA and what came back, for the command being handled
-_trace: ContextVar[list[dict[str, Any]] | None] = ContextVar("assistant_trace", default=None)
-
-
-def _note(kind: str, **data: Any) -> None:
-    trace = _trace.get()
-    if trace is not None:
-        trace.append({"kind": kind, **data})
-    if kind in ("llm_reply", "tool", "direct", "ha_reply"):
-        _LOGGER.info("%s: %s", kind, json.dumps(data, ensure_ascii=False, default=str)[:800])
+# The time goes to the model again only after this long: within a talk it barely moves
+CONTEXT_TIME_RESEND_S = 300
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 
 MAX_TOOL_ROUNDS = 6
@@ -76,20 +70,52 @@ SYSTEM_RULES = """Ты — голосовой ассистент умного д
 - Текущие значения датчиков и состояния устройств узнавай через get_state.
 - Никогда не отвечай «сейчас узнаю», «посмотрю», «проверю»: второго шанса не будет. Сразу вызови функцию и ответь результатом.
 - Одинаковые имена датчиков в одной комнате — это разные приборы; смотри имя прибора и подсказки.
-- В начале сообщения пользователя в квадратных скобках — время, кто говорит и комната колонки."""
+- В начале сообщения пользователя в квадратных скобках бывает контекст: time — время, speaker — кто говорит, room — комната колонки. Он действует, пока не придёт новый. Если комната в запросе не названа, речь о комнате колонки."""
 CATALOG_HEADER = "Справочник устройств: комната, в ней прибор, в нём entity_id — имя (подсказки)."
 # The system prompt holds nothing that changes between requests (no time, no
 # states): llama.cpp then reuses its cache and reads only the new words, instead
 # of the whole device list on every command (tens of seconds on a CPU).
-PROMPT_NAMES = {"home": "дом", "notes": "списки и заметки"}
+PROMPT_NAMES = {"home": "дом", "notes": "списки и заметки", "list_review": "проверка списка"}
 # llama-server slots: each prompt keeps its own place in the cache
 SLOT_HOME = 0
 SLOT_NOTES = 1
+# a plugin reading a page: a long prompt, new every time, kept away from the other two
+SLOT_PLUGINS = 2
+# reading a page on a CPU takes far longer than a command
+PLUGIN_TIMEOUT_S = 600
 # how long a question back waits for its answer; later the phrase is a new command
 PENDING_TTL_S = 45
 # «а в зале?» right after «температура на кухне»
 FOLLOWUP_TTL_S = 120
 MAX_DIFF_LINES = 60
+# Before a dictated list is written, the model reads it once more and drops what
+# is not an item. In English: shorter for the model, so faster on a CPU. Constant,
+# so llama.cpp keeps it cached; the list itself goes in the user message.
+LIST_REVIEW_RULES = """You check a list that was dictated by voice and transcribed by speech recognition, before it is saved.
+The user message gives the list name and its numbered items (in Russian).
+Remove an item when it is not something to put on such a list:
+- filler words, interjections, hesitations;
+- yes/no answers, confirmations, agreement or refusal;
+- words addressed to the assistant or to other people, pieces of conversation;
+- recognition noise: a fragment or a word that means nothing on its own;
+- a repeat of another item.
+Keep every real item, even an unusual one or one that does not match the list name. When in doubt, keep it.
+Never change, merge or add items. Call keep_items with the numbers of the items to keep."""
+LIST_REVIEW_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "keep_items",
+            "description": "The numbers of the items that stay on the list.",
+            "parameters": {
+                "type": "object",
+                "properties": {"keep": {"type": "array", "items": {"type": "integer"}}},
+                "required": ["keep"],
+            },
+        },
+    }
+]
+SAVING_PHRASE = "Записываю"
 
 TOOLS = [
     {
@@ -159,7 +185,7 @@ TOOLS = [
 
 # Small local models sometimes write a tool call as plain text instead of making
 # it: get_state(sensor.x), light.turn_on(entity_id="light.y"), {"name": ..., "arguments": ...}
-_TOOL_NAMES = sorted(t["function"]["name"] for t in TOOLS)
+_TOOL_NAMES = sorted([t["function"]["name"] for t in TOOLS] + PLUGIN_TOOL_NAMES)
 _TOOL_POSITIONAL = {
     "get_state": ("entity_id",),
     "ask_user": ("question",),
@@ -305,6 +331,11 @@ class _Conversation:
     # what the last direct answer measured, for «а в зале?»
     last_measure: str = ""
     last_measure_at: float = 0.0
+    # a plugin answered last, for «а завтра?»
+    last_plugin_at: float = 0.0
+    # «Что поискать?»: the next phrase is the question for this plugin
+    plugin_wait: str = ""
+    plugin_wait_at: float = 0.0
 
 
 class Assistant:
@@ -330,6 +361,7 @@ class Assistant:
         self._convs: dict[str, _Conversation] = {}
         self._session: aiohttp.ClientSession | None = None
         self.hub: Any = None
+        self.plugins: Any = None  # PluginManager
         self._ent_cache: tuple[float, list[dict[str, str]]] | None = None
 
     # ------------------------------------------------------------------ api
@@ -376,18 +408,23 @@ class Assistant:
         room: str | None = None,
         on_llm: Callable[[float | None], None] | None = None,
         speaker_id: str | None = None,
+        on_saving: Callable[[str], None] | None = None,
     ) -> AssistantResult:
-        """on_llm: called when the LLM is about to start, with the seconds it is expected to take."""
+        """on_llm: called when the LLM is about to start, with the seconds it is expected to take.
+        on_saving: says a phrase at once («Записываю») while a dictated list is checked."""
         s = self.settings.get()
         backend = s.assistant_backend
         conv = self._conv(conv_key)
         t0 = time.monotonic()
         self.busy = {"since": time.time(), "stage": "Home Assistant" if backend == "ha" else "LLM"}
-        trace: list[dict[str, Any]] = []
-        _trace.set(trace)
+        trace = _start_trace()
         _note("input", text=text, backend=backend, room=room, speaker=speaker, device_id=device_id)
         try:
-            notes = await self._notes(text, conv, speaker, on_llm, speaker_id) if backend != "off" and s.notes_enabled else None
+            notes = await self._plugin_trigger(text, conv, on_llm) if backend != "off" else None
+            if notes is None and backend != "off" and s.notes_enabled:
+                notes = await self._notes(text, conv, speaker, on_llm, speaker_id, on_saving)
+            if notes is None and backend != "off":
+                notes = self._plugin_answer(text, conv)
             if notes is not None:
                 result = notes
             elif backend == "off":
@@ -416,10 +453,7 @@ class Assistant:
         if not result.expect_reply and result.backend.endswith(("openai", "direct")):
             # keep the context briefly so "а теперь выключи" still works; it starts
             # at a phrase: a tool answer without its call confuses the model
-            tail = conv.messages[-12:]
-            while tail and tail[0].get("role") != "user":
-                tail.pop(0)
-            conv.messages = tail
+            conv.messages = _trim_history(conv.messages)
         prefix = conv.list_prefix
         conv.list_prefix = ""
         if prefix:
@@ -482,6 +516,10 @@ class Assistant:
     async def _all_rows(self) -> list[dict[str, str]]:
         now = time.monotonic()
         if self._ent_cache and now - self._ent_cache[0] < ENTITIES_CACHE_S:
+            _note(
+                "ha_cache", what="список сущностей", count=len(self._ent_cache[1]),
+                age_s=round(now - self._ent_cache[0], 1),
+            )
             return self._ent_cache[1]
         rows = await self.ha.entities(self._domains())
         self._ent_cache = (now, rows)
@@ -631,11 +669,71 @@ class Assistant:
     def _rules(self) -> str:
         return self.settings.get().llm_system_prompt.strip() or SYSTEM_RULES
 
+    # -------------------------------------------------------------- plugins
+    def _plugin_rules(self) -> str:
+        return self.plugins.rules() if self.plugins is not None else ""
+
+    def _tools(self) -> list[dict[str, Any]]:
+        return TOOLS + (self.plugins.tools() if self.plugins is not None else [])
+
+    def _plugin_answer(self, text: str, conv: _Conversation) -> AssistantResult | None:
+        """«Какая погода завтра»: a plugin answers from what it read, without the model."""
+        if self.plugins is None:
+            return None
+        now = time.time()
+        found = self.plugins.answer(text, followup=now - conv.last_plugin_at < FOLLOWUP_TTL_S)
+        if found is None:
+            return None
+        pid, speech = found
+        conv.last_plugin_at = now
+        _note("plugin", plugin=pid, speech=speech)
+        return AssistantResult(speech=speech, backend="plugin")
+
+    async def _plugin_trigger(
+        self, text: str, conv: _Conversation, on_llm: Callable[[float | None], None] | None
+    ) -> AssistantResult | None:
+        """«Поищи в интернете ...», «спроси у брата ...»: the key words send the phrase to a plugin."""
+        if self.plugins is None:
+            return None
+        found = self.plugins.trigger(text)
+        if found is None and conv.plugin_wait and time.time() - conv.plugin_wait_at < PENDING_TTL_S:
+            plugin = self.plugins.plugins.get(conv.plugin_wait)
+            if plugin is not None and plugin.enabled and text.strip():
+                found = (plugin, text.strip(" ,.!?"))
+        conv.plugin_wait = ""
+        if found is None:
+            return None
+        plugin, query = found
+        self._stage(plugin.title)
+        _note("plugin_call", plugin=plugin.title, query=query)
+        said = await plugin.respond(query, on_llm)
+        if said.ask:
+            conv.plugin_wait, conv.plugin_wait_at = plugin.id, time.time()
+        return AssistantResult(speech=said.speech, backend=said.backend, expect_reply=said.ask)
+
+    def plugin_text_limit(self) -> int:
+        """How much page text fits next to the other prompts in the model's context."""
+        return min(8000, self.settings.get().llm_ctx * 3 // 4)
+
+    async def plugin_chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        """One request from a plugin: its own slot, only its own tools, the house is not in it."""
+        try:
+            return await self._chat(
+                messages, max_tokens=700, tool_choice="required", tools=tools, slot=SLOT_PLUGINS, timeout=PLUGIN_TIMEOUT_S
+            )
+        finally:
+            if self._local_llm():
+                # a long page may have pushed the house out of the cache: read it back before a command
+                self.schedule_prewarm(1.0)
+
     def _notes_rules(self) -> str:
         return self.settings.get().llm_notes_prompt.strip() or NOTES_RULES
 
     async def _system(self) -> str:
-        parts = [self._rules(), CATALOG_HEADER, await self._entities_text()]
+        parts = [self._rules()]
+        if self._plugin_rules():
+            parts.append(self._plugin_rules())
+        parts += [CATALOG_HEADER, await self._entities_text()]
         extra = self.settings.get().llm_prompt.strip()
         if extra:
             parts.append(extra)
@@ -651,6 +749,7 @@ class Assistant:
                 "default": SYSTEM_RULES,
                 "custom": bool(s.llm_system_prompt.strip()),
                 "catalog": f"{CATALOG_HEADER}\n{await self._entities_text()}",
+                "plugins": self._plugin_rules(),
                 "chars": len(full),
             },
             "notes": {
@@ -844,15 +943,64 @@ class Assistant:
         hub = self.hub
         return bool(hub is not None and hub.runtime.store.has_speakers())
 
-    def finish_list(self, conv_key: str) -> AssistantResult | None:
-        """The open list was left in silence: write it, or ask what to add."""
+    async def finish_list(
+        self, conv_key: str, on_saving: Callable[[str], None] | None = None
+    ) -> AssistantResult | None:
+        """The open list was left in silence: check and write it, or ask what to add."""
         conv = self._convs.get(conv_key)
         pending = conv.pending if conv is not None else None
         if conv is None or not pending or pending.get("op") != "list_more":
             return None
         conv.pending = None
         conv.pending_until = 0.0
-        return self._notes_result(self.notes.finish_more(pending), conv)
+        items = await self._review_list(pending, list(pending.get("items") or []), on_saving)
+        return self._notes_result(self.notes.save_more(pending, items), conv)
+
+    async def _review_list(
+        self, pending: dict[str, Any], items: list[str], on_saving: Callable[[str], None] | None
+    ) -> list[str]:
+        """Say «Записываю», let the model drop what is not an item, keep the rest.
+        Without a model, or when it fails, everything said is written as before."""
+        if not items or not self._llm_usable():
+            return items
+        if on_saving is not None:
+            on_saving(SAVING_PHRASE)
+        self._stage("LLM проверяет список перед записью")
+        numbered = "\n".join(f"{i}. {item}" for i, item in enumerate(items, 1))
+        messages = [
+            {"role": "system", "content": LIST_REVIEW_RULES},
+            {"role": "user", "content": f"List: {self.notes.list_title(pending)}\n{numbered}"},
+        ]
+        self._note_prompt("list_review", LIST_REVIEW_RULES)
+        try:
+            msg = await self._chat(messages, max_tokens=80, tools=LIST_REVIEW_TOOLS, slot=SLOT_PLUGINS)
+        except (HaError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            _LOGGER.info("List review unavailable, writing as said: %s", err)
+            return items
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            found = _json_tool_calls((msg.get("content") or "").strip())
+            calls = [{"function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}} for n, a in found]
+        args: Any = None
+        for call in calls:
+            fn = call.get("function") or {}
+            if fn.get("name") == "keep_items":
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = None
+                break
+        keep = args.get("keep") if isinstance(args, dict) else None
+        if not isinstance(keep, list):
+            _note("list_review", items=items, error="no keep_items", kept=items)
+            return items
+        idx = {int(n) for n in keep if isinstance(n, (int, float)) or (isinstance(n, str) and n.strip().isdigit())}
+        kept = [item for i, item in enumerate(items, 1) if i in idx]
+        dropped = [item for item in items if item not in kept]
+        _note("list_review", items=items, kept=kept, dropped=dropped)
+        if dropped:
+            _LOGGER.info("List review dropped: %s", dropped)
+        return kept
 
     async def _notes(
         self,
@@ -861,12 +1009,16 @@ class Assistant:
         speaker: str | None,
         on_llm: Callable[[float | None], None] | None,
         speaker_id: str | None = None,
+        on_saving: Callable[[str], None] | None = None,
     ) -> AssistantResult | None:
         """The first stop of every phrase, and instant. None: not about lists."""
         pending, conv.pending = conv.pending, None
         if pending and time.time() < conv.pending_until:
             if pending.get("op") == "list_more":
                 more = self.notes.take_more(text, pending, speaker, speaker_id, self._voices_known())
+                if more.save is not None:
+                    items = await self._review_list(pending, more.save, on_saving)
+                    more.reply = self.notes.save_more(pending, items, handoff=more.kind == "handoff")
                 if more.kind == "handoff":
                     conv.list_prefix = more.reply.speech
                 else:
@@ -954,13 +1106,8 @@ class Assistant:
     async def _llm_rounds(
         self, text: str, conv: _Conversation, speaker: str | None, room: str | None, system: str
     ) -> AssistantResult:
-        ctx = [datetime.now().strftime("%A %d.%m.%Y %H:%M")]
-        if speaker:
-            ctx.append(f"говорит {speaker}")
-        if room:
-            ctx.append(f"колонка в комнате «{room}» — если комната не названа, речь о ней")
         keep = len(conv.messages)
-        conv.messages.append({"role": "user", "content": f"[{'; '.join(ctx)}]\n{text}"})
+        conv.messages.append(_user_message(text, speaker, room, conv.messages))
         result = AssistantResult(backend="openai")
         tools_ran = False
         nudged = False
@@ -1058,13 +1205,16 @@ class Assistant:
         tool_choice: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         slot: int = SLOT_HOME,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         s = self.settings.get()
         headers = {"Content-Type": "application/json"}
         if s.llm_api_key:
             headers["Authorization"] = f"Bearer {s.llm_api_key}"
+        messages = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
         body: dict[str, Any] = {
-            "model": s.llm_model, "messages": messages, "tools": tools or TOOLS, "temperature": 0.2, "max_tokens": max_tokens,
+            "model": s.llm_model, "messages": messages, "tools": tools or self._tools(), "temperature": 0.2,
+            "max_tokens": max_tokens,
         }
         if tool_choice:
             body["tool_choice"] = tool_choice
@@ -1077,7 +1227,8 @@ class Assistant:
             messages=[m for m in messages if m.get("role") != "system"],
         )
         t0 = time.monotonic()
-        async with session.post(s.llm_url.rstrip("/") + "/chat/completions", json=body, headers=headers) as resp:
+        extra: dict[str, Any] = {"timeout": aiohttp.ClientTimeout(total=timeout)} if timeout else {}
+        async with session.post(s.llm_url.rstrip("/") + "/chat/completions", json=body, headers=headers, **extra) as resp:
             text = await resp.text()
             if resp.status >= 400:
                 _note("llm_reply", status=resp.status, body=text[:2000], seconds=round(time.monotonic() - t0, 1))
@@ -1106,6 +1257,9 @@ class Assistant:
         return list(dict.fromkeys(able))
 
     async def _tool(self, name: str, args: dict[str, Any], result: AssistantResult) -> Any:
+        plugin = self.plugins.owner(name) if self.plugins is not None else None
+        if plugin is not None:
+            return await plugin.call_tool(name, args)
         domains = self._domains()
         try:
             if name == "list_entities":
@@ -1181,6 +1335,50 @@ class Assistant:
     async def close(self) -> None:
         if self._session is not None:
             await self._session.close()
+
+
+def _context_line(ctx: dict[str, str]) -> str:
+    parts = [f"{k}: {ctx[k]}" for k in ("time", "speaker", "room") if k in ctx]
+    return f"[{'; '.join(parts)}]\n" if parts else ""
+
+
+def _known_context(messages: list[dict[str, Any]]) -> tuple[dict[str, str], float]:
+    """What the model already knows from the history: the latest of each field, and when the time was sent."""
+    known: dict[str, str] = {}
+    time_at = 0.0
+    for m in messages:
+        ctx = m.get("_ctx") or {}
+        known.update(ctx)
+        if "time" in ctx:
+            time_at = m.get("_at", 0.0)
+    return known, time_at
+
+
+def _user_message(text: str, speaker: str | None, room: str | None, history: list[dict[str, Any]]) -> dict[str, Any]:
+    """The phrase with only the context the history does not already carry, in English."""
+    now = datetime.now()
+    # a voice not recognised mid-talk is nearly always the same person: nothing is sent then
+    current = {"speaker": speaker or "", "room": room or ""}
+    known, time_at = _known_context(history)
+    ctx = {k: v for k, v in current.items() if v and known.get(k) != v}
+    if "time" not in known or time.time() - time_at > CONTEXT_TIME_RESEND_S:
+        ctx = {"time": f"{_WEEKDAYS[now.weekday()]} {now:%Y-%m-%d %H:%M}", **ctx}
+    return {
+        "role": "user", "content": _context_line(ctx) + text,
+        "_text": text, "_ctx": ctx, "_at": time.time(),
+    }
+
+
+def _trim_history(messages: list[dict[str, Any]], keep: int = 12) -> list[dict[str, Any]]:
+    """The last messages, starting at a phrase: a tool answer without its call confuses
+    the model. Context sent in the dropped messages moves to the first phrase kept."""
+    tail = messages[-keep:]
+    while tail and tail[0].get("role") != "user":
+        tail.pop(0)
+    if tail and len(tail) < len(messages) and "_text" in tail[0]:
+        known, time_at = _known_context(messages[: len(messages) - len(tail) + 1])
+        tail[0] = {**tail[0], "content": _context_line(known) + tail[0]["_text"], "_ctx": known, "_at": time_at}
+    return tail
 
 
 def result_dict(result: AssistantResult) -> dict[str, Any]:

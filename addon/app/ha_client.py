@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 import aiohttp
 
 from settings import SettingsStore
+from tracing import active as _tracing, note as _note
 
 _LOGGER = logging.getLogger("ha-voice.ha")
 
@@ -103,6 +105,19 @@ def token_diagnostics() -> dict[str, Any]:
     }
 
 
+# what one HA call puts into the command's trace
+TRACE_LIST_ITEMS = 8
+TRACE_CHARS = 3000
+
+
+def _brief(value: Any) -> Any:
+    """A long list (every entity of a domain) is shown by its count and first items."""
+    if isinstance(value, list) and len(value) > TRACE_LIST_ITEMS:
+        value = {"всего": len(value), "первые": value[:TRACE_LIST_ITEMS]}
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    return value if len(text) <= TRACE_CHARS else text[:TRACE_CHARS] + "…"
+
+
 class HaClient:
     def __init__(self, settings: SettingsStore) -> None:
         self.settings = settings
@@ -127,12 +142,15 @@ class HaClient:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         return self._session
 
-    async def request(self, method: str, path: str, payload: Any = None) -> Any:
+    async def request(self, method: str, path: str, payload: Any = None, what: str = "") -> Any:
+        """what: said in the trace instead of a long payload (a template)."""
         target = self.target()
         if target is None:
             raise HaError("Нет доступа к Home Assistant: укажите адрес и токен в настройках")
         base, token = target
         session = await self._http()
+        t0 = time.monotonic()
+        status = 0
         try:
             async with session.request(
                 method,
@@ -140,13 +158,42 @@ class HaClient:
                 json=payload,
                 headers={"Authorization": f"Bearer {token}"},
             ) as resp:
+                status = resp.status
                 text = await resp.text()
                 if resp.status >= 400:
                     raise HaError(f"Home Assistant {resp.status}: {text[:200]}")
                 ctype = resp.headers.get("Content-Type", "")
-                return json.loads(text) if "json" in ctype and text else text
+                out = json.loads(text) if "json" in ctype and text else text
         except aiohttp.ClientError as err:
+            self._trace(method, path, payload, what, t0, status, error=str(err))
             raise HaError(f"Home Assistant недоступен: {err}") from err
+        except HaError as err:
+            self._trace(method, path, payload, what, t0, status, error=str(err))
+            raise
+        self._trace(method, path, payload, what, t0, status, result=out)
+        return out
+
+    @staticmethod
+    def _trace(
+        method: str, path: str, payload: Any, what: str, t0: float, status: int, result: Any = None, error: str = ""
+    ) -> None:
+        if not _tracing():
+            return
+        data: dict[str, Any] = {"method": method, "path": path, "status": status, "seconds": round(time.monotonic() - t0, 2)}
+        if what:
+            data["what"] = what
+        elif payload is not None:
+            data["payload"] = _brief(payload)
+        if error:
+            data["error"] = error
+        else:
+            if isinstance(result, str) and what:
+                try:
+                    result = json.loads(result)
+                except ValueError:
+                    pass
+            data["result"] = _brief(result)
+        _note("ha_call", **data)
 
     async def ping(self) -> dict[str, Any]:
         if not self.configured:
@@ -163,7 +210,7 @@ class HaClient:
 
     async def entities(self, domains: list[str]) -> list[dict[str, str]]:
         tpl = _ENTITIES_TEMPLATE.replace("DOMAINS", json.dumps(domains))
-        raw = await self.request("POST", "/template", {"template": tpl})
+        raw = await self.request("POST", "/template", {"template": tpl}, what=f"все сущности доменов {', '.join(domains)}")
         rows = json.loads(raw) if isinstance(raw, str) else raw
         out = []
         for r in rows:
@@ -181,23 +228,23 @@ class HaClient:
             out.append(item)
         return out
 
-    async def _template_json(self, tpl: str) -> Any:
-        raw = await self.request("POST", "/template", {"template": tpl})
+    async def _template_json(self, tpl: str, what: str = "шаблон") -> Any:
+        raw = await self.request("POST", "/template", {"template": tpl}, what=what)
         return json.loads(raw) if isinstance(raw, str) else raw
 
     async def device_for_mac(self, mac: str) -> tuple[str, str]:
         """(device_id, area name) of the board in HA's ESPHome integration, or ('', '')."""
         if not mac:
             return "", ""
-        d, area = await self._template_json(_DEVICE_TEMPLATE.replace("MAC", json.dumps(mac.lower())))
+        d, area = await self._template_json(_DEVICE_TEMPLATE.replace("MAC", json.dumps(mac.lower())), f"устройство платы {mac}")
         return d or "", area or ""
 
     async def areas(self) -> list[str]:
-        return list(await self._template_json(_AREAS_TEMPLATE))
+        return list(await self._template_json(_AREAS_TEMPLATE, "список комнат"))
 
     async def area_device(self, area: str) -> str:
         """Any device in the area: passed as device_id it gives HA the room context."""
-        raw = await self.request("POST", "/template", {"template": _AREA_DEVICE_TEMPLATE.replace("AREA", json.dumps(area))})
+        raw = await self.request("POST", "/template", {"template": _AREA_DEVICE_TEMPLATE.replace("AREA", json.dumps(area))}, what=f"устройство в комнате {area}")
         return str(raw).strip()
 
     async def state(self, entity_id: str) -> dict[str, Any]:

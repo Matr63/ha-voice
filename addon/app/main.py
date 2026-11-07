@@ -17,6 +17,7 @@ from ha_client import HaClient
 from llm import LlmManager
 from modes import Modes
 from notes import NotesBook
+from plugins import PluginManager
 from satellite import SatelliteHub
 from settings import SettingsStore
 from speakers import SpeakerStore
@@ -63,6 +64,8 @@ async def amain() -> None:
     firmware = FirmwareStore(Path(os.environ.get("FIRMWARE_DIR", "/data/firmware")))
     llm = LlmManager(settings)
     llm.on_ready = assistant.prewarm
+    plugins = PluginManager(Path(os.environ.get("PLUGINS_FILE", "/data/plugins.json")), assistant)
+    assistant.plugins = plugins
     ctx = AppContext(
         settings=settings,
         store=store,
@@ -73,6 +76,7 @@ async def amain() -> None:
         ha=ha,
         firmware=firmware,
         llm=llm,
+        plugins=plugins,
         stt_uri=stt_uri,
         stt_model=os.environ.get("STT_MODEL", "gigaam-v3-e2e-rnnt"),
         tts_uri=tts_uri,
@@ -93,6 +97,7 @@ async def amain() -> None:
         run_gate(gate_uri, upstream, store, settings, gate_state),
         hub.serve("0.0.0.0", pcm_port),
         ha_install.run(api_port),
+        plugins.serve(),
     )
 
 
