@@ -2072,6 +2072,50 @@
     await Promise.all(jobs);
   }
 
+  const TRACE_TITLES = {
+    input: "Запрос к ассистенту",
+    system: "Системный промпт модели",
+    llm_request: "Сообщения, отправленные модели",
+    llm_reply: "Ответ модели",
+    tool: "Вызов функции и результат",
+    direct: "Датчик найден без модели",
+    ha_request: "Запрос к Home Assistant",
+    ha_reply: "Ответ Home Assistant",
+  };
+
+  function traceHtml(trace) {
+    if (!trace) return `<div class="small muted">Загружаю…</div>`;
+    return trace.map(({ kind, ...data }) => {
+      const body = kind === "system" ? data.content : JSON.stringify(data, null, 2);
+      const title = TRACE_TITLES[kind] || kind;
+      // the prompt is long and the same every time: closed until asked for
+      return kind === "system"
+        ? `<details><summary class="small">${esc(title)} · ${String(body).length} символов</summary><pre class="trace-pre">${esc(body)}</pre></details>`
+        : `<div class="small trace-title">${esc(title)}</div><pre class="trace-pre">${esc(body)}</pre>`;
+    }).join("");
+  }
+
+  async function onTraceToggle(ev) {
+    const el = ev.target;
+    if (!el.dataset || !el.dataset.trace) return;
+    const id = Number(el.dataset.trace);
+    state.traceOpen = state.traceOpen || new Set();
+    state.traces = state.traces || {};
+    if (!el.open) {
+      state.traceOpen.delete(id);
+      return;
+    }
+    state.traceOpen.add(id);
+    if (state.traces[id]) return;
+    try {
+      state.traces[id] = (await api(`/api/assistant/log/${id}/trace`)).trace;
+    } catch (err) {
+      state.traces[id] = [{ kind: "ошибка", message: err.message || String(err) }];
+    }
+    const body = el.isConnected ? el.querySelector(".trace-body") : document.querySelector(`[data-trace="${id}"] .trace-body`);
+    if (body) body.innerHTML = traceHtml(state.traces[id]);
+  }
+
   function logItem(e) {
     const who = e.speaker ? `<span class="chip" style="--h:${hue(e.speaker)}">${esc(e.speaker)}</span>` : "";
     const b = e.rejected
@@ -2095,6 +2139,9 @@
           ${actions ? `<div style="margin-top:4px">${actions}</div>` : ""}
           ${e.error ? `<div class="small bad" style="margin-top:4px">${esc(HA_ERRORS[e.error] || e.error)}</div>` : ""}
           ${e.backend === "ha+openai" ? `<div class="small muted" style="margin-top:4px">HA не понял — ответила LLM</div>` : ""}
+          ${e.backend === "direct" ? `<div class="small muted" style="margin-top:4px">Без модели: датчик найден по комнатам и подсказкам</div>` : ""}
+          ${e.heard && e.heard !== e.text ? `<div class="small muted" style="margin-top:4px">Распознано целиком: «${esc(e.heard)}»</div>` : ""}
+          ${e.has_trace ? `<details class="trace" data-trace="${e.id}" ${(state.traceOpen || new Set()).has(e.id) ? "open" : ""}><summary class="small">Что ушло ассистенту и что вернулось</summary><div class="trace-body">${traceHtml((state.traces || {})[e.id])}</div></details>` : ""}
           ${e.has_audio ? `<audio controls preload="none" src="${BASE}/api/assistant/log/${e.id}/audio" style="height:30px;margin-top:6px;max-width:100%"></audio>` : ""}
           ${e.has_audio && (state.speakers || []).length ? `
           <div class="row small" style="gap:6px;margin-top:6px;align-items:center">
@@ -2302,6 +2349,7 @@
             ${selectField("ha_agent_id", "Агент разговора HA", s.ha_agent_id, agents, "Встроенный понимает «включи свет на кухне» без интернета. Агент с ИИ (OpenAI, Ollama, Gemini) настраивается в HA.")}
             ${switchField("llm_fallback", "Если HA не понял — спросить LLM", s.llm_fallback, "Встроенный агент знает только свои шаблоны («какая температура на кухне») и точные имена устройств. Остальное («выключи тв», «температура кухни») разберёт LLM ниже — своя модель на этом сервере или Ollama.")}
           </div>
+          ${switchField("direct_reads", "Значения датчиков — без модели", s.direct_reads, "«Температура в зале», «влажность на кухне»: датчик находится по комнатам и подсказкам на вкладке «Устройства», значение берётся из HA. Быстро и без выдуманных чисел. Всё остальное идёт в LLM.")}
           <div data-show="openai ha">
             ${textField("llm_url", "Адрес API", s.llm_url, "Ollama на этом ПК: <span class='mono'>http://127.0.0.1:11434/v1</span> (в compose — <span class='mono'>http://host.docker.internal:11434/v1</span>)")}
             ${textField("llm_model", "Модель", s.llm_model, "Нужна модель с tool calling, например qwen2.5:7b или llama3.1:8b.")}
@@ -2724,7 +2772,6 @@
       return;
     }
     const ha = state.ha;
-    const noVoices = !st || !st.speakers;
     const haLine = !ha ? "проверяю…" : ha.ok ? `подключено · Home Assistant ${esc(ha.version || "")}` : esc(ha.error || "нет доступа");
     v.innerHTML = `
       <div class="grid grid-2">
@@ -2746,9 +2793,9 @@
             ["mute", "Выключить звук"],
             ["pause", "Поставить на паузу"],
             ["off", "Не трогать"],
-          ], "После узнанного голоса ТВ стихает на время ответа и возвращается, когда колонка снова ждёт. Пока голоса не записаны, громкость ТВ не трогаем — отличить вас от передачи нельзя. Если звук на ТВ уже выключен или громкость поменяли вручную — не трогаем.")}
+          ], "Сразу после сигнала «слушаю» ТВ стихает, чтобы запрос был слышен без помех, и возвращается, как только запрос записан. Если звук на ТВ уже выключен или громкость поменяли вручную — не трогаем.")}
           ${rangeField("tv_duck_level", "Громкость ТВ на время команды", s.tv_duck_level ?? 25, 0, 90, 5, "vol", "Доля от текущей громкости телевизора.")}
-          ${noVoices ? `<div class="hint warn">Голоса ещё не записаны — отличить вас от ТВ нельзя, громкость телевизора от ключевого слова не меняется. Запишите голос во вкладке «Голоса».</div>` : ""}
+          ${switchField("tv_duck_reply", "Глушить ТВ и на время ответа", s.tv_duck_reply, "Пока ассистент думает, ТВ играет как обычно, а на время ответа стихает снова.")}
           ${saveRow()}
         </form>
       </div>
@@ -2928,6 +2975,7 @@
   view("speaker").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && ev.target.id === "spSay") $("#spSayBtn").click();
   });
+  document.addEventListener("toggle", onTraceToggle, true);
   view("devices").addEventListener("change", onDevicesChange);
   view("devices").addEventListener("click", onDevicesClick);
   view("devices").addEventListener("focusout", onDevicesHints);

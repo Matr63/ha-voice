@@ -693,6 +693,12 @@ def create_app(ctx: AppContext) -> web.Application:
             return _err("Запись команды уже не хранится", 404)
         return web.Response(body=to_wav(pcm), content_type="audio/wav", headers={"Cache-Control": "no-cache"})
 
+    async def assistant_log_trace(request: web.Request) -> web.Response:
+        trace = assistant.traces.get(int(request.match_info["entry_id"]))
+        if trace is None:
+            return _err("Подробности уже не хранятся (держатся последние 40)", 404)
+        return web.json_response({"trace": trace})
+
     async def assistant_log(request: web.Request) -> web.Response:
         return web.json_response({"log": assistant.history(int(request.query.get("limit", "100")))})
 
@@ -724,7 +730,8 @@ def create_app(ctx: AppContext) -> web.Application:
                 "actions": result.actions,
                 "expect_reply": result.expect_reply,
                 "error": result.error,
-            }
+            },
+            trace=result.trace,
         )
         if data.get("speak") and result.speech:
             sat = hub.get(data.get("id") or None)
@@ -910,6 +917,7 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_post("/api/mode", mode_set)
     r.add_get("/api/assistant/log", assistant_log)
     r.add_get("/api/assistant/log/{entry_id:\\d+}/audio", assistant_log_audio)
+    r.add_get("/api/assistant/log/{entry_id:\\d+}/trace", assistant_log_trace)
     r.add_post("/api/assistant/log/{entry_id:\\d+}/assign", assistant_log_assign)
     r.add_post("/api/assistant/ask", assistant_ask)
     r.add_get("/api/assistant/agents", assistant_agents)

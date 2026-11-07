@@ -857,6 +857,8 @@ class Satellite:
             self.command.wake_pcm = pre[-int(WAKE_AUDIO_S * TARGET_RATE) * 2 :]
         self.recent_audio.clear()
         if not silent:
+            # right away: the request itself must be heard without the TV
+            self._spawn(self.hub.duck_tv())
             await self.set_state(ST_LISTENING)
             if self.hub.settings.get().sound_wake:
                 # not awaited: the mic loop must keep running (mute_until covers the sound)
@@ -937,7 +939,6 @@ class Satellite:
                 else:
                     self._spawn(self.flash_error())
                 return
-            self._spawn(hub.duck_tv())
             gen = hub.speak_gen
             if self.state != ST_THINKING:
                 await self.set_state(ST_THINKING)
@@ -956,7 +957,7 @@ class Satellite:
                 expect_reply=result.expect_reply,
                 error=result.error,
             )
-            hub.assistant.record(entry, pcm)
+            hub.assistant.record(entry, pcm, trace=result.trace)
             _LOGGER.info("%s: «%s» -> «%s»", self.id, text, result.speech)
             if hub.speak_gen != gen:
                 await self.go_idle()
@@ -1026,6 +1027,8 @@ class Satellite:
                 self._tts_done.clear()
             if gen != hub.speak_gen:
                 return
+            if hub.settings.get().tv_duck_reply:
+                self._spawn(hub.duck_tv())
             for b in boards:
                 await b.set_state(ST_REPLYING)
             started = 0.0
@@ -1201,8 +1204,6 @@ class SatelliteHub:
         s = self.settings.get()
         entity = s.tv_entity.strip()
         if s.tv_duck == "off" or not entity or self.ha is None or not self.ha.configured:
-            return
-        if not self.runtime.store.has_speakers():
             return
         async with self._duck_lock:
             if self._ducked is not None:

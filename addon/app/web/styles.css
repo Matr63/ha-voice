@@ -414,3 +414,13 @@ a { color: var(--accent); }
   .cat-ent { grid-template-columns: auto minmax(0, 1fr) auto; }
   .cat-hint.input { grid-column: 2 / -1; }
 }
+
+/* ---------- assistant log: what was sent ---------- */
+.trace { margin-top: 6px; }
+.trace summary { cursor: pointer; color: var(--muted); }
+.trace-title { margin: 8px 0 2px; font-weight: 600; }
+.trace-pre {
+  margin: 2px 0 6px; padding: 8px 10px; max-height: 340px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 0.78rem;
+}

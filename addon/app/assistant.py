@@ -16,19 +16,35 @@ import logging
 import re
 import time
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from difflib import get_close_matches
 from typing import Any, Callable
 
 import aiohttp
 
 from ha_client import HaClient, HaError
+from sensor_lookup import MAX_ANSWERS, asked_measure, find_sensors, spoken_value
 from settings import SettingsStore
 
 _LOGGER = logging.getLogger("ha-voice.assistant")
 
 CONVERSATION_TTL_S = 300
 KEEP_AUDIO = 40
+KEEP_TRACES = 40
+# everything sent to the model or HA and what came back, for the command being handled
+_trace: ContextVar[list[dict[str, Any]] | None] = ContextVar("assistant_trace", default=None)
+
+
+def _note(kind: str, **data: Any) -> None:
+    trace = _trace.get()
+    if trace is not None:
+        trace.append({"kind": kind, **data})
+    if kind in ("llm_reply", "tool", "direct", "ha_reply"):
+        _LOGGER.info("%s: %s", kind, json.dumps(data, ensure_ascii=False, default=str)[:800])
+
+
 MAX_TOOL_ROUNDS = 6
 MAX_RECOVERED_READS = 6
 MAX_SPOKEN_READS = 3
@@ -226,6 +242,7 @@ class AssistantResult:
     backend: str = ""
     actions: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    trace: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -243,6 +260,7 @@ class Assistant:
         self._next_id = 1
         # command audio by log id: "чей это голос?" in the log teaches the voice
         self.audio: dict[int, bytes] = {}
+        self.traces: dict[int, list[dict[str, Any]]] = {}
         # how long answers take (for "обычно ~N с") and what is going on right now
         self.durations: deque[float] = deque(maxlen=10)
         # the LLM alone: what the next answer is predicted from
@@ -259,9 +277,16 @@ class Assistant:
     def history(self, limit: int = 100) -> list[dict[str, Any]]:
         return list(self.log)[: max(1, limit)]
 
-    def record(self, entry: dict[str, Any], pcm: bytes | None = None) -> dict[str, Any]:
+    def record(
+        self, entry: dict[str, Any], pcm: bytes | None = None, trace: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         entry["id"] = self._next_id
         self._next_id += 1
+        if trace:
+            self.traces[entry["id"]] = trace
+            entry["has_trace"] = True
+            for old in sorted(self.traces)[:-KEEP_TRACES]:
+                del self.traces[old]
         if pcm:
             self.audio[entry["id"]] = pcm
             entry["has_audio"] = True
@@ -298,6 +323,9 @@ class Assistant:
         conv = self._conv(conv_key)
         t0 = time.monotonic()
         self.busy = {"since": time.time(), "stage": "Home Assistant" if backend == "ha" else "LLM"}
+        trace: list[dict[str, Any]] = []
+        _trace.set(trace)
+        _note("input", text=text, backend=backend, room=room, speaker=speaker, device_id=device_id)
         try:
             if backend == "off":
                 result = AssistantResult(backend="off")
@@ -315,9 +343,12 @@ class Assistant:
             _LOGGER.exception("Assistant %s failed", backend)
             result = AssistantResult(speech="Что-то пошло не так.", backend=backend, error=str(err))
         self.busy = None
+        result.trace = trace
+        if result.error:
+            _note("error", error=result.error)
         if backend != "off":
             self.durations.append(time.monotonic() - t0)
-        if not result.expect_reply and result.backend.endswith("openai"):
+        if not result.expect_reply and result.backend.endswith(("openai", "direct")):
             # keep the context briefly so "а теперь выключи" still works; it starts
             # at a phrase: a tool answer without its call confuses the model
             tail = conv.messages[-12:]
@@ -457,7 +488,9 @@ class Assistant:
     # ------------------------------------------------------------ backends
     async def _ha(self, text: str, conv: _Conversation, device_id: str | None = None) -> AssistantResult:
         s = self.settings.get()
+        _note("ha_request", text=text, agent=s.ha_agent_id or None, conversation_id=conv.ha_conversation_id, device_id=device_id)
         data = await self.ha.conversation(text, s.ha_agent_id or None, conv.ha_conversation_id, device_id=device_id)
+        _note("ha_reply", response=data)
         conv.ha_conversation_id = data.get("conversation_id") or conv.ha_conversation_id
         response = data.get("response") or {}
         speech = (((response.get("speech") or {}).get("plain") or {}).get("speech") or "").strip()
@@ -486,7 +519,8 @@ class Assistant:
             _LOGGER.info("LLM fallback unavailable: %s", err)
             del conv.messages[keep:]
             return ha_result
-        result.backend = "ha+openai"
+        if result.backend != "direct":
+            result.backend = "ha+openai"
         if not result.speech and not result.actions:
             return ha_result
         return result
@@ -604,6 +638,38 @@ class Assistant:
             parts.append(f"{attrs.get('friendly_name') or 'Значение'}: {value}")
         return ". ".join(parts) + "." if parts else ""
 
+    async def _direct_read(self, text: str, conv: _Conversation, room: str | None) -> AssistantResult | None:
+        """A question about a sensor's value: answered from HA itself, see sensor_lookup."""
+        try:
+            catalog = self._catalog()
+            rows = [r for r in await self._all_rows() if self._exposed(r, catalog)]
+            hints = {r["entity_id"]: self._hints(r["entity_id"], catalog) for r in rows}
+            found = find_sensors(text, rows, hints, self.room_hints(), room)
+            if found is None:
+                return None
+            parts = []
+            for row in found.rows[:MAX_ANSWERS]:
+                state = await self.ha.state(row["entity_id"])
+                attrs = state.get("attributes") or {}
+                value = state.get("state")
+                said = "нет данных" if value in ("unavailable", "unknown", None) else spoken_value(
+                    value, attrs.get("unit_of_measurement") or row.get("unit") or "", found.measure
+                )
+                place = row.get("area") or row.get("device") or row["name"]
+                if len(found.rows) > 1:
+                    place = f"{place}, {row.get('device') or row['name']}"
+                parts.append(f"{place}, {found.measure} {said}")
+        except HaError as err:
+            _LOGGER.info("Sensor lookup failed, asking the LLM: %s", err)
+            return None
+        speech = ". ".join(parts) + "." if parts else f"Датчика {found.missing} нет."
+        _note(
+            "direct", measure=found.measure, scores=found.scores, chosen=[r["entity_id"] for r in found.rows],
+            missing=found.missing, speech=speech,
+        )
+        conv.messages += [{"role": "user", "content": text}, {"role": "assistant", "content": speech}]
+        return AssistantResult(speech=speech, backend="direct")
+
     async def _llm(
         self,
         text: str,
@@ -612,7 +678,12 @@ class Assistant:
         room: str | None = None,
         on_llm: Callable[[float | None], None] | None = None,
     ) -> AssistantResult:
+        if self.settings.get().direct_reads:
+            direct = await self._direct_read(text, conv, room)
+            if direct is not None:
+                return direct
         system = await self._system()
+        _note("system", content=system)
         if on_llm is not None:
             on_llm(self._predict_llm_s(system))
         t0 = time.monotonic()
@@ -649,8 +720,10 @@ class Assistant:
                     # stored as a real call: copied from the history, the text form would come back
                     _LOGGER.info("LLM wrote a tool call as text, executing it: %r", content)
                     msg = {"role": "assistant", "content": "", "tool_calls": calls}
-            if not calls and self._reads_as_ids(content):
-                _LOGGER.info("LLM wrote service names instead of an answer: %r", content)
+            # a number nobody has read: the model made it up («22 градусов»)
+            invented = not calls and not tools_ran and bool(re.search(r"\d", content)) and bool(asked_measure(text))
+            if invented or (not calls and self._reads_as_ids(content)):
+                _LOGGER.info("LLM wrote service names or an unread value instead of an answer: %r", content)
                 if not tools_ran:
                     calls = await self._recover_calls([{"role": "system", "content": system}, *conv.messages], content)
                     if calls:
@@ -698,6 +771,7 @@ class Assistant:
                 self._stage(f"выполняю {args.get('domain', '')}.{args.get('service', '')}" if name == "call_service" else f"смотрю {name}")
                 tools_ran = True
                 output = await self._tool(name, args, result)
+                _note("tool", name=name, args=args, output=output)
                 if name == "get_state" and isinstance(output, dict) and "state" in output:
                     reads.append(output)
                 conv.messages.append(
@@ -721,12 +795,21 @@ class Assistant:
         if self._local_llm():
             body["cache_prompt"] = True
         session = await self._http()
+        _note(
+            "llm_request", model=s.llm_model, tool_choice=tool_choice,
+            messages=[m for m in messages if m.get("role") != "system"],
+        )
+        t0 = time.monotonic()
         async with session.post(s.llm_url.rstrip("/") + "/chat/completions", json=body, headers=headers) as resp:
             text = await resp.text()
             if resp.status >= 400:
+                _note("llm_reply", status=resp.status, body=text[:2000], seconds=round(time.monotonic() - t0, 1))
                 raise HaError(f"LLM {resp.status}: {text[:200]}")
             data = json.loads(text)
-        return (data.get("choices") or [{}])[0].get("message") or {}
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        _note("llm_reply", message=msg, finish_reason=choice.get("finish_reason"), usage=data.get("usage"), seconds=round(time.monotonic() - t0, 1))
+        return msg
 
     async def _tool(self, name: str, args: dict[str, Any], result: AssistantResult) -> Any:
         domains = self._domains()
@@ -762,7 +845,13 @@ class Assistant:
             if name == "get_state":
                 eid = str(args.get("entity_id") or "")
                 if not await self._allow_entity(eid):
-                    return {"error": "эта сущность недоступна ассистенту"}
+                    # usually an id the model made up: it gets real ones to try again
+                    catalog = self._catalog()
+                    known = [r["entity_id"] for r in await self._all_rows() if self._exposed(r, catalog)]
+                    return {
+                        "error": f"entity_id {eid} нет в справочнике, вызови get_state с точным entity_id из него",
+                        "похожие": get_close_matches(eid, known, n=5, cutoff=0.3),
+                    }
                 st = await self.ha.state(eid)
                 attrs = {k: v for k, v in (st.get("attributes") or {}).items() if not isinstance(v, (list, dict))}
                 return {"entity_id": eid, "state": st.get("state"), "attributes": attrs}

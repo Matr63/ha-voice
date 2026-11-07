@@ -111,6 +111,7 @@ class Settings:
     # while a board listens and answers: quieter TV ("volume"), "mute", "pause" or "off"
     tv_duck: str = "volume"
     tv_duck_level: int = 25         # % of the TV's volume while ducked
+    tv_duck_reply: bool = False     # also while the answer is spoken, not only while listening
     sat_mic_gain: int = 36          # ES7210 hardware gain, dB (3 dB steps)
     sat_led_brightness: int = 80
     mic_boost_db: int = 6           # digital gain on the PC (the board's loud slot is picked first)
@@ -156,6 +157,8 @@ class Settings:
     entity_catalog: str = "{}"
     # JSON {"Кухня": "столешница, у холодильника"}: what a room is also called
     room_hints: str = "{}"
+    # «температура в зале» is answered from the sensor found by rooms and hints, without the LLM
+    direct_reads: bool = True
     stop_phrases: str = "стоп, остановись, прекрати"
     # local model run by the add-on (llama.cpp); empty = none
     llm_local_model: str = ""
