@@ -40,7 +40,7 @@ from settings import DSP_PARAMS, SettingsStore, clean_dsp
 from stt_client import transcribe
 from tts_client import synthesize_stream
 from tts_engine import resolve_voice
-from wake import WakeDetector, match_prefix, normalize, phrase_list, strip_wake_word
+from wake import WakeDetector, match_prefix, model_phrases, normalize, phrase_list, strip_wake_word
 
 try:
     import webrtcvad  # type: ignore
@@ -787,6 +787,12 @@ class Satellite:
             return
         s = self.hub.settings.get()
         hit = match_prefix(text, phrase_list(s.wake_phrases))
+        by_model_word = False
+        if hit is None:
+            # the model's own word, heard by STT while the model scored below the threshold
+            spoken = sorted(set(model_phrases(s.wake_word)), key=len, reverse=True)
+            hit = match_prefix(text, spoken)
+            by_model_word = hit is not None
         rest = hit[1] if hit else normalize(text)
         if await self.mode_phrase(rest, explicit=bool(hit)):
             return
@@ -795,6 +801,13 @@ class Satellite:
         if not self.hub.claim(self):
             return
         self.last_wake = {"ts": time.time(), "score": 1.0, "word": hit[0], "by": "phrase"}
+        if by_model_word:
+            peak = self.wake.peak(duration_ms(pcm) / 1000 + 8)
+            self.last_wake.update(by="text", model_peak=peak)
+            _LOGGER.info(
+                "%s: wake model missed '%s' (best score %s, threshold %.2f), taken from the text",
+                self.id, hit[0], "?" if peak is None else f"{peak:.2f}", s.wake_threshold,
+            )
         _LOGGER.info("%s: activation phrase '%s' -> %r", self.id, hit[0], rest)
         if rest:
             # said in one breath: the sound comes after the phrase and means "heard"

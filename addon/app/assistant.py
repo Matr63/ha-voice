@@ -50,6 +50,7 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент умного �
 - После действия коротко подтверди, что сделал.
 - Числа и единицы говори словами так, как их произносят.
 - Текущие значения датчиков и состояния устройств узнавай через get_state.
+- Никогда не отвечай «сейчас узнаю», «посмотрю», «проверю»: второго шанса не будет. Сразу вызови функцию и ответь результатом.
 - В списке устройства сгруппированы по приборам. Одинаковые имена датчиков в одной комнате — это разные приборы; смотри имя прибора и подсказки после «|».
 - В начале сообщения пользователя в квадратных скобках — время, кто говорит и комната колонки.
 Устройства (прибор, затем entity_id | имя | подсказки):
@@ -198,6 +199,19 @@ def text_tool_calls(content: str) -> list[dict[str, Any]]:
         }
         for i, (name, args) in enumerate(found)
     ]
+
+
+# "Я узнаю, Саша." with no call made: the model promised to look and stopped.
+# Nobody asks again, so it is told once to make the call now.
+_PROMISE_RE = re.compile(
+    r"\b(?:узна(?:ю|ем)|посмотр(?:ю|им)|провер(?:ю|им)|уточн(?:ю|им)|выясн(?:ю|им)|гляну|подожди(?:те)?)\b",
+    re.IGNORECASE,
+)
+PROMISE_NUDGE = "(Не обещай. Вызови нужную функцию прямо сейчас и ответь результатом.)"
+
+
+def is_promise(content: str) -> bool:
+    return bool(_PROMISE_RE.search(content))
 
 
 @dataclass
@@ -561,9 +575,14 @@ class Assistant:
             ctx.append(f"колонка в комнате «{room}» — если комната не названа, речь о ней")
         conv.messages.append({"role": "user", "content": f"[{'; '.join(ctx)}]\n{text}"})
         result = AssistantResult(backend="openai")
+        tools_ran = False
+        nudged = False
+        # the promise and the nudge, for one request only: kept out of the history
+        extra: list[dict[str, Any]] = []
         for step in range(MAX_TOOL_ROUNDS):
             self._stage("LLM думает" if step == 0 else f"LLM думает (шаг {step + 1})")
-            msg = await self._chat([{"role": "system", "content": system}, *conv.messages])
+            msg = await self._chat([{"role": "system", "content": system}, *conv.messages, *extra])
+            extra = []
             calls = msg.get("tool_calls") or []
             content = (msg.get("content") or "").strip()
             if not calls:
@@ -576,6 +595,17 @@ class Assistant:
                 _LOGGER.warning("LLM answer not spoken, it holds service names: %r", content)
                 result.speech = "Не получилось разобраться с запросом."
                 result.error = f"Модель ответила служебным текстом: {content[:200]}"
+                return result
+            if not calls and not tools_ran and not nudged and is_promise(content):
+                _LOGGER.info("LLM promised instead of calling a tool, asking again: %r", content)
+                nudged = True
+                extra = [{"role": "assistant", "content": content}, {"role": "user", "content": PROMISE_NUDGE}]
+                continue
+            if not calls and not tools_ran and nudged and is_promise(content):
+                # a second promise: an answer that never comes is worse than "no"
+                _LOGGER.warning("LLM promised again without a tool call: %r", content)
+                result.speech = "Не получилось это узнать."
+                result.error = f"Модель пообещала, но не вызвала функцию: {content[:200]}"
                 return result
             conv.messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
             if not calls:
@@ -596,6 +626,7 @@ class Assistant:
                     result.expect_reply = True
                     return result
                 self._stage(f"выполняю {args.get('domain', '')}.{args.get('service', '')}" if name == "call_service" else f"смотрю {name}")
+                tools_ran = True
                 output = await self._tool(name, args, result)
                 conv.messages.append(
                     {"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(output, ensure_ascii=False)}

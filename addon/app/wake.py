@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ _LOGGER = logging.getLogger("ha-voice.wake")
 
 FRAME_SAMPLES = 1280  # 80 ms at 16 kHz, what openWakeWord expects
 REFRACTORY_S = 2.0
+PEAK_FRAMES = 200  # 16 s of scores: an utterance plus the recognition queue
 
 # Built-in openWakeWord models and how GigaAM tends to spell them, so the wake
 # word can be cut from the start of the command text.
@@ -55,6 +57,12 @@ def strip_wake_word(text: str, wake_word: str) -> str:
         if low.startswith(phrase):
             return re.sub(r"^[\s,.!?:;—-]+", "", t[len(phrase):])
     return t
+
+
+def model_phrases(wake_word: str) -> list[str]:
+    """How STT writes the built-in model's word: a backup when the model misses
+    it (Russian «Алекса» scores close to the threshold of the English model)."""
+    return [normalize(p) for p in PRETRAINED.get(wake_word, {}).get("spoken", [])]
 
 
 def normalize(text: str) -> str:
@@ -102,6 +110,11 @@ class LocalWake:
         self._buf = np.zeros(0, dtype=np.int16)
         self._last_hit = 0.0
         self.last_score = 0.0
+        self._recent: deque[tuple[float, float]] = deque(maxlen=PEAK_FRAMES)
+
+    def peak(self, window_s: float) -> float:
+        since = time.monotonic() - window_s
+        return max((sc for t, sc in self._recent if t >= since), default=0.0)
 
     def process(self, pcm: bytes, threshold: float) -> float | None:
         """Returns the score when the wake word fired, else None."""
@@ -115,6 +128,7 @@ class LocalWake:
             score = float(max(scores.values())) if scores else 0.0
             self.last_score = score
             now = time.monotonic()
+            self._recent.append((now, score))
             if score >= threshold and now - self._last_hit > REFRACTORY_S:
                 self._last_hit = now
                 hit = score
@@ -218,6 +232,10 @@ class WakeDetector:
     @property
     def last_score(self) -> float:
         return self._impl.last_score if self._impl else 0.0
+
+    def peak(self, window_s: float) -> float | None:
+        """The model's best score over the last seconds (None: not known, e.g. Wyoming)."""
+        return self._impl.peak(window_s) if isinstance(self._impl, LocalWake) else None
 
     async def _ensure(self) -> None:
         s = self.settings.get()
