@@ -154,6 +154,8 @@ class Settings:
     sat_voice_out: str = ""
     # JSON {"entity_id": {"enabled": false, "hints": "у телевизора"}}
     entity_catalog: str = "{}"
+    # JSON {"Кухня": "столешница, у холодильника"}: what a room is also called
+    room_hints: str = "{}"
     stop_phrases: str = "стоп, остановись, прекрати"
     # local model run by the add-on (llama.cpp); empty = none
     llm_local_model: str = ""

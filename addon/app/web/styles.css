@@ -355,7 +355,9 @@ a { color: var(--accent); }
 
 .cat-room { margin-bottom: 20px; }
 .cat-room-head { display: flex; align-items: center; gap: 10px; padding: 0 14px 8px; }
-.cat-room-head h4 { margin: 0; font-size: 0.95rem; flex: 1; min-width: 0; }
+.cat-room-head h4 { margin: 0; font-size: 0.95rem; flex: none; }
+.cat-room-head .spacer { flex: 1; }
+.cat-room-hint.input { flex: 1; min-width: 0; width: auto; padding: 4px 9px; font-size: 0.85rem; }
 .cat-room-note { margin: -4px 14px 8px; }
 .cat-devs {
   background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
@@ -404,6 +406,9 @@ a { color: var(--accent); }
 .cat-ent.off .cat-ent-name > span:first-child { text-decoration: line-through; }
 
 @media (max-width: 640px) {
+  .cat-room-head { flex-wrap: wrap; }
+  .cat-room-head h4 { flex: 1; }
+  .cat-room-hint.input { order: 1; flex-basis: 100%; }
   .cat-segment { width: 100%; }
   .cat-segment button { flex: 1; padding: 6px 4px; }
   .cat-ent { grid-template-columns: auto minmax(0, 1fr) auto; }

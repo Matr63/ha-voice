@@ -2469,7 +2469,8 @@
     const out = [];
     for (const d of devices) {
       if (state.catalogRoom !== null && catKey(d) !== state.catalogRoom) continue;
-      const whole = !q || `${d.name} ${d.area} ${catKind(d).about || ""}`.toLowerCase().includes(q);
+      const roomHint = ((state.catalog && state.catalog.room_hints) || {})[d.area] || "";
+      const whole = !q || `${d.name} ${d.area} ${roomHint} ${catKind(d).about || ""}`.toLowerCase().includes(q);
       const ents = (d.entities || []).filter((e) => {
         if (show === "on" && !e.enabled) return false;
         if (show === "off" && e.enabled) return false;
@@ -2558,6 +2559,7 @@
           <div class="cat-room-head">
             <label class="cat-check" title="${onHere ? "Выключить для модели всё в этой группе" : "Включить для модели всё в этой группе"}"><input type="checkbox" data-room-on="${esc(key)}" data-fk="r:${esc(key)}" ${onHere ? "checked" : ""} data-indet="${onHere && onHere < ents.length ? 1 : 0}"></label>
             <h4>${esc(catKeyName(key))}</h4>
+            ${key === CAT_BOARDS || key === CAT_NO_ROOM ? `<span class="spacer"></span>` : `<input class="input cat-room-hint" data-room-hints="${esc(key)}" data-fk="rh:${esc(key)}" value="${esc((cat.room_hints || {})[key] || "")}" placeholder="как ещё называете эту комнату" maxlength="200" aria-label="Как ещё называют эту комнату">`}
             <span class="small muted">${onHere} из ${ents.length}</span>
           </div>
           ${key === CAT_BOARDS ? `<p class="small muted cat-room-note">Сущности колонок по умолчанию скрыты от модели.</p>` : ""}
@@ -2604,12 +2606,13 @@
     }
   }
 
-  async function saveCatalogPatch(patch) {
+  async function saveCatalogPatch(patch, rooms) {
     const seq = ++state.catalogSeq;
-    const res = await postJson("/api/ha/catalog", { entities: patch });
+    const res = await postJson("/api/ha/catalog", rooms ? { entities: patch, rooms } : { entities: patch });
     if (seq !== state.catalogSeq) return;   // a newer change is on its way: its answer has this one too
     state.catalog = res;
-    if (!(document.activeElement && document.activeElement.dataset.entHints)) renderDevices();
+    const focused = document.activeElement;
+    if (!(focused && (focused.dataset.entHints || focused.dataset.roomHints))) renderDevices();
   }
 
   // shown at once; the answer from the server follows
@@ -2677,6 +2680,18 @@
 
   async function onDevicesHints(ev) {
     const t = ev.target;
+    if (t.dataset.roomHints) {
+      const hints = (state.catalog.room_hints = state.catalog.room_hints || {});
+      const room = t.dataset.roomHints;
+      if ((hints[room] || "") === t.value.trim()) return;
+      hints[room] = t.value.trim();
+      try {
+        await saveCatalogPatch({}, { [room]: t.value });
+      } catch (err) {
+        showError(err);
+      }
+      return;
+    }
     if (!t.dataset.entHints) return;
     const e = ((state.catalog && state.catalog.devices) || []).flatMap((d) => d.entities || []).find((x) => x.entity_id === t.dataset.entHints);
     if (!e || (e.hints || "") === t.value.trim()) return;

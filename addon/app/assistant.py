@@ -30,6 +30,8 @@ _LOGGER = logging.getLogger("ha-voice.assistant")
 CONVERSATION_TTL_S = 300
 KEEP_AUDIO = 40
 MAX_TOOL_ROUNDS = 6
+MAX_RECOVERED_READS = 6
+MAX_SPOKEN_READS = 3
 MAX_PROMPT_ENTITIES = 200
 ENTITIES_CACHE_S = 30
 # HA answers that mean "didn't understand the phrase / no device by that name":
@@ -45,15 +47,18 @@ SYSTEM_PROMPT = """Ты — голосовой ассистент умного �
 Правила:
 - Отвечай по-русски, коротко: одно-два предложения, без markdown, списков и эмодзи.
 - Чтобы управлять устройствами, вызывай call_service. Чтобы узнать состояние — get_state или list_entities.
-- Функции вызывай только как вызов функции. В тексте ответа никогда не пиши их названия и entity_id: текст читается вслух.
-- Если непонятно, какое именно устройство имеется в виду (например, свет есть в нескольких комнатах), не угадывай — вызови ask_user с коротким уточняющим вопросом.
+- Функции вызывай только как вызов функции. В тексте ответа никогда не пиши их названия и entity_id и не копируй строки списка устройств: текст читается вслух.
+- Нужное ищи так: сначала комната (названная, совпавшая с тем, что после «она же», иначе комната колонки), затем в ней датчик или устройство по имени и подсказкам.
+- Спрашивают значение, а подходящих датчиков несколько — прочитай один, с совпавшей подсказкой, и назови его значение; не перечисляй их и не переспрашивай.
+- Предлог важен: «у холодильника» — рядом с ним, «в холодильнике» — внутри него. Если подходящего датчика нет, так и скажи и не подставляй соседний.
+- Если непонятно, каким устройством управлять (например, свет есть в нескольких комнатах), не угадывай — вызови ask_user с коротким уточняющим вопросом.
 - После действия коротко подтверди, что сделал.
 - Числа и единицы говори словами так, как их произносят.
 - Текущие значения датчиков и состояния устройств узнавай через get_state.
 - Никогда не отвечай «сейчас узнаю», «посмотрю», «проверю»: второго шанса не будет. Сразу вызови функцию и ответь результатом.
-- В списке устройства сгруппированы по приборам. Одинаковые имена датчиков в одной комнате — это разные приборы; смотри имя прибора и подсказки после «|».
+- Одинаковые имена датчиков в одной комнате — это разные приборы; смотри имя прибора и подсказки.
 - В начале сообщения пользователя в квадратных скобках — время, кто говорит и комната колонки.
-Устройства (прибор, затем entity_id | имя | подсказки):
+Справочник устройств: комната, в ней прибор, в нём entity_id — имя (подсказки).
 {entities}
 {extra}"""
 # The system prompt holds nothing that changes between requests (no time, no
@@ -345,6 +350,14 @@ class Assistant:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def room_hints(self) -> dict[str, str]:
+        """What a room is also called: {"Кухня": "столешница, у холодильника"}."""
+        try:
+            data = json.loads(self.settings.get().room_hints or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if v} if isinstance(data, dict) else {}
+
     def _board_ids(self) -> set[str]:
         hub = self.hub
         if hub is None:
@@ -489,17 +502,23 @@ class Assistant:
         for r in rows:
             key = (r.get("device") or r["name"], r.get("area") or "", r.get("device_id") or r["entity_id"])
             groups.setdefault(key, []).append(r)
+        room_hints = self.room_hints()
         lines: list[str] = []
         count = 0
+        room: str | None = None
         for key in sorted(groups, key=lambda x: (x[1].lower(), x[0].lower(), x[2])):
             dname, area, _ = key
-            lines.append(f"{dname} ({area or 'без комнаты'}):")
+            if area != room:
+                room = area
+                also = f" (она же: {room_hints[area]})" if room_hints.get(area) else ""
+                lines.append(f"{area or 'Без комнаты'}{also}:")
+            lines.append(f"  {dname}:")
             for r in sorted(groups[key], key=lambda x: x["name"].lower()):
                 if count >= MAX_PROMPT_ENTITIES:
                     break
                 hints = self._hints(r["entity_id"], catalog)
-                extra = f" | {hints}" if hints else ""
-                lines.append(f"  {r['entity_id']} | {r['name']}{extra}")
+                extra = f" (подсказки: {hints})" if hints else ""
+                lines.append(f"    {r['entity_id']} — {r['name']}{extra}")
                 count += 1
             if count >= MAX_PROMPT_ENTITIES:
                 break
@@ -548,6 +567,43 @@ class Assistant:
         domains = "|".join(re.escape(d) for d in self._domains())
         return bool(re.search(rf"\b(?:{domains})\.[a-z0-9_]+\b|\b(?:{'|'.join(_TOOL_NAMES)})\b", speech))
 
+    def _named_ids(self, text: str) -> list[str]:
+        domains = "|".join(re.escape(d) for d in self._domains())
+        return list(dict.fromkeys(re.findall(rf"\b(?:{domains})\.[a-z0-9_]+\b", text)))
+
+    async def _recover_calls(self, messages: list[dict[str, Any]], content: str) -> list[dict[str, Any]]:
+        """The model wrote entity ids instead of calling a function, in whatever form:
+        one id is read as it is; of several, it picks in a request that allows only
+        a real call; if even that fails, the ones it named are read."""
+        ids = self._named_ids(content)
+        if len(ids) != 1:
+            try:
+                msg = await self._chat(messages, tool_choice="required")
+            except (HaError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+                _LOGGER.info("LLM retry with a required call failed: %s", err)
+            else:
+                calls = msg.get("tool_calls") or text_tool_calls((msg.get("content") or "").strip())
+                if calls:
+                    return calls
+        return [
+            {
+                "id": f"text_{i}",
+                "type": "function",
+                "function": {"name": "get_state", "arguments": json.dumps({"entity_id": eid})},
+            }
+            for i, eid in enumerate(ids[:MAX_RECOVERED_READS])
+        ]
+
+    @staticmethod
+    def _speak_reads(reads: list[dict[str, Any]]) -> str:
+        """The values themselves, when the model cannot put them into words."""
+        parts = []
+        for out in reads[:MAX_SPOKEN_READS]:
+            attrs = out.get("attributes") or {}
+            value = f"{out.get('state')} {attrs.get('unit_of_measurement') or ''}".strip()
+            parts.append(f"{attrs.get('friendly_name') or 'Значение'}: {value}")
+        return ". ".join(parts) + "." if parts else ""
+
     async def _llm(
         self,
         text: str,
@@ -573,10 +629,12 @@ class Assistant:
             ctx.append(f"говорит {speaker}")
         if room:
             ctx.append(f"колонка в комнате «{room}» — если комната не названа, речь о ней")
+        keep = len(conv.messages)
         conv.messages.append({"role": "user", "content": f"[{'; '.join(ctx)}]\n{text}"})
         result = AssistantResult(backend="openai")
         tools_ran = False
         nudged = False
+        reads: list[dict[str, Any]] = []
         # the promise and the nudge, for one request only: kept out of the history
         extra: list[dict[str, Any]] = []
         for step in range(MAX_TOOL_ROUNDS):
@@ -592,10 +650,22 @@ class Assistant:
                     _LOGGER.info("LLM wrote a tool call as text, executing it: %r", content)
                     msg = {"role": "assistant", "content": "", "tool_calls": calls}
             if not calls and self._reads_as_ids(content):
-                _LOGGER.warning("LLM answer not spoken, it holds service names: %r", content)
-                result.speech = "Не получилось разобраться с запросом."
-                result.error = f"Модель ответила служебным текстом: {content[:200]}"
-                return result
+                _LOGGER.info("LLM wrote service names instead of an answer: %r", content)
+                if not tools_ran:
+                    calls = await self._recover_calls([{"role": "system", "content": system}, *conv.messages], content)
+                    if calls:
+                        msg = {"role": "assistant", "content": "", "tool_calls": calls}
+                if not calls:
+                    # nothing to run: this exchange stays out of the history
+                    speech = self._speak_reads(reads) or ("Готово." if result.actions else "")
+                    if speech:
+                        conv.messages.append({"role": "assistant", "content": speech})
+                        result.speech = speech
+                        return result
+                    del conv.messages[keep:]
+                    result.speech = "Не получилось разобраться с запросом."
+                    result.error = f"Модель ответила служебным текстом: {content[:200]}"
+                    return result
             if not calls and not tools_ran and not nudged and is_promise(content):
                 _LOGGER.info("LLM promised instead of calling a tool, asking again: %r", content)
                 nudged = True
@@ -628,13 +698,17 @@ class Assistant:
                 self._stage(f"выполняю {args.get('domain', '')}.{args.get('service', '')}" if name == "call_service" else f"смотрю {name}")
                 tools_ran = True
                 output = await self._tool(name, args, result)
+                if name == "get_state" and isinstance(output, dict) and "state" in output:
+                    reads.append(output)
                 conv.messages.append(
                     {"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(output, ensure_ascii=False)}
                 )
         result.speech = "Готово." if result.actions else "Не получилось разобраться с запросом."
         return result
 
-    async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 300) -> dict[str, Any]:
+    async def _chat(
+        self, messages: list[dict[str, Any]], max_tokens: int = 300, tool_choice: str | None = None
+    ) -> dict[str, Any]:
         s = self.settings.get()
         headers = {"Content-Type": "application/json"}
         if s.llm_api_key:
@@ -642,6 +716,8 @@ class Assistant:
         body: dict[str, Any] = {
             "model": s.llm_model, "messages": messages, "tools": TOOLS, "temperature": 0.2, "max_tokens": max_tokens,
         }
+        if tool_choice:
+            body["tool_choice"] = tool_choice
         if self._local_llm():
             body["cache_prompt"] = True
         session = await self._http()
@@ -662,7 +738,13 @@ class Assistant:
                 rows = await self.ha.entities([dom] if dom in domains else domains)
                 rows = [r for r in rows if self._exposed(r, catalog)]
                 if area:
-                    rows = [r for r in rows if area in (r["area"] or "").lower() or area in (r.get("device") or "").lower()]
+                    room_hints = self.room_hints()
+                    rows = [
+                        r for r in rows
+                        if area in (r["area"] or "").lower()
+                        or area in (r.get("device") or "").lower()
+                        or area in room_hints.get(r["area"] or "", "").lower()
+                    ]
                 out = []
                 for r in rows[:100]:
                     item = {

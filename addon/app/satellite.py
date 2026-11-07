@@ -684,8 +684,8 @@ class Satellite:
             mode = s.mic_channel
             self._wake_pcm = None
             if mode == "auto" and self.info.get("board") == "xvf3800":
-                # route «Comms to STT, ASR to wake word»: 0 = comms (the chip's noise
-                # suppression and AGC), 1 = ASR beam with «ASR output gain»
+                # route «Речь с шумоподавлением (comms)»: 0 = comms (the chip's noise
+                # suppression and AGC), 1 = ASR beam with «Усиление ключевого слова ASR»
                 self.ch_active, audio = 0, left
                 wake = right if rate == TARGET_RATE else pcm16_to_float(normalize_pcm(apply_gain(right, 0), rate))
                 self._wake_pcm = apply_gain(wake, s.mic_boost_db)

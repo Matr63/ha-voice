@@ -44,7 +44,7 @@ esphome:
     - xvf_dsp.h
   project:
     name: matr63.ha-voice-xvf3800
-    version: "2.3.0"
+    version: "2.3.1"
   on_boot:
     - priority: 600
       then:
@@ -131,6 +131,17 @@ ota:
 web_server:
   port: 80
   version: 3
+  js_include: xvf_web.js
+  sorting_groups:
+    - id: web_control
+      name: "Управление"
+      sorting_weight: 10
+    - id: web_settings
+      name: "Настройки"
+      sorting_weight: 20
+    - id: web_state
+      name: "Состояние"
+      sorting_weight: 30
 
 i2c:
   - id: internal_i2c
@@ -176,7 +187,10 @@ respeaker_xvf3800:
           id: ring_state
           state: !lambda return id(ring_last);
   dfu_version:
-    name: "XVF3800 firmware"
+    name: "Прошивка чипа XVF3800"
+    web_server:
+      sorting_group_id: web_state
+      sorting_weight: 20
     update_interval: 120s
   firmware:
     url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/${respeaker_ref}/respeaker_xvf3800_i2s_master_v${xvf_fw_version}_48k.bin
@@ -496,6 +510,9 @@ switch:
   - platform: template
     id: mic_switch
     name: "Микрофон"
+    web_server:
+      sorting_group_id: web_control
+      sorting_weight: 10
     icon: mdi:microphone
     lambda: return !id(mic_mute_switch).state;
     turn_on_action:
@@ -505,6 +522,9 @@ switch:
   - platform: template
     id: listen_switch
     name: "Слушать"
+    web_server:
+      sorting_group_id: web_control
+      sorting_weight: 20
     icon: mdi:ear-hearing
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
@@ -517,22 +537,28 @@ switch:
 
 select:
   - platform: template
-    name: "DSP route"
+    name: "Маршрут каналов DSP"
+    web_server:
+      sorting_group_id: web_settings
+      sorting_weight: 30
     id: dsp_route
     optimistic: true
     restore_value: true
-    initial_option: "Comms to STT, ASR to wake word"
+    initial_option: "Речь с шумоподавлением (comms)"
     entity_category: config
     icon: mdi:call-split
     options:
-      - "ASR to STT and wake word"
-      - "Comms to STT, ASR to wake word"
+      - "Речь из канала ASR"
+      - "Речь с шумоподавлением (comms)"
     on_value:
       - lambda: id(respeaker).set_asr_route(i == 0);
 
 number:
   - platform: template
-    name: "ASR output gain"
+    name: "Усиление ключевого слова ASR"
+    web_server:
+      sorting_group_id: web_settings
+      sorting_weight: 20
     id: asr_out_gain
     optimistic: true
     restore_value: true
@@ -545,7 +571,10 @@ number:
     on_value:
       - lambda: id(respeaker).set_asr_out_gain(x);
   - platform: template
-    name: "AGC max gain (comms)"
+    name: "Автоусиление речи AGC: максимум"
+    web_server:
+      sorting_group_id: web_settings
+      sorting_weight: 10
     id: agc_max_gain
     optimistic: true
     restore_value: true
@@ -562,6 +591,9 @@ text:
   - platform: template
     id: ha_voice_host_text
     name: "Сервер HA Voice"
+    web_server:
+      sorting_group_id: web_settings
+      sorting_weight: 40
     icon: mdi:server-network
     entity_category: config
     mode: text
@@ -575,25 +607,37 @@ text:
 text_sensor:
   - platform: template
     id: dsp_status
-    name: "DSP status"
+    name: "Состояние чипа DSP"
+    web_server:
+      sorting_group_id: web_state
+      sorting_weight: 10
     icon: mdi:chip
     entity_category: diagnostic
     update_interval: never
 
 binary_sensor:
   - platform: template
-    name: "HA Voice connected"
+    name: "Связь с HA Voice"
+    web_server:
+      sorting_group_id: web_state
+      sorting_weight: 30
     icon: mdi:lan-connect
     entity_category: diagnostic
     lambda: return id(sat).is_connected();
 
 sensor:
   - platform: wifi_signal
-    name: "Wi-Fi signal"
+    name: "Сигнал Wi-Fi"
+    web_server:
+      sorting_group_id: web_state
+      sorting_weight: 40
     update_interval: 60s
     entity_category: diagnostic
 
 button:
   - platform: restart
-    name: "Restart"
+    name: "Перезагрузить плату"
+    web_server:
+      sorting_group_id: web_settings
+      sorting_weight: 50
     entity_category: config

@@ -511,7 +511,7 @@ def create_app(ctx: AppContext) -> web.Application:
             devices = await assistant.catalog_view()
         except HaError as err:
             return web.json_response({"devices": [], "error": str(err)})
-        return web.json_response({"devices": devices})
+        return web.json_response({"devices": devices, "room_hints": assistant.room_hints()})
 
     async def ha_catalog_set(request: web.Request) -> web.Response:
         data = await _json_obj(request)
@@ -541,14 +541,18 @@ def create_app(ctx: AppContext) -> web.Application:
                 catalog[eid] = cur
             else:
                 catalog.pop(eid, None)
-        settings.update({"entity_catalog": json.dumps(catalog, ensure_ascii=False)})
+        changes = {"entity_catalog": json.dumps(catalog, ensure_ascii=False)}
+        if isinstance(data.get("rooms"), dict):
+            rooms = {**assistant.room_hints(), **{str(k): str(v or "").strip() for k, v in data["rooms"].items()}}
+            changes["room_hints"] = json.dumps({k: v for k, v in rooms.items() if v}, ensure_ascii=False)
+        settings.update(changes)
         assistant.invalidate_entities()
         assistant.schedule_prewarm()
         try:
             devices = await assistant.catalog_view()
         except HaError as err:
             return web.json_response({"ok": True, "devices": [], "error": str(err)})
-        return web.json_response({"ok": True, "devices": devices})
+        return web.json_response({"ok": True, "devices": devices, "room_hints": assistant.room_hints()})
 
     async def satellites_rooms_refresh(_: web.Request) -> web.Response:
         await hub.refresh_rooms()
@@ -700,7 +704,14 @@ def create_app(ctx: AppContext) -> web.Application:
         board = hub.get(data.get("id") or None) if data.get("speak") else None
         cue = ThinkingCue(board) if board is not None else None
         try:
-            result = await assistant.handle(text, conv_key="panel", on_llm=cue.llm_started if cue else None)
+            # with a room and a speaker the model gets the same request as from a board
+            result = await assistant.handle(
+                text,
+                conv_key="panel",
+                speaker=data.get("speaker") or None,
+                room=data.get("room") or (board.room if board is not None else "") or None,
+                on_llm=cue.llm_started if cue else None,
+            )
         finally:
             if cue:
                 cue.done()
