@@ -2100,6 +2100,8 @@
     tool: "Вызов функции и результат",
     direct: "Датчик найден без модели",
     notes: "Списки и заметки: без модели",
+    list_match: "Код не нашёл — модель подобрала похожее (номера вариантов, 0 — ничего)",
+    list_review: "Модель проверила список перед записью",
     plugin: "Ответ плагина: без модели",
     plugin_call: "Ключевая фраза: вопрос ушёл плагину",
     web_search: "Поиск в интернете",
@@ -2278,7 +2280,7 @@
           ${e.backend === "ha+openai" ? `<div class="small muted" style="margin-top:4px">HA не понял — ответила LLM</div>` : ""}
           ${e.backend === "direct" ? `<div class="small muted" style="margin-top:4px">Без модели: датчик найден по комнатам и подсказкам</div>` : ""}
           ${e.backend === "notes" ? `<div class="small muted" style="margin-top:4px">Без модели: команда про списки и заметки</div>` : ""}
-          ${e.backend === "notes+llm" ? `<div class="small muted" style="margin-top:4px">Списки и заметки: фразу разобрала модель</div>` : ""}
+          ${e.backend === "notes+llm" ? `<div class="small muted" style="margin-top:4px">Списки и заметки: помогла модель</div>` : ""}
           ${e.backend === "plugin" ? `<div class="small muted" style="margin-top:4px">Без модели: ответил плагин по прочитанной странице</div>` : ""}
           ${e.backend === "web" ? `<div class="small muted" style="margin-top:4px">Поиск в интернете</div>` : ""}
           ${e.backend === "brother" ? `<div class="small muted" style="margin-top:4px">Ответил брат — другая модель через интернет</div>` : ""}

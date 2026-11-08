@@ -79,7 +79,7 @@ CATALOG_HEADER = "Справочник устройств: комната, в н
 # The system prompt holds nothing that changes between requests (no time, no
 # states): llama.cpp then reuses its cache and reads only the new words, instead
 # of the whole device list on every command (tens of seconds on a CPU).
-PROMPT_NAMES = {"home": "дом", "notes": "списки и заметки", "list_review": "проверка списка"}
+PROMPT_NAMES = {"home": "дом", "notes": "списки и заметки", "list_review": "проверка списка", "list_match": "поиск похожего"}
 # llama-server slots: each prompt keeps its own place in the cache
 SLOT_HOME = 0
 SLOT_NOTES = 1
@@ -133,6 +133,27 @@ LIST_REVIEW_TOOLS = [
                 "type": "object",
                 "properties": {"keep": {"type": "array", "items": {"type": "integer"}}},
                 "required": ["keep"],
+            },
+        },
+    }
+]
+# The code did not find a list or an item by its words («пакет молока» when the
+# list has «бутылка молока», «продукты» for «покупки»): the model matches by meaning.
+LIST_MATCH_RULES = """A person named things by voice (speech recognition, Russian); the code did not find them among the options.
+The user message gives the numbered options and the numbered things said.
+For each thing said, pick the option the person most likely meant: the same thing in other words, another form, a synonym,
+the same product in another package or amount, a misheard word. Pick 0 when no option fits; do not pick between two different things.
+Call match with one number per thing said, in order."""
+LIST_MATCH_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "match",
+            "description": "For each thing said, in order: the number of the option, or 0.",
+            "parameters": {
+                "type": "object",
+                "properties": {"picks": {"type": "array", "items": {"type": "integer"}}},
+                "required": ["picks"],
             },
         },
     }
@@ -1180,12 +1201,78 @@ class Assistant:
             else:
                 reply = self.notes.answer(text, pending, speaker)
                 if reply is not None:
-                    return self._notes_result(reply, conv, speaker_id=speaker_id)
+                    reply, used = await self._match(reply, speaker, on_llm)
+                    return self._notes_result(reply, conv, "notes+llm" if used else "notes", speaker_id=speaker_id)
         reply = self.notes.handle(text, speaker)
         if reply is not None:
-            return self._notes_result(reply, conv, speaker_id=speaker_id)
+            reply, used = await self._match(reply, speaker, on_llm)
+            return self._notes_result(reply, conv, "notes+llm" if used else "notes", speaker_id=speaker_id)
         if in_domain(text) and self._llm_usable():
             return await self._notes_llm(text, conv, speaker, on_llm)
+        return None
+
+    async def _match(
+        self, reply: Reply, speaker: str | None, on_llm: Callable[[float | None], None] | None
+    ) -> tuple[Reply, bool]:
+        """The code did not find a list or an item: one short call to the model, which
+        matches by meaning. Without a model, or when it finds nothing, the reply stands.
+        Twice at most: a list found by meaning may then miss an item too."""
+        used = False
+        for _ in range(2):
+            match, reply.match = reply.match, None
+            if not match or not self._llm_usable():
+                break
+            question = self.notes.match_question(match)
+            if question is None:
+                break
+            picks = await self._llm_match(*question, on_llm)
+            done = self.notes.finish_match(match, picks, speaker) if picks is not None else None
+            if done is None:
+                break
+            reply, used = done, True
+        reply.match = None
+        return reply, used
+
+    async def _llm_match(
+        self, options: list[str], said: list[str], on_llm: Callable[[float | None], None] | None
+    ) -> list[int] | None:
+        if not options or not said:
+            return None
+        self._stage("LLM ищет похожее в списках")
+        if on_llm is not None:
+            on_llm(None)
+        listing = "\n".join(f"{i}. {o}" for i, o in enumerate(options, 1))
+        heard = "\n".join(f"{i}. {s}" for i, s in enumerate(said, 1))
+        messages = [
+            {"role": "system", "content": LIST_MATCH_RULES},
+            {"role": "user", "content": f"Options:\n{listing}\n\nSaid:\n{heard}"},
+        ]
+        self._note_prompt("list_match", LIST_MATCH_RULES)
+        try:
+            msg = await self._chat(messages, max_tokens=40, tools=LIST_MATCH_TOOLS, slot=SLOT_PLUGINS)
+        except (HaError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            _LOGGER.info("List match unavailable: %s", err)
+            return None
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            found = _json_tool_calls((msg.get("content") or "").strip())
+            calls = [{"function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}} for n, a in found]
+        for call in calls:
+            fn = call.get("function") or {}
+            if fn.get("name") != "match":
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                break
+            raw = args.get("picks") if isinstance(args, dict) else None
+            if not isinstance(raw, list):
+                break
+            picks = [int(n) if isinstance(n, (int, float)) or (isinstance(n, str) and n.strip().isdigit()) else 0 for n in raw]
+            picks = (picks + [0] * len(said))[: len(said)]
+            _note("list_match", options=options, said=said, picks=picks)
+            return picks
+        _note("list_match", options=options, said=said, error="no match call")
         return None
 
     def _llm_usable(self) -> bool:
@@ -1228,6 +1315,7 @@ class Assistant:
             args = {}
         _note("tool", name=fn.get("name"), args=args)
         reply = self.notes.run_tool(fn.get("name", ""), args, speaker)
+        reply, _ = await self._match(reply, speaker, on_llm)
         if reply.pending and reply.pending.get("op") == "again":
             reply.pending["text"] = text
         return self._notes_result(reply, conv, "notes+llm")

@@ -48,7 +48,7 @@ _REMOVE = ("удал", "убер", "убра", "вычеркн", "сотр", "в
 _CLEAR = ("очист",)
 _CREATE = ("созда", "создай", "завед", "заведи", "начни", "начать", "сделай", "сделать", "новый", "новая", "новую")
 _LAST = ("последн",)
-_YES = {"да", "давай", "ага", "угу", "конечно", "можно", "создай", "создавай", "добавь", "хорошо", "верно", "туда", "удаляй", "удали", "очисти", "новый"}
+_YES = {"да", "давай", "ага", "угу", "конечно", "можно", "создай", "создавай", "добавь", "хорошо", "верно", "туда", "удаляй", "удали", "убери", "убирай", "очисти", "новый"}
 _NO = {"нет", "не", "неа", "отмена", "отмени", "отбой", "забудь", "неважно", "ничего", "никакой", "стоп"}
 _DOMAIN_STEMS = ("спис", "заметк", "заметок", "журнал", "покупк", "покупок", "запиш", "запомн", "купить")
 _DEVICE_VERBS = ("включ", "выключ")
@@ -118,6 +118,9 @@ class Reply:
     actions: list[dict[str, Any]] = field(default_factory=list)
     # False: keep listening, but this phrase was not more of the list, so the pause is not restarted
     extend: bool = True
+    # the code did not find a list or an item: the model may match it by meaning
+    # (match_question → the model → finish_match). Without a model this reply stands.
+    match: dict[str, Any] | None = None
 
 
 @dataclass
@@ -144,7 +147,8 @@ def _join(words: list[str]) -> str:
 
 
 def _content(words: list[str]) -> list[str]:
-    low = [_low(w) for w in words]
+    """Meaning words for matching: «холодильник-дача» and «холодильник дача» are one name."""
+    low = [_low(p) for w in words for p in re.split(r"[-‐‑–—]", w)]
     return [w for w in low if w and w not in _PREPS and w not in _NAME_STOP and w not in _LIST_WORDS]
 
 
@@ -207,6 +211,15 @@ def in_domain(text: str) -> bool:
 
 def _word_in(word: str, words: list[str]) -> bool:
     return any(_same_word(word, w) for w in words)
+
+
+# «бутылка молока» for «пакет молока»: one shared word is enough, but not a short one
+_MAIN_WORD = 3
+
+
+def _shares_word(said: str, item: str) -> bool:
+    own = _content(_tokens(item))
+    return any(len(w) >= _MAIN_WORD and _word_in(w, own) for w in _content(_tokens(said)))
 
 
 class NotesBook:
@@ -434,13 +447,18 @@ class NotesBook:
         removed: list[str] = []
         missing: list[str] = []
         for want in items:
-            query = _content(_tokens(want))
-            hit = next((i for i in coll["items"] if query and all(_word_in(q, _content(_tokens(i["text"]))) for q in query)), None)
+            hit = self._find_item(coll, want)
             if hit is None:
                 missing.append(want)
             else:
                 self.remove_item(coll["id"], hit["id"])
                 removed.append(hit["text"])
+        reply = self._removed_reply(coll, removed, missing)
+        if missing and coll["items"] and coll["kind"] == "list":
+            reply.match = {"op": "items", "id": coll["id"], "missing": missing, "removed": removed}
+        return reply
+
+    def _removed_reply(self, coll: dict[str, Any], removed: list[str], missing: list[str]) -> Reply:
         parts = []
         if removed:
             parts.append(f"Убрано: {', '.join(removed)}.")
@@ -448,6 +466,19 @@ class NotesBook:
             parts.append(f"В {self.in_title(coll)} нет: {', '.join(missing)}.")
         action = [{"service": "убрано", "target": f"{self.title(coll)}: {'; '.join(removed)}"}] if removed else []
         return Reply(" ".join(parts) or "Нечего убирать.", actions=action)
+
+    @staticmethod
+    def _find_item(coll: dict[str, Any], want: str) -> dict[str, Any] | None:
+        """Every word said is in the item; otherwise the only item that shares a main
+        word with it («пакет молока» → «бутылка молока»). Two such items: not guessed."""
+        query = _content(_tokens(want))
+        if not query:
+            return None
+        hit = next((i for i in coll["items"] if all(_word_in(q, _content(_tokens(i["text"]))) for q in query)), None)
+        if hit is not None:
+            return hit
+        close = [i for i in coll["items"] if _shares_word(want, i["text"])]
+        return close[0] if len(close) == 1 else None
 
     def _overview(self, kind: str) -> Reply:
         colls = [c for c in self.of_kind(kind)]
@@ -498,15 +529,89 @@ class NotesBook:
             return self._ask(f"Какой: {self._names(found)}?", op="choose", kind=kind, then=then, items=items, last=last,
                              ids=[c["id"] for c in found])
         close = self.similar(query, kind)
+        if then == "add" and len(close) == 1:
+            return self._use_or_new(close[0], kind, name, items)
         if then == "add":
-            if len(close) == 1:
-                return self._ask(
-                    f"Такого нет, есть {self._to_title(close[0])}. Добавить туда?",
-                    op="use_or_new", id=close[0]["id"], kind=kind, name=name, items=items,
-                )
-            return self._ask(f"{word.capitalize()} {name} нет. Создать?", op="new", kind=kind, name=name, items=items)
-        others = f" Есть: {', '.join(c['name'] for c in colls if c['name'])}." if any(c["name"] for c in colls) else ""
-        return Reply(f"{word.capitalize()} {name} нет.{others}")
+            reply = self._ask(f"{word.capitalize()} {name} нет. Создать?", op="new", kind=kind, name=name, items=items)
+        else:
+            others = f" Есть: {', '.join(c['name'] for c in colls if c['name'])}." if any(c["name"] for c in colls) else ""
+            reply = Reply(f"{word.capitalize()} {name} нет.{others}")
+        if any(c["name"] for c in colls):
+            reply.match = {"op": "list", "kind": kind, "then": then, "name": name, "items": items, "last": last}
+        return reply
+
+    def _use_or_new(self, coll: dict[str, Any], kind: str, name: str, items: list[str]) -> Reply:
+        return self._ask(
+            f"Такого нет, есть {self._to_title(coll)}. Добавить туда?",
+            op="use_or_new", id=coll["id"], kind=kind, name=name, items=items,
+        )
+
+    # ----------------------------------------------- what the code could not find
+    def match_question(self, match: dict[str, Any]) -> tuple[list[str], list[str]] | None:
+        """What the model is to match: the options (numbered for it) and what was said.
+        The ids of the options are kept in `match`, so the numbers mean the same later."""
+        if match.get("op") == "items":
+            coll = self.get(match.get("id") or "")
+            if coll is None or not coll["items"]:
+                return None
+            match["ids"] = [i["id"] for i in coll["items"]]
+            return [i["text"] for i in coll["items"]], list(match.get("missing") or [])
+        if match.get("op") == "list":
+            colls = [c for c in self.of_kind(match.get("kind") or "list") if c["name"]]
+            if not colls:
+                return None
+            match["ids"] = [c["id"] for c in colls]
+            return [c["name"] for c in colls], [str(match.get("name") or "")]
+        return None
+
+    def finish_match(self, match: dict[str, Any], picks: list[int], who: str | None = None) -> Reply | None:
+        """picks: an option number (from 1) for each thing said, 0 for none.
+        None: the model found nothing, the answer of the code stands."""
+        ids = list(match.get("ids") or [])
+
+        def chosen(n: int) -> str | None:
+            return ids[n - 1] if isinstance(n, int) and 1 <= n <= len(ids) else None
+
+        if match.get("op") == "list":
+            coll = self.get((chosen(picks[0]) if picks else None) or "")
+            if coll is None:
+                return None
+            kind, then, items = match.get("kind") or "list", match.get("then") or "read", list(match.get("items") or [])
+            if then == "add":
+                return self._use_or_new(coll, kind, str(match.get("name") or ""), items)
+            return self._on(then, coll, items, who, bool(match.get("last")))
+        if match.get("op") != "items":
+            return None
+        coll = self.get(match.get("id") or "")
+        if coll is None:
+            return None
+        removed = list(match.get("removed") or [])
+        missing: list[str] = []
+        unsure: list[dict[str, Any]] = []
+        found = False
+        for k, said in enumerate(match.get("missing") or []):
+            iid = chosen(picks[k]) if k < len(picks) else None
+            item = next((i for i in coll["items"] if i["id"] == iid), None)
+            if item is None or any(u["id"] == item["id"] for u in unsure):
+                missing.append(said)
+            elif _shares_word(said, item["text"]):
+                self.remove_item(coll["id"], item["id"])
+                removed.append(item["text"])
+                found = True
+            else:
+                unsure.append(item)
+                found = True
+        if not found:
+            return None
+        reply = self._removed_reply(coll, removed, missing)
+        if unsure:
+            # matched by meaning only: «кефир» for «ряженка» is asked, not removed
+            names = ", ".join(u["text"] for u in unsure)
+            ask = f"Есть {names}. Убрать?"
+            reply.speech = ask if reply.speech == "Нечего убирать." else f"{reply.speech} {ask}"
+            reply.expect_reply = True
+            reply.pending = {"op": "remove_ids", "id": coll["id"], "items": [u["id"] for u in unsure]}
+        return reply
 
     # -------------------------------------------------------- reading phrases
     @staticmethod
@@ -885,6 +990,13 @@ class NotesBook:
             if says_no:
                 return Reply("Хорошо, ничего не убираю.")
             return self._do_remove(coll, split_items(text))
+        if op == "remove_ids":
+            if not says_yes:
+                return Reply("Хорошо, оставляю.")
+            gone = [i for i in coll["items"] if i["id"] in (pending.get("items") or [])]
+            for item in gone:
+                self.remove_item(coll["id"], item["id"])
+            return self._removed_reply(coll, [i["text"] for i in gone], [])
         if op == "choose":
             if says_no:
                 return Reply("Хорошо.")
