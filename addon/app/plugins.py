@@ -244,6 +244,14 @@ def _low(text: str) -> str:
     return (text or "").lower().replace("ё", "е")
 
 
+def _word_rx(word: str) -> str:
+    """Any ending of a key word: «поищи» also hears «поищите», «поищем»; «интернете» — «интернет»."""
+    if len(word) < 4:
+        return re.escape(word)
+    stem = word[:-2] if len(word) >= 7 else word[:-1]
+    return re.escape(stem) + r"[а-яa-z]{0,4}"
+
+
 def find_phrase(text: str, phrases: str) -> str | None:
     """«поищи в интернете температуру воды» -> «температуру воды»; None: no key phrase.
     The phrase may stand anywhere; what is around it is the question."""
@@ -253,7 +261,7 @@ def find_phrase(text: str, phrases: str) -> str | None:
         words = re.findall(r"[а-яa-z0-9]+", _low(phrase))
         if not words:
             continue
-        rx = r"(?<![\wа-я])" + r"[\s,.!?:;\-]+".join(map(re.escape, words)) + r"(?![\wа-я])"
+        rx = r"(?<![\wа-я])" + r"[\s,.!?:;\-]+".join(map(_word_rx, words)) + r"(?![\wа-я])"
         m = re.search(rx, low)
         # the longest phrase wins: «спроси у старшего брата» over «брата»
         if m and (best is None or m.end() - m.start() > best[1] - best[0]):
