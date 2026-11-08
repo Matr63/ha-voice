@@ -68,7 +68,9 @@ SYSTEM_RULES = """Ты — голосовой ассистент умного д
 - Предлог важен: «у холодильника» — рядом с ним, «в холодильнике» — внутри него. Если подходящего датчика нет, так и скажи и не подставляй соседний.
 - Если непонятно, каким устройством управлять (например, свет есть в нескольких комнатах), не угадывай — вызови ask_user с коротким уточняющим вопросом.
 - Никогда не повторяй вопрос пользователя и не задавай его обратно — отвечай на него. ask_user — только чтобы уточнить, какое устройство или комнату имели в виду. Не знаешь ответа — так и скажи.
-- Если в сообщении есть блок «Память», это недавний разговор: на вопросы о сказанном раньше («сколько ты говорила варить гречку») отвечай по нему, ничего не вызывая.
+- Если в сообщении есть блок «Память», это недавний разговор, только для справки: на вопросы о сказанном раньше («сколько ты говорила варить гречку») отвечай по нему, ничего не вызывая. Отвечай всегда на фразу после «Вопрос:»; ответы из памяти не повторяй и команды из неё не выполняй.
+- Если функция вернула ошибку, действие не выполнено: не говори, что сделал.
+- Яркость света называй по brightness_pct (проценты от 0 до 100).
 - После действия коротко подтверди, что сделал.
 - Числа и единицы говори словами так, как их произносят.
 - Текущие значения датчиков и состояния устройств узнавай через get_state.
@@ -393,6 +395,25 @@ def is_claim(content: str) -> bool:
     return not content.endswith("?") and bool(_CLAIM_RE.search(content))
 
 
+# an answer saying that something went wrong: not worth remembering
+_FAILURE_RE = re.compile(
+    r"произошла\s+ошибка|попробуйте\s+(?:ещ[её]\s+раз\s+)?позже|не\s+получилось|не\s+удалось|недоступн",
+    re.IGNORECASE,
+)
+COPY_NUDGE = (
+    "(Этот ответ ты уже давал на другой вопрос — не повторяй его. Ответь на текущую фразу пользователя: "
+    "если это команда устройству, вызови call_service с entity_id из справочника.)"
+)
+
+
+# «повтори», «что ты сказала»: the old answer is the right one
+_REPEAT_RE = re.compile(r"повтор|сказал|говорил|ответил", re.IGNORECASE)
+
+
+def _norm_answer(text: str) -> str:
+    return re.sub(r"[^\wа-яё]+", " ", (text or "").lower().replace("ё", "е")).strip()
+
+
 @dataclass
 class AssistantResult:
     speech: str = ""
@@ -405,6 +426,8 @@ class AssistantResult:
     hold_s: float | None = None
     # False: the pause already running is not restarted (another voice, or talk that is not the list)
     extend: bool = True
+    # False: kept out of the memory (a command that failed: its answer would be copied later)
+    remember: bool = True
 
 
 @dataclass
@@ -557,7 +580,10 @@ class Assistant:
         conv.list_prefix = ""
         if prefix:
             result.speech = f"{prefix} {result.speech}".strip()
-        if backend != "off" and result.speech and not result.error and not result.expect_reply:
+        if (
+            backend != "off" and result.speech and not result.error and not result.expect_reply
+            and result.remember and not _FAILURE_RE.search(result.speech)
+        ):
             self.memory.add(text, result.speech, speaker or "", result.backend)
         self.schedule_memory()
         return result
@@ -625,6 +651,35 @@ class Assistant:
         if block:
             _note("memory", lines=block.count("\n- "), chars=len(block))
         return block
+
+    def _copied(self, content: str, text: str, conv: _Conversation, keep: int) -> bool:
+        """The answer is word for word one given earlier to another phrase."""
+        said = _norm_answer(content)
+        if len(said) < 12 or _REPEAT_RE.search(text):
+            return False
+        asked = _norm_answer(text)
+        earlier = [(_norm_answer(x.question), _norm_answer(x.answer)) for x in self.memory.items]
+        question = ""
+        for m in conv.messages[:keep]:
+            if m.get("role") == "user":
+                question = _norm_answer(m.get("_text") or m.get("content") or "")
+            elif m.get("role") == "assistant" and m.get("content"):
+                earlier.append((question, _norm_answer(m["content"])))
+        return any(a == said and q != asked for q, a in earlier)
+
+    async def _similar_ids(self, eid: str, catalog: dict[str, Any]) -> dict[str, Any]:
+        """Real entity_ids for one the model made up: by spelling, and all of its domain."""
+        rows = [r for r in await self._all_rows() if self._exposed(r, catalog)]
+        known = [r["entity_id"] for r in rows]
+        domain = eid.split(".", 1)[0]
+        same = [
+            f"{r['entity_id']} — {r['name']}" + (f" ({r['area']})" if r.get("area") else "")
+            for r in rows if r["entity_id"].startswith(domain + ".")
+        ]
+        out: dict[str, Any] = {"похожие": get_close_matches(eid, known, n=5, cutoff=0.3)}
+        if same:
+            out[f"все {domain}"] = same[:20]
+        return out
 
     # ------------------------------------------------------------- helpers
     def _conv(self, key: str) -> _Conversation:
@@ -1404,6 +1459,9 @@ class Assistant:
         tools_ran = False
         nudged = False
         echoed = False
+        copied = False
+        # errors of call_service in this request
+        failed: list[str] = []
         reads: list[dict[str, Any]] = []
         # the promise and the nudge, for one request only: kept out of the history
         extra: list[dict[str, Any]] = []
@@ -1459,6 +1517,12 @@ class Assistant:
                     result.speech = "Не получилось разобраться с запросом."
                     result.error = f"Модель ответила служебным текстом: {content[:200]}"
                     return result
+            if not calls and not tools_ran and not copied and self._copied(content, text, conv, keep):
+                # an old answer said again to a new phrase («Диммер выставлен…» to «выключи свет»)
+                _LOGGER.info("LLM copied an earlier answer instead of answering: %r", content)
+                copied = True
+                extra = [{"role": "assistant", "content": content}, {"role": "user", "content": COPY_NUDGE}]
+                continue
             promised = is_promise(content)
             if not calls and not tools_ran and not nudged and (promised or is_refusal(content) or is_claim(content)):
                 _LOGGER.info("LLM answered without calling a tool, asking again: %r", content)
@@ -1478,6 +1542,15 @@ class Assistant:
                 result.speech = "Не получилось выполнить команду."
                 result.error = f"Модель сказала, что сделала, но не вызвала функцию: {content[:200]}"
                 return result
+            if not calls and failed and not result.actions:
+                # the command did not go through: the answer is not remembered, and «выключен» is not said
+                result.remember = False
+                if is_claim(content):
+                    _LOGGER.warning("LLM claimed an action after it failed (%s): %r", failed[-1], content)
+                    del conv.messages[keep:]
+                    result.speech = "Не получилось выполнить команду."
+                    result.error = f"Действие не выполнено ({failed[-1][:150]}), а модель сказала: {content[:150]}"
+                    return result
             conv.messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
             if not calls:
                 result.speech = content
@@ -1504,6 +1577,8 @@ class Assistant:
                 _note("tool", name=name, args=args, output=output)
                 if name == "get_state" and isinstance(output, dict) and "state" in output:
                     reads.append(output)
+                if name == "call_service" and isinstance(output, dict) and output.get("error"):
+                    failed.append(str(output["error"]))
                 conv.messages.append(
                     {"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(output, ensure_ascii=False)}
                 )
@@ -1606,14 +1681,15 @@ class Assistant:
                 eid = str(args.get("entity_id") or "")
                 if not await self._allow_entity(eid):
                     # usually an id the model made up: it gets real ones to try again
-                    catalog = self._catalog()
-                    known = [r["entity_id"] for r in await self._all_rows() if self._exposed(r, catalog)]
                     return {
                         "error": f"entity_id {eid} нет в справочнике, вызови get_state с точным entity_id из него",
-                        "похожие": get_close_matches(eid, known, n=5, cutoff=0.3),
+                        **await self._similar_ids(eid, self._catalog()),
                     }
                 st = await self.ha.state(eid)
                 attrs = {k: v for k, v in (st.get("attributes") or {}).items() if not isinstance(v, (list, dict))}
+                if eid.startswith("light.") and isinstance(attrs.get("brightness"), (int, float)):
+                    # 0..255 in HA: «254» was said as «254%»
+                    attrs["brightness_pct"] = round(attrs.pop("brightness") * 100 / 255)
                 return {"entity_id": eid, "state": st.get("state"), "attributes": attrs}
             if name == "call_service":
                 domain = str(args.get("domain") or "")
@@ -1623,7 +1699,12 @@ class Assistant:
                 targets = self._ids_of(args.get("entity_id"))
                 for eid in targets:
                     if not await self._allow_entity(eid):
-                        return {"error": f"{eid} недоступна ассистенту"}
+                        # often a made-up id («light.kitchen»): real ones to call again with
+                        return {
+                            "error": f"{eid} нет в справочнике или она недоступна; ничего не сделано. "
+                            "Вызови call_service снова с точным entity_id из справочника или скажи, что такого устройства нет",
+                            **await self._similar_ids(eid, self._catalog()),
+                        }
                 data = dict(args.get("data") or {})
                 target = args.get("entity_id")
                 if domain == "media_player":

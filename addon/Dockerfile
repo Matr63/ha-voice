@@ -18,6 +18,7 @@ RUN echo "[ha-voice 1/6] apt packages..." \
     espeak-ng \
     ffmpeg \
     curl \
+    tzdata \
     cmake \
     git \
  && rm -rf /var/lib/apt/lists/* \
