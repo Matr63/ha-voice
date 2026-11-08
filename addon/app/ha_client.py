@@ -142,8 +142,9 @@ class HaClient:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         return self._session
 
-    async def request(self, method: str, path: str, payload: Any = None, what: str = "") -> Any:
-        """what: said in the trace instead of a long payload (a template)."""
+    async def request(self, method: str, path: str, payload: Any = None, what: str = "", brief: Any = None) -> Any:
+        """what: said in the trace instead of a long payload (a template).
+        brief: put in the trace instead of the answer (the entity list lives in a snapshot)."""
         target = self.target()
         if target is None:
             raise HaError("Нет доступа к Home Assistant: укажите адрес и токен в настройках")
@@ -170,7 +171,7 @@ class HaClient:
         except HaError as err:
             self._trace(method, path, payload, what, t0, status, error=str(err))
             raise
-        self._trace(method, path, payload, what, t0, status, result=out)
+        self._trace(method, path, payload, what, t0, status, result=out if brief is None else brief)
         return out
 
     @staticmethod
@@ -210,7 +211,10 @@ class HaClient:
 
     async def entities(self, domains: list[str]) -> list[dict[str, str]]:
         tpl = _ENTITIES_TEMPLATE.replace("DOMAINS", json.dumps(domains))
-        raw = await self.request("POST", "/template", {"template": tpl}, what=f"все сущности доменов {', '.join(domains)}")
+        raw = await self.request(
+            "POST", "/template", {"template": tpl}, what=f"все сущности доменов {', '.join(domains)}",
+            brief="весь список — в снимке ниже",
+        )
         rows = json.loads(raw) if isinstance(raw, str) else raw
         out = []
         for r in rows:

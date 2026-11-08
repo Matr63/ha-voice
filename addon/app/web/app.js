@@ -2109,6 +2109,8 @@
     ha_reply: "Ответ Home Assistant",
     ha_call: "Обращение к Home Assistant",
     ha_cache: "Взято из кеша, без обращения к Home Assistant",
+    entities: "Список сущностей",
+    memory: "Память: недавний разговор добавлен к вопросу",
   };
   const TRACE_ROLES = { user: "Запрос", assistant: "Модель", tool: "Результат функции" };
 
@@ -2138,6 +2140,7 @@
       else if (data.result !== undefined) parts.push(`Получено:\n${typeof data.result === "string" ? data.result : JSON.stringify(data.result, null, 2)}`);
       return parts.join("\n\n");
     }
+    if (kind === "memory") return `${data.lines} записей, ${data.chars} символов — сам текст в сообщении модели ниже`;
     if (kind === "ha_cache") return `${data.what}: ${data.count} шт., получен ${data.age_s} с назад`;
     return JSON.stringify(data, null, 2);
   }
@@ -2152,10 +2155,23 @@
     return `<div class="small trace-title">${head} <span class="muted" style="font-weight:400">· ${data.first ? "первый запрос после запуска" : "без изменений"}, текст — в блоке «Промпт модели»</span></div>`;
   }
 
+  const snapshotLink = (sid, label) =>
+    sid ? `<button type="button" class="btn ghost sm" data-snapshot="${Number(sid)}">${icon("search")}${esc(label || `Снимок №${sid}`)}</button>` : "";
+
+  function traceEntities(data) {
+    const what = data.new ? "список изменился — новый снимок" : "тот же, что в прошлый раз";
+    return `<div class="small trace-title">${esc(TRACE_TITLES.entities)} <span class="muted" style="font-weight:400">· ${data.count} шт., в справочнике модели ${data.exposed} · ${what}</span></div>
+      <div style="margin:2px 0 6px">${snapshotLink(data.snapshot, `Открыть снимок №${data.snapshot}`)}</div>`;
+  }
+
   function traceHtml(trace) {
     if (!trace) return `<div class="small muted">Загружаю…</div>`;
     return trace.map(({ kind, ...data }) => (kind === "system"
       ? tracePrompt(data)
+      : kind === "entities"
+      ? traceEntities(data)
+      : kind === "ha_cache" && data.snapshot
+      ? `<div class="small trace-title">${esc(TRACE_TITLES.ha_cache)}</div><div class="small" style="margin:2px 0 6px">${esc(traceBody(kind, data))} · ${snapshotLink(data.snapshot)}</div>`
       : `<div class="small trace-title">${esc(TRACE_TITLES[kind] || kind)}</div><pre class="trace-pre">${esc(traceBody(kind, data))}</pre>`
     )).join("");
   }
@@ -2512,7 +2528,7 @@
         <div id="asResult" class="small" style="margin-top:8px"></div>
       </div>
       <div class="card" style="margin-top:14px">
-        <div class="row between"><h3>${icon("shield")}Журнал команд</h3><span class="small muted">фильтр голосов: ${s.gate_require_match ? "чужим отказывать" : "выключен"}</span></div>
+        <div class="row between"><h3>${icon("shield")}Журнал команд</h3><span class="small muted"><button type="button" class="btn ghost sm" data-memory>${icon("edit")}Память</button> ${snapshotLink(-1, "Списки сущностей")} фильтр голосов: ${s.gate_require_match ? "чужим отказывать" : "выключен"}</span></div>
         <div id="asLog"></div>
       </div>`;
 
@@ -3347,7 +3363,107 @@
     }
   }
 
+  async function openMemory() {
+    let mem;
+    try {
+      mem = await api("/api/assistant/memory");
+    } catch (err) {
+      toast(err.message || String(err), "bad");
+      return;
+    }
+    const at = (ts) => new Date(ts * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+    const items = mem.items || [];
+    const body = `
+      <div class="small muted">Модель получает это вместе с каждым вопросом. Последние ${mem.fresh_min} минут — почти дословно, раньше — кратко (краткое содержание модель пишет сама, пока все молчат), через ${mem.keep_h} ч запись забывается.</div>
+      ${items.length ? items.map((x) => `<div class="plugin-kv"><span class="small muted">${at(x.at)}${x.who ? ` · ${esc(x.who)}` : ""}${x.fresh ? " · дословно" : ""}</span><span><b>${esc(x.question)}</b><br>${esc(x.answer)}${x.summary ? `<br><span class="small muted">Кратко: ${esc(x.summary)}</span>` : ""}</span></div>`).join("") : `<div class="small muted">Пока пусто.</div>`}`;
+    openModal({
+      title: "Память ассистента",
+      body,
+      actions: [
+        { label: "Закрыть" },
+        ...(items.length ? [{ label: "Очистить", kind: "danger", onClick: async () => { await api("/api/assistant/memory", { method: "DELETE" }); toast("Память очищена"); } }] : []),
+      ],
+      onOpen: (dlg) => dlg.classList.add("modal-wide"),
+      onClose: () => $("#modal").classList.remove("modal-wide"),
+    });
+  }
+
+  async function openSnapshot(sid) {
+    let snap;
+    try {
+      if (sid > 0) {
+        snap = await api(`/api/ha/snapshots/${sid}`);
+      } else {
+        const last = ((await api("/api/ha/snapshots")).snapshots || [])[0];
+        if (!last) {
+          toast("Снимков пока нет: список появится после первой команды ассистенту");
+          return;
+        }
+        snap = await api(`/api/ha/snapshots/${last.id}`);
+      }
+    } catch (err) {
+      toast(err.message || String(err), "bad");
+      return;
+    }
+    const when = snap.at
+      ? new Date(snap.at * 1000).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      : "";
+    const sortKey = (r) => [r.area || "", r.device || "", r.name || ""].join(" | ");
+    const rows = [...(snap.rows || [])].sort((a, b) => sortKey(a).localeCompare(sortKey(b), "ru"));
+    const mark = new Map();
+    for (const e of snap.added || []) mark.set(e, "добавлена");
+    for (const e of snap.changed || []) mark.set(e, "изменена");
+    const added = snap.added || [];
+    const removed = snap.removed || [];
+    const changed = snap.changed || [];
+    const diff = snap.previous
+      ? [
+          added.length ? `добавлено ${added.length}` : "",
+          removed.length ? `убрано ${removed.length}: ${removed.join(", ")}` : "",
+          changed.length ? `изменено ${changed.length}` : "",
+        ].filter(Boolean).join(" · ") || "отличий в составе нет"
+      : "это самый старый из сохранённых снимков";
+    const row = (r) => `<tr data-q="${esc(`${r.area} ${r.device} ${r.name} ${r.entity_id}`.toLowerCase())}"${r.exposed ? "" : ` class="muted"`}>
+          <td>${r.exposed ? "✓" : "—"}</td><td>${esc(r.area || "")}</td><td>${esc(r.device || "")}</td>
+          <td>${esc(r.name || "")}${mark.has(r.entity_id) ? ` <span class="pill">${mark.get(r.entity_id)}</span>` : ""}</td>
+          <td class="mono">${esc(r.entity_id)}</td><td>${esc(`${r.state ?? ""}${r.unit ? ` ${r.unit}` : ""}`)}</td></tr>`;
+    const body = `
+      <div class="small muted">${esc(when)} · ${snap.count} сущностей, в справочнике модели ${snap.exposed}. Значения — на момент снимка: новый снимок появляется, только когда меняется сам список (сущности, имена, комнаты, галочки на вкладке «Устройства»).</div>
+      <div class="small">${snap.previous ? `По сравнению со снимком №${snap.previous}: ` : ""}${esc(diff)}</div>
+      <div class="row" style="gap:6px;flex-wrap:wrap">
+        ${snap.previous ? snapshotLink(snap.previous, `← №${snap.previous}`) : ""}
+        ${snap.next ? snapshotLink(snap.next, `№${snap.next} →`) : ""}
+        <input class="input" type="search" placeholder="Фильтр: комната, имя, entity_id" data-snap-filter style="flex:1;min-width:160px">
+      </div>
+      <div class="snap-wrap"><table class="snap-table">
+        <thead><tr><th>Модель</th><th>Комната</th><th>Прибор</th><th>Имя</th><th>entity_id</th><th>Значение</th></tr></thead>
+        <tbody>${rows.map(row).join("")}</tbody>
+      </table></div>`;
+    openModal({
+      title: `Снимок списка сущностей №${snap.id}`,
+      body,
+      onOpen: (dlg) => {
+        dlg.classList.add("modal-wide");
+        const f = $("[data-snap-filter]", dlg);
+        f.addEventListener("input", () => {
+          const q = f.value.trim().toLowerCase();
+          $$("tbody tr", dlg).forEach((tr) => { tr.hidden = Boolean(q) && !tr.dataset.q.includes(q); });
+        });
+      },
+      onClose: () => $("#modal").classList.remove("modal-wide"),
+    });
+  }
+
   document.addEventListener("click", (ev) => {
+    if (ev.target.closest("[data-memory]")) {
+      openMemory();
+      return;
+    }
+    const snap = ev.target.closest("[data-snapshot]");
+    if (snap) {
+      openSnapshot(Number(snap.dataset.snapshot) || 0);
+      return;
+    }
     const go = ev.target.closest("[data-goto]");
     if (go) {
       setTab(go.dataset.goto);

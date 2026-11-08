@@ -310,6 +310,12 @@ a { color: var(--accent); }
   border: 1px solid var(--border); border-radius: 16px; padding: 0; width: min(520px, calc(100vw - 32px));
   background: var(--panel); color: var(--text); box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
 }
+.modal.modal-wide { width: min(1100px, calc(100vw - 32px)); }
+.snap-wrap { max-height: 60vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.snap-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+.snap-table th, .snap-table td { padding: 4px 8px; text-align: left; border-top: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+.snap-table th { position: sticky; top: 0; background: var(--panel-2); border-top: 0; }
+.snap-table tr.muted td { color: var(--muted); }
 .modal::backdrop { background: rgba(6, 10, 16, 0.6); backdrop-filter: blur(2px); }
 .modal-head { padding: 16px 18px 0; font-weight: 700; font-size: 1.08rem; }
 .modal-body { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }

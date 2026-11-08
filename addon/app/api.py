@@ -20,6 +20,7 @@ from firmware import BOARDS, KINDS, FirmwareStore, board_key, file_name
 from gate_server import GateState
 from ha_client import HaClient, HaError
 from llm import PRESETS, LlmManager
+import memory as memory_mod
 import models_archive
 from plugins import PluginManager
 from satellite import SatelliteHub, ThinkingCue
@@ -509,6 +510,15 @@ def create_app(ctx: AppContext) -> web.Application:
         except HaError as err:
             return web.json_response({"areas": [], "error": str(err)})
 
+    async def entity_snapshots(_: web.Request) -> web.Response:
+        return web.json_response({"snapshots": assistant.snapshots.list()})
+
+    async def entity_snapshot(request: web.Request) -> web.Response:
+        snap = assistant.snapshots.get(int(request.match_info["sid"]))
+        if snap is None:
+            return _err("Этого снимка уже нет (хранятся последние 30)", 404)
+        return web.json_response(snap)
+
     async def ha_catalog(_: web.Request) -> web.Response:
         if not ctx.ha.configured:
             return web.json_response({"devices": [], "error": "нет доступа к Home Assistant"})
@@ -749,6 +759,25 @@ def create_app(ctx: AppContext) -> web.Application:
     async def assistant_agents(_: web.Request) -> web.Response:
         return web.json_response({"agents": await ctx.ha.agents()})
 
+    def _memory_view() -> dict:
+        now = time.time()
+        return {
+            "items": [
+                {"at": x.at, "question": x.question, "answer": x.answer, "who": x.who, "source": x.source,
+                 "summary": x.summary, "fresh": now - x.at < memory_mod.FRESH_S}
+                for x in reversed(assistant.memory.items)
+            ],
+            "fresh_min": memory_mod.FRESH_S // 60,
+            "keep_h": memory_mod.KEEP_S // 3600,
+        }
+
+    async def assistant_memory(_: web.Request) -> web.Response:
+        return web.json_response(_memory_view())
+
+    async def assistant_memory_clear(_: web.Request) -> web.Response:
+        assistant.memory.clear()
+        return web.json_response(_memory_view())
+
     async def assistant_prompt(_: web.Request) -> web.Response:
         return web.json_response(await assistant.prompt_view())
 
@@ -968,6 +997,8 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_post("/api/satellites/rooms", satellites_rooms_refresh)
     r.add_get("/api/ha/areas", ha_areas)
     r.add_get("/api/ha/catalog", ha_catalog)
+    r.add_get("/api/ha/snapshots", entity_snapshots)
+    r.add_get("/api/ha/snapshots/{sid:\\d+}", entity_snapshot)
     r.add_post("/api/ha/catalog", ha_catalog_set)
     r.add_post("/api/satellites/say", satellite_say)
     r.add_post("/api/satellites/volume", satellite_volume)
@@ -988,6 +1019,8 @@ def create_app(ctx: AppContext) -> web.Application:
     r.add_post("/api/assistant/ask", assistant_ask)
     r.add_get("/api/assistant/agents", assistant_agents)
     r.add_get("/api/assistant/prompt", assistant_prompt)
+    r.add_get("/api/assistant/memory", assistant_memory)
+    r.add_delete("/api/assistant/memory", assistant_memory_clear)
     r.add_get("/api/notes", notes_list)
     r.add_post("/api/notes", notes_create)
     r.add_patch("/api/notes/{cid}", notes_rename)

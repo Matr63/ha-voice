@@ -24,7 +24,9 @@ from typing import Any, Callable
 
 import aiohttp
 
+from entity_snapshots import EntitySnapshots
 from ha_client import HaClient, HaError
+from memory import Memory
 from media_control import service_data, service_name, supports, twins, without_unnamed_twins
 from notes import HOLD_OPEN_S, HOLD_SETTLE_S, NOTES_RULES, NOTES_TOOLS, NotesBook, Reply, in_domain
 from plugins import PLUGIN_TOOL_NAMES
@@ -65,6 +67,8 @@ SYSTEM_RULES = """Ты — голосовой ассистент умного д
 - Спрашивают значение, а подходящих датчиков несколько — прочитай один, с совпавшей подсказкой, и назови его значение; не перечисляй их и не переспрашивай.
 - Предлог важен: «у холодильника» — рядом с ним, «в холодильнике» — внутри него. Если подходящего датчика нет, так и скажи и не подставляй соседний.
 - Если непонятно, каким устройством управлять (например, свет есть в нескольких комнатах), не угадывай — вызови ask_user с коротким уточняющим вопросом.
+- Никогда не повторяй вопрос пользователя и не задавай его обратно — отвечай на него. ask_user — только чтобы уточнить, какое устройство или комнату имели в виду. Не знаешь ответа — так и скажи.
+- Если в сообщении есть блок «Память», это недавний разговор: на вопросы о сказанном раньше («сколько ты говорила варить гречку») отвечай по нему, ничего не вызывая.
 - После действия коротко подтверди, что сделал.
 - Числа и единицы говори словами так, как их произносят.
 - Текущие значения датчиков и состояния устройств узнавай через get_state.
@@ -88,6 +92,24 @@ PENDING_TTL_S = 45
 # «а в зале?» right after «температура на кухне»
 FOLLOWUP_TTL_S = 120
 MAX_DIFF_LINES = 60
+# the house quiet this long: the model writes the memory's summaries
+MEMORY_IDLE_S = 20
+MEMORY_RULES = (
+    "Сожми ответ голосового ассистента в одну короткую фразу, до 20 слов. Сохрани числа, сроки, названия и суть; "
+    "без вступлений. Вызови remember."
+)
+REMEMBER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "remember",
+        "description": "Сохранить краткое содержание ответа.",
+        "parameters": {
+            "type": "object",
+            "properties": {"summary": {"type": "string", "description": "Одна фраза: суть ответа с числами."}},
+            "required": ["summary"],
+        },
+    },
+}
 # Before a dictated list is written, the model reads it once more and drops what
 # is not an item. In English: shorter for the model, so faster on a CPU. Constant,
 # so llama.cpp keeps it cached; the list itself goes in the user message.
@@ -296,6 +318,37 @@ UNBACKED_NUDGE = (
 )
 
 
+ECHO_NUDGE = (
+    "(Ты повторил вопрос пользователя — так нельзя. Если вопрос о доме, вызови нужную функцию. "
+    "Если нет — ответь сам одной-двумя фразами или скажи, что не знаешь.)"
+)
+_ECHO_FILLER = {"а", "и", "ну", "еще", "раз", "почти", "скажи", "подскажи", "пожалуйста", "мне"}
+
+
+def _echo_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[а-яa-z0-9]+", text.lower().replace("ё", "е")) if w not in _ECHO_FILLER}
+
+
+def is_echo(question: str, text: str) -> bool:
+    """«Какая температура в зале?» asked back to «Какая погода в зале? Какая температура в зале?»:
+    the model repeats the user's question instead of answering it."""
+    asked = _echo_words(question)
+    said = _echo_words(text)
+    return len(asked) >= 2 and len(asked & said) >= 0.8 * len(asked)
+
+
+def _asked_back(calls: list[dict[str, Any]], content: str) -> str:
+    """The question the model puts to the user: an ask_user call or a plain text question."""
+    for call in calls:
+        fn = call.get("function") or {}
+        if fn.get("name") == "ask_user":
+            try:
+                return str(json.loads(fn.get("arguments") or "{}").get("question") or "")
+            except (json.JSONDecodeError, AttributeError):
+                return ""
+    return content if not calls and content.endswith("?") else ""
+
+
 def is_refusal(content: str) -> bool:
     return bool(_REFUSAL_RE.search(content))
 
@@ -363,6 +416,10 @@ class Assistant:
         self.hub: Any = None
         self.plugins: Any = None  # PluginManager
         self._ent_cache: tuple[float, list[dict[str, str]]] | None = None
+        self._ent_snapshot = 0
+        self.memory = Memory(Path("/data/memory.json") if Path("/data").is_dir() else None)
+        self._memory_task: asyncio.Task | None = None
+        self.snapshots = EntitySnapshots(Path("/data/entity_snapshots.json") if Path("/data").is_dir() else None)
 
     # ------------------------------------------------------------------ api
     def history(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -416,6 +473,8 @@ class Assistant:
         backend = s.assistant_backend
         conv = self._conv(conv_key)
         t0 = time.monotonic()
+        # a summary being written for the memory waits: the answer comes first
+        self._stop_memory()
         self.busy = {"since": time.time(), "stage": "Home Assistant" if backend == "ha" else "LLM"}
         trace = _start_trace()
         _note("input", text=text, backend=backend, room=room, speaker=speaker, device_id=device_id)
@@ -458,7 +517,74 @@ class Assistant:
         conv.list_prefix = ""
         if prefix:
             result.speech = f"{prefix} {result.speech}".strip()
+        if backend != "off" and result.speech and not result.error and not result.expect_reply:
+            self.memory.add(text, result.speech, speaker or "", result.backend)
+        self.schedule_memory()
         return result
+
+    # ------------------------------------------------------------- memory
+    def _stop_memory(self) -> None:
+        if self._memory_task is not None and not self._memory_task.done():
+            self._memory_task.cancel()
+        self._memory_task = None
+
+    def schedule_memory(self, delay_s: float = MEMORY_IDLE_S) -> None:
+        """Summaries of long answers, written while nobody talks; the next command cancels it."""
+        self._stop_memory()
+        s = self.settings.get()
+        if not self.memory.pending() or not s.llm_url or s.assistant_backend == "off":
+            return
+
+        async def later() -> None:
+            await asyncio.sleep(delay_s)
+            await self.compress_memory()
+
+        self._memory_task = asyncio.create_task(later())
+
+    async def compress_memory(self) -> int:
+        """One phrase per long answer, oldest first. Stops at the first failure: tried again after the next command."""
+        done = 0
+        for item in self.memory.pending():
+            if self.busy is not None:
+                break
+            messages = [
+                {"role": "system", "content": MEMORY_RULES},
+                {"role": "user", "content": f"Вопрос: {item.question}\nОтвет: {item.answer}"},
+            ]
+            try:
+                msg = await self._chat(
+                    messages, max_tokens=120, tool_choice="required", tools=[REMEMBER_TOOL], slot=SLOT_PLUGINS,
+                    timeout=PLUGIN_TIMEOUT_S,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.info("Memory summary not written: %s", err)
+                break
+            summary = ""
+            for call in msg.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                try:
+                    summary = str(json.loads(fn.get("arguments") or "{}").get("summary") or "")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+            summary = re.sub(r"\s+", " ", summary or (msg.get("content") or "")).strip()
+            if not summary:
+                break
+            item.summary = summary[:300]
+            done += 1
+            _LOGGER.info("Memory: «%s» -> «%s»", item.question, item.summary)
+        if done:
+            self.memory.save()
+        return done
+
+    def _memory_block(self, conv: _Conversation, keep: int) -> str:
+        """What was said lately and is not in the talk the model already has."""
+        in_talk = [m.get("_text", "") for m in conv.messages[:keep] if m.get("role") == "user"]
+        block = self.memory.block(skip=in_talk)
+        if block:
+            _note("memory", lines=block.count("\n- "), chars=len(block))
+        return block
 
     # ------------------------------------------------------------- helpers
     def _conv(self, key: str) -> _Conversation:
@@ -516,14 +642,28 @@ class Assistant:
     async def _all_rows(self) -> list[dict[str, str]]:
         now = time.monotonic()
         if self._ent_cache and now - self._ent_cache[0] < ENTITIES_CACHE_S:
+            # the catalog may have changed since: what the model gets is in the snapshot
+            self._snapshot(self._ent_cache[1], quiet=True)
             _note(
                 "ha_cache", what="список сущностей", count=len(self._ent_cache[1]),
-                age_s=round(now - self._ent_cache[0], 1),
+                age_s=round(now - self._ent_cache[0], 1), snapshot=self._ent_snapshot,
             )
             return self._ent_cache[1]
         rows = await self.ha.entities(self._domains())
         self._ent_cache = (now, rows)
+        self._snapshot(rows)
         return rows
+
+    def _snapshot(self, rows: list[dict[str, str]], quiet: bool = False) -> None:
+        """The list goes to its own table; the command log only links to it."""
+        catalog = self._catalog()
+        marked = [{**r, "exposed": self._exposed(r, catalog)} for r in rows]
+        sid, new = self.snapshots.add(marked)
+        self._ent_snapshot = sid
+        if not quiet:
+            _note(
+                "entities", snapshot=sid, new=new, count=len(rows), exposed=sum(1 for r in marked if r["exposed"])
+            )
 
     async def catalog_view(self) -> list[dict[str, Any]]:
         """Devices with their entities, overlaying enabled/hints from settings."""
@@ -711,6 +851,12 @@ class Assistant:
             conv.plugin_wait, conv.plugin_wait_at = plugin.id, time.time()
         return AssistantResult(speech=said.speech, backend=said.backend, expect_reply=said.ask)
 
+    def _unknown_answer(self) -> str:
+        web = self.plugins.plugins.get("web_search") if self.plugins is not None else None
+        if web is not None and web.enabled:
+            return "Не знаю. Скажите «поищи в интернете» и вопрос — я поищу."
+        return "Не знаю ответа на этот вопрос."
+
     def plugin_text_limit(self) -> int:
         """How much page text fits next to the other prompts in the model's context."""
         return min(8000, self.settings.get().llm_ctx * 3 // 4)
@@ -874,6 +1020,11 @@ class Assistant:
 
     async def _direct_read(self, text: str, conv: _Conversation, room: str | None) -> AssistantResult | None:
         """A question about a sensor's value: answered from HA itself, see sensor_lookup."""
+        # «Какая погода в зале? Какая температура в зале?»: a person corrects themselves,
+        # the last sentence about a measure is the question
+        sentences = [x for x in re.split(r"(?<=[.?!])\s+", text.strip()) if asked_measure(x)]
+        if len(sentences) > 0 and sentences[-1] != text.strip():
+            text = sentences[-1]
         try:
             catalog = self._catalog()
             rows = [r for r in await self._all_rows() if self._exposed(r, catalog)]
@@ -1111,12 +1262,21 @@ class Assistant:
         result = AssistantResult(backend="openai")
         tools_ran = False
         nudged = False
+        echoed = False
         reads: list[dict[str, Any]] = []
         # the promise and the nudge, for one request only: kept out of the history
         extra: list[dict[str, Any]] = []
+        # the memory goes with this request only: the history keeps the phrase as it was said
+        memo = self._memory_block(conv, keep)
         for step in range(MAX_TOOL_ROUNDS):
             self._stage("LLM думает" if step == 0 else f"LLM думает (шаг {step + 1})")
-            msg = await self._chat([{"role": "system", "content": system}, *conv.messages, *extra])
+            talk = list(conv.messages)
+            if memo:
+                said, content = talk[keep].get("_text", ""), talk[keep]["content"]
+                # after the context line «[time: ...]», right before the phrase
+                head = content[: len(content) - len(said)] if said and content.endswith(said) else ""
+                talk[keep] = {**talk[keep], "content": head + memo + content[len(head):]}
+            msg = await self._chat([{"role": "system", "content": system}, *talk, *extra])
             extra = []
             calls = msg.get("tool_calls") or []
             content = (msg.get("content") or "").strip()
@@ -1126,6 +1286,17 @@ class Assistant:
                     # stored as a real call: copied from the history, the text form would come back
                     _LOGGER.info("LLM wrote a tool call as text, executing it: %r", content)
                     msg = {"role": "assistant", "content": "", "tool_calls": calls}
+            question = _asked_back(calls, content)
+            if question and is_echo(question, text):
+                _LOGGER.info("LLM asked the user's own question back: %r", question)
+                if not echoed:
+                    echoed = True
+                    extra = [{"role": "assistant", "content": question}, {"role": "user", "content": ECHO_NUDGE}]
+                    continue
+                del conv.messages[keep:]
+                result.speech = self._unknown_answer()
+                result.error = f"Модель повторила вопрос вместо ответа: {question[:200]}"
+                return result
             # a number nobody has read: the model made it up («22 градусов»)
             invented = not calls and not tools_ran and (
                 (bool(re.search(r"\d", content)) and bool(asked_measure(text))) or bool(_SPOKEN_VALUE_RE.search(content))
