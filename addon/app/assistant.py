@@ -800,6 +800,7 @@ class Assistant:
             return f"(не удалось получить список: {err})"
         catalog = self._catalog()
         rows = [r for r in rows if self._exposed(r, catalog)]
+        exposed = rows
         rows = without_unnamed_twins(rows, lambda eid: self._hints(eid, catalog))
         groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
         for r in rows:
@@ -821,6 +822,14 @@ class Assistant:
                     break
                 hints = self._hints(r["entity_id"], catalog)
                 extra = f" (подсказки: {hints})" if hints else ""
+                if r.get("domain") == "media_player":
+                    # a command this one cannot do goes to its twin: the model hears both lists as one
+                    acts = list(r.get("actions") or [])
+                    for twin in twins(r["entity_id"], exposed):
+                        tw = next((x for x in exposed if x["entity_id"] == twin), {})
+                        acts += [a for a in tw.get("actions") or [] if a not in acts]
+                    if acts:
+                        extra += f" [умеет: {', '.join(acts)}]"
                 lines.append(f"    {r['entity_id']} — {r['name']}{extra}")
                 count += 1
             if count >= MAX_PROMPT_ENTITIES:

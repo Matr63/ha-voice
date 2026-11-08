@@ -26,7 +26,11 @@ SERVICE_ALIASES = {
 }
 # MediaPlayerEntityFeature bits: any of them makes the service work
 _PAUSE, _VOLUME_SET, _MUTE, _PREVIOUS, _NEXT, _VOLUME_STEP, _STOP, _PLAY = 1, 4, 8, 16, 32, 1024, 4096, 16384
+_TURN_ON, _TURN_OFF, _SELECT_SOURCE = 128, 256, 2048
 SERVICE_FEATURES = {
+    "turn_on": _TURN_ON,
+    "turn_off": _TURN_OFF,
+    "select_source": _SELECT_SOURCE,
     "media_play": _PLAY,
     "media_pause": _PAUSE,
     "media_play_pause": _PLAY | _PAUSE,
@@ -60,6 +64,17 @@ def service_data(service: str, data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Громкость бывает от 0 до 100, а не {raw}. Скажи об этом пользователю")
     # percent, and 1 is one percent: a misread number must not blast the room
     return {"volume_level": round(value if value < 1 else value / 100, 3)}
+
+
+def player_actions(features: Any) -> list[str]:
+    """The services a player takes, by its supported_features, in SERVICE_FEATURES order.
+    An unavailable player keeps the features HA last saw, so the list stays."""
+    if not isinstance(features, int) or isinstance(features, bool):
+        try:
+            features = int(features)
+        except (TypeError, ValueError):
+            return []
+    return [s for s, bits in SERVICE_FEATURES.items() if features & bits]
 
 
 def supports(service: str, state: dict[str, Any]) -> bool:

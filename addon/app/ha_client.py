@@ -15,6 +15,7 @@ from pathlib import Path
 
 import aiohttp
 
+from media_control import player_actions
 from settings import SettingsStore
 from tracing import active as _tracing, note as _note
 
@@ -30,7 +31,7 @@ _ENTITIES_TEMPLATE = """
 {%- if d -%}
 {%- set dname = device_attr(d, 'name_by_user') or device_attr(d, 'name') or '' -%}
 {%- endif -%}
-{%- set ns.rows = ns.rows + [[s.entity_id, s.name, s.state, area_name(s.entity_id) or '', d or '', dname, s.attributes.get('unit_of_measurement') or '']] -%}
+{%- set ns.rows = ns.rows + [[s.entity_id, s.name, s.state, area_name(s.entity_id) or '', d or '', dname, s.attributes.get('unit_of_measurement') or '', s.attributes.get('supported_features') or 0]] -%}
 {%- endfor -%}
 {{ ns.rows | tojson }}
 """
@@ -229,6 +230,8 @@ class HaClient:
                 "unit": r[6] if len(r) > 6 else "",
                 "domain": eid.split(".", 1)[0],
             }
+            if item["domain"] == "media_player":
+                item["actions"] = player_actions(r[7] if len(r) > 7 else 0)
             out.append(item)
         return out
 

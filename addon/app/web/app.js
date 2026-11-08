@@ -3390,6 +3390,23 @@
     });
   }
 
+  // media_player services as the snapshot lists them (by supported_features)
+  const ACTION_LABELS = {
+    turn_on: "включить",
+    turn_off: "выключить",
+    select_source: "источник",
+    media_play: "играть",
+    media_pause: "пауза",
+    media_play_pause: "играть/пауза",
+    media_stop: "стоп",
+    media_next_track: "следующий",
+    media_previous_track: "предыдущий",
+    volume_set: "громкость (уровень)",
+    volume_up: "громче",
+    volume_down: "тише",
+    volume_mute: "без звука",
+  };
+
   async function openSnapshot(sid) {
     let snap;
     try {
@@ -3428,7 +3445,8 @@
     const row = (r) => `<tr data-q="${esc(`${r.area} ${r.device} ${r.name} ${r.entity_id}`.toLowerCase())}"${r.exposed ? "" : ` class="muted"`}>
           <td>${r.exposed ? "✓" : "—"}</td><td>${esc(r.area || "")}</td><td>${esc(r.device || "")}</td>
           <td>${esc(r.name || "")}${mark.has(r.entity_id) ? ` <span class="pill">${mark.get(r.entity_id)}</span>` : ""}</td>
-          <td class="mono">${esc(r.entity_id)}</td><td>${esc(`${r.state ?? ""}${r.unit ? ` ${r.unit}` : ""}`)}</td></tr>`;
+          <td class="mono">${esc(r.entity_id)}</td><td>${esc(`${r.state ?? ""}${r.unit ? ` ${r.unit}` : ""}`)}</td>
+          <td class="small">${(r.actions || []).map((a) => `<span class="pill" title="${esc(`media_player.${a}`)}">${esc(ACTION_LABELS[a] || a)}</span>`).join(" ")}</td></tr>`;
     const body = `
       <div class="small muted">${esc(when)} · ${snap.count} сущностей, в справочнике модели ${snap.exposed}. Значения — на момент снимка: новый снимок появляется, только когда меняется сам список (сущности, имена, комнаты, галочки на вкладке «Устройства»).</div>
       <div class="small">${snap.previous ? `По сравнению со снимком №${snap.previous}: ` : ""}${esc(diff)}</div>
@@ -3438,7 +3456,7 @@
         <input class="input" type="search" placeholder="Фильтр: комната, имя, entity_id" data-snap-filter style="flex:1;min-width:160px">
       </div>
       <div class="snap-wrap"><table class="snap-table">
-        <thead><tr><th>Модель</th><th>Комната</th><th>Прибор</th><th>Имя</th><th>entity_id</th><th>Значение</th></tr></thead>
+        <thead><tr><th>Модель</th><th>Комната</th><th>Прибор</th><th>Имя</th><th>entity_id</th><th>Значение</th><th>Действия</th></tr></thead>
         <tbody>${rows.map(row).join("")}</tbody>
       </table></div>`;
     openModal({

@@ -21,11 +21,18 @@ _LOGGER = logging.getLogger("ha-voice.snapshots")
 KEEP_SNAPSHOTS = 30
 # what makes the list "the same": everything but the value
 _KEY_FIELDS = ("entity_id", "name", "area", "device", "unit", "exposed")
-_ROW_FIELDS = ("entity_id", "name", "state", "unit", "area", "device", "exposed")
+# actions: what a player takes, by its supported_features (a Cast twin changes them
+# with the running app, so they are a value, not part of the list's identity)
+_ROW_FIELDS = ("entity_id", "name", "state", "unit", "area", "device", "exposed", "actions")
+
+
+# bumped when a snapshot starts carrying more: the first list after an update gets a new snapshot
+_FORMAT = 2
 
 
 def _digest(rows: list[dict[str, Any]]) -> str:
-    key = sorted(tuple(str(r.get(f, "")) for f in _KEY_FIELDS) for r in rows)
+    key: list[Any] = [_FORMAT]
+    key += sorted(tuple(str(r.get(f, "")) for f in _KEY_FIELDS) for r in rows)
     return hashlib.sha1(json.dumps(key, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -66,7 +73,7 @@ class EntitySnapshots:
             "id": sid,
             "at": time.time(),
             "digest": digest,
-            "rows": [{f: r.get(f, "") for f in _ROW_FIELDS} for r in rows],
+            "rows": [{f: r[f] for f in _ROW_FIELDS if f in r} for r in rows],
         })
         del self.items[: -self.keep]
         self._save()
