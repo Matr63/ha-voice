@@ -907,6 +907,8 @@ class NotesBook:
     ) -> More:
         reply = self._hold(coll, items, pending.get("who"), opened, pending.get("speaker_id"), extend)
         reply.speech = speech
+        if pending.get("more"):
+            reply.pending["more"] = True
         return More("hold", reply)
 
     def take_more(
@@ -942,14 +944,25 @@ class NotesBook:
         added, opened = item_phrase(text)
         return self._keep(coll, pending, self._merge(items, added), "", opened, True)
 
-    def save_more(self, pending: dict[str, Any], items: list[str], handoff: bool = False) -> Reply:
+    def save_more(self, pending: dict[str, Any], items: list[str], handoff: bool = False, ask_more: bool = False) -> Reply:
         """The dictation ended: write the (checked) items, or ask if nothing is left.
-        handoff: the talk moved on, the answer is only a short line before the other one."""
+        handoff: the talk moved on, the answer is only a short line before the other one.
+        ask_more: the pause ran out — the person may only be remembering the next item, so
+        what was said is written and the dictation goes on after «Ещё что-нибудь?»."""
         coll = self.get(pending.get("id") or "")
         if coll is None:
             return Reply("" if handoff else "Этого уже нет.")
         if handoff:
             return Reply(self._save_prefix(coll, items, pending.get("who")))
+        if ask_more and coll["kind"] == "list":
+            if not items:
+                # asked once already and nothing came: the dictation is over
+                return Reply("") if pending.get("more") else self._commit_items(coll, items, pending.get("who"))
+            reply = self._do_add(coll, items, pending.get("who"))
+            reply.speech = f"{reply.speech} Ещё что-нибудь?"
+            reply.expect_reply = True
+            reply.pending = {"op": "items", "id": coll["id"], "more": True, "speaker_id": pending.get("speaker_id")}
+            return reply
         return self._commit_items(coll, items, pending.get("who"))
 
     def list_title(self, pending: dict[str, Any]) -> str:
@@ -975,14 +988,20 @@ class NotesBook:
         if op in ("items", "text", "remove_what") and self._marker(low) is not None and len(low) > 1 and not says_no:
             return None     # a new command about lists, not the answer
         if op == "items":
-            if says_no:
-                return Reply("Хорошо, ничего не добавляю.")
+            more = bool(pending.get("more"))
+            if says_no or (more and _closing(low)):
+                return Reply("Хорошо." if more else "Хорошо, ничего не добавляю.")
+            if more and (self._switches_away(text, low) or self._chatter(low) or low[0] in _ASK):
+                return None     # «Ещё что-нибудь?» was left unanswered, this is another command
             if first.startswith(_ADD):
                 text = _join(toks[1:])
             if coll["kind"] == "list":
                 items, opened = item_phrase(text)
-                if opened:
-                    return self._hold(coll, items, who, opened, pending.get("speaker_id"))
+                if opened or more:
+                    # after «Ещё что-нибудь?» the dictation goes on, with the same question at the next pause
+                    held = self._hold(coll, items, who, opened, pending.get("speaker_id"))
+                    held.pending["more"] = more
+                    return held
                 return self._do_add(coll, items, who)
             return self._do_add(coll, [text.strip(_PUNCT + " ")], who)
         if op == "text":

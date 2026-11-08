@@ -568,7 +568,8 @@ class Satellite:
                 "backend": result.backend,
                 "actions": result.actions,
                 "expect_reply": result.expect_reply,
-            }
+            },
+            trace=result.trace,
         )
         _LOGGER.info("%s: list hold closed -> «%s»", self.id, result.speech)
         if result.speech and self.voice_out() is not None:
@@ -945,11 +946,11 @@ class Satellite:
             return
         await self.start_command("list_hold", wait_s=remain)
 
-    async def _finish_list(self) -> Any:
+    async def _finish_list(self, ask_more: bool = False) -> Any:
         """Write the dictated list: «Записываю» while the model checks it."""
         cue = ThinkingCue(self)
         try:
-            return await self.hub.assistant.finish_list(self.id, on_saving=cue.announce)
+            return await self.hub.assistant.finish_list(self.id, on_saving=cue.announce, ask_more=ask_more)
         finally:
             cue.done()
 
@@ -958,7 +959,7 @@ class Satellite:
         self.list_hold_until = 0.0
         if self.state != ST_THINKING:
             await self.set_state(ST_THINKING)
-        result = await self._finish_list()
+        result = await self._finish_list(ask_more=True)
         if result is None:
             await self.go_idle()
             return
@@ -970,7 +971,8 @@ class Satellite:
                 "backend": result.backend,
                 "actions": result.actions,
                 "expect_reply": result.expect_reply,
-            }
+            },
+            trace=result.trace,
         )
         _LOGGER.info("%s: list hold ended -> «%s»", self.id, result.speech)
         if result.speech and self.voice_out() is not None:

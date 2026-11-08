@@ -265,6 +265,19 @@ def _parse_text_args(name: str, raw: str) -> dict[str, Any]:
     return args
 
 
+def _say_dropped(reply: Reply, said: list[str], kept: list[str]) -> Reply:
+    """The model took something off a dictated list: say so, to be added again if it was real."""
+    dropped = [item for item in said if item not in kept]
+    if dropped and not reply.speech:
+        reply.speech = f"Не записала: {', '.join(dropped)}."
+    elif dropped:
+        head, ask = reply.speech, ""
+        if head.endswith(" Ещё что-нибудь?"):
+            head, ask = head[: -len(" Ещё что-нибудь?")], " Ещё что-нибудь?"
+        reply.speech = f"{head} Не записала: {', '.join(dropped)}.{ask}"
+    return reply
+
+
 def _json_tool_calls(content: str) -> list[tuple[str, dict[str, Any]]]:
     decoder = json.JSONDecoder()
     found: list[tuple[str, dict[str, Any]]] = []
@@ -1125,17 +1138,24 @@ class Assistant:
         return bool(hub is not None and hub.runtime.store.has_speakers())
 
     async def finish_list(
-        self, conv_key: str, on_saving: Callable[[str], None] | None = None
+        self, conv_key: str, on_saving: Callable[[str], None] | None = None, ask_more: bool = False
     ) -> AssistantResult | None:
-        """The open list was left in silence: check and write it, or ask what to add."""
+        """The open list was left in silence: check and write it, or ask what to add.
+        ask_more: the pause ran out (not a stop): write and ask «Ещё что-нибудь?»."""
         conv = self._convs.get(conv_key)
         pending = conv.pending if conv is not None else None
         if conv is None or not pending or pending.get("op") != "list_more":
             return None
         conv.pending = None
         conv.pending_until = 0.0
-        items = await self._review_list(pending, list(pending.get("items") or []), on_saving)
-        return self._notes_result(self.notes.save_more(pending, items), conv)
+        trace = _start_trace()
+        said = list(pending.get("items") or [])
+        _note("input", text=f"(пауза — пишу список: {', '.join(said) or 'пусто'})")
+        items = await self._review_list(pending, said, on_saving)
+        reply = _say_dropped(self.notes.save_more(pending, items, ask_more=ask_more), said, items)
+        result = self._notes_result(reply, conv)
+        result.trace = trace
+        return result
 
     async def _review_list(
         self, pending: dict[str, Any], items: list[str], on_saving: Callable[[str], None] | None
@@ -1200,6 +1220,8 @@ class Assistant:
                 if more.save is not None:
                     items = await self._review_list(pending, more.save, on_saving)
                     more.reply = self.notes.save_more(pending, items, handoff=more.kind == "handoff")
+                    if more.kind != "handoff":
+                        more.reply = _say_dropped(more.reply, more.save, items)
                 if more.kind == "handoff":
                     conv.list_prefix = more.reply.speech
                 else:
