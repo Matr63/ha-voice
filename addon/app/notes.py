@@ -66,7 +66,9 @@ _MONTHS = (
 
 NOTES_RULES = """Ты разбираешь голосовые команды про списки, заметки и журнал. Всегда вызывай ровно одну функцию и ничего не пиши текстом.
 - Список — покупки, дела и всё, что перечисляют по пунктам. Заметка — то, что просят запомнить. Журнал — записи о том, что было сделано.
-- Название списка бери из перечня «Есть» в начале сообщения, если подходит по смыслу. Иначе возьми слова из фразы.
+- В квадратных скобках в начале сообщения — названия существующих списков. Название списка бери оттуда, если подходит по смыслу. Иначе возьми слова из фразы.
+- list_add — только когда просят добавить, записать, купить. «В списке …», «список …», «что в …» без такого глагола — list_read.
+- Название списка — никогда не пункт.
 - Если неясно, что сделать, вызови ask_user с коротким вопросом."""
 
 
@@ -649,7 +651,8 @@ class NotesBook:
         before = low[idx - 1] if idx else ""
         tail = toks[start:]
         is_add = verb.startswith(_ADD)
-        is_read = verb in _ASK or verb.startswith(_READ) or idx == 0
+        # «в списке для дачи?» — the recogniser often loses «что» at the start: no verb, so a question
+        is_read = verb in _ASK or verb.startswith(_READ) or idx == 0 or (idx == 1 and verb in ("в", "во") and low[idx] == "списке")
         is_remove = verb.startswith(_REMOVE)
         is_clear = verb.startswith(_CLEAR)
         is_create = verb.startswith(_CREATE)
@@ -1043,8 +1046,19 @@ class NotesBook:
 
     # --------------------------------------------------------- what the model asks for
     def names_line(self) -> str:
-        lists = [c["name"] for c in self.of_kind("list")]
-        return f"Есть: {', '.join(lists)}" if lists else "Есть: пока ни одного списка"
+        lists = [f"«{c['name']}»" for c in self.of_kind("list")]
+        return f"Списки: {', '.join(lists)}" if lists else "Списков пока нет"
+
+    def _named_by(self, text: str) -> dict[str, Any] | None:
+        """The list whose whole name this is («холодильник-дача» for «холодильник дача»)."""
+        words = _content(_tokens(text))
+        if not words:
+            return None
+        for coll in self.of_kind("list"):
+            own = _content(_tokens(coll["name"]))
+            if len(own) == len(words) and all(_word_in(w, own) for w in words):
+                return coll
+        return None
 
     def run_tool(self, name: str, args: dict[str, Any], who: str | None = None) -> Reply:
         query = _tokens(str(args.get("list") or ""))
@@ -1054,6 +1068,20 @@ class NotesBook:
         items = [str(i) for i in (items or []) if str(i).strip()]
         text = str(args.get("text") or "").strip()
         if name == "list_add":
+            # a list's own name is never its item: «в списке холодильник-дача» is a question
+            named = []
+            kept = []
+            for item in items:
+                coll = self._named_by(item)
+                if coll is None:
+                    kept.append(item)
+                else:
+                    named.append(coll)
+            items = kept
+            if named and not items:
+                return self._do_read(named[0])
+            if named and not _content(query):
+                query = _tokens(named[0]["name"])
             return self._act("add", "list", query, items, who)
         if name == "list_read":
             return self._act("read", "list", query, [], who)
