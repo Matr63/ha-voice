@@ -111,6 +111,14 @@ NOISE_WINDOW_FRAMES = 150
 NOISE_START = 3.0
 NOISE_KEEP = 2.0
 STOP_MAX_MS = 3000
+# audio heard over the wake sound: up to 2 s kept; it starts the command when speech
+# follows within LEAD_KEEP_MS after the sound
+HELD_MAX_BYTES = 2 * TARGET_RATE * 2
+LEAD_KEEP_MS = 600
+# a dictated list: a pause to remember the next item is not the end of the phrase
+HOLD_SILENCE_MS = 1200
+# while a phrase is handled the mic keeps listening; shorter bits are noise
+BACKLOG_MIN_MS = 300
 
 
 def is_command_phrase(text: str, phrases: list[str]) -> bool:
@@ -150,6 +158,10 @@ class Segmenter:
         self._vad = webrtcvad.Vad(1) if webrtcvad is not None else None
         self._levels: deque[float] = deque(maxlen=NOISE_WINDOW_FRAMES)
         self.noise = 0.0
+        # audio from before the preroll (heard over the wake sound): the start of the
+        # phrase when speech follows within lead_left ms, otherwise forgotten
+        self.lead = b""
+        self.lead_left = 0
 
     def seed_noise(self, other: "Segmenter") -> None:
         self._levels.extend(other._levels)
@@ -190,8 +202,9 @@ class Segmenter:
             if self._is_speech(frame, threshold):
                 if not self.in_speech:
                     self.in_speech = True
-                    self.buf = bytearray(b"".join(self.pre))
+                    self.buf = bytearray(self.lead + b"".join(self.pre))
                     self.pre.clear()
+                    self.lead = b""
                 self.buf.extend(frame)
                 self.silence_ms = 0
             elif self.in_speech:
@@ -202,6 +215,10 @@ class Segmenter:
                     continue
             else:
                 self.pre.append(frame)
+                if self.lead:
+                    self.lead_left -= 20
+                    if self.lead_left <= 0:
+                        self.lead = b""
                 continue
             if len(self.buf) >= max_bytes:
                 out.append(self._take())
@@ -226,6 +243,16 @@ class Segmenter:
         self.silence_ms = 0
         self.pre.clear()
         self._rest = b""
+        self.lead = b""
+        self.lead_left = 0
+
+    def carry_from(self, other: "Segmenter") -> None:
+        """A phrase that began in `other` goes on here, as if it was one recording."""
+        self.seed_noise(other)
+        if other.in_speech and other.buf:
+            self.buf = bytearray(other.buf)
+            self.in_speech = True
+            self.silence_ms = other.silence_ms
 
 
 class CommandCapture:
@@ -240,8 +267,18 @@ class CommandCapture:
         self.seg = Segmenter(preroll_ms=200)
         self.started = time.monotonic()
         self.wake_pcm = b""
+        self.held = bytearray()
+
+    def hold(self, pcm: bytes) -> None:
+        """Audio while the wake sound plays: not listened to (the sound itself would start
+        a phrase), but kept — people start talking on the beep, and that was the first word."""
+        self.held.extend(pcm)
+        del self.held[: max(0, len(self.held) - HELD_MAX_BYTES)]
 
     def feed(self, pcm: bytes, threshold: float, silence_ms: int, max_ms: int, wait_s: float) -> Any:
+        if self.held:
+            self.seg.lead, self.seg.lead_left = bytes(self.held), LEAD_KEEP_MS
+            self.held = bytearray()
         done = self.seg.feed(pcm, threshold, silence_ms, max_ms)
         if done:
             return done[0]
@@ -341,6 +378,10 @@ class Satellite:
         self.listening = True
         self.speaking = False
         self.busy = False
+        # what was said while a phrase was handled: the next phrases, and one still going on
+        self.busy_seg = Segmenter(preroll_ms=300)
+        self.backlog: list[bytes] = []
+        self._queued_run = False
         self.mute_until = 0.0
         self.command: CommandCapture | None = None
         self.confirm: WakeConfirm | None = None
@@ -551,6 +592,10 @@ class Satellite:
         # dictation was left (stop, sleep, error): write what was already said
         self.confirm = None
         self._preroll = b""
+        if self.backlog:
+            _LOGGER.info("%s: %d phrases said meanwhile dropped, nothing waits for them", self.id, len(self.backlog))
+        self.backlog.clear()
+        self.busy_seg.reset()
         hold = self.list_hold_s > 0
         self.list_hold_s = 0.0
         self.list_hold_until = 0.0
@@ -815,6 +860,8 @@ class Satellite:
         if speaking:
             return
         if time.monotonic() < self.mute_until:
+            if self.command is not None:
+                self.command.hold(pcm)
             return
         if self.command is None and self.confirm is None:
             self.recent_audio.append(pcm)
@@ -836,7 +883,11 @@ class Satellite:
             await self._consume_command(pcm)
             return
 
-        if self.busy:
+        if self.busy or self._queued_run:
+            # the phrase is being handled, the person goes on: heard now, handled next
+            for seg in self.busy_seg.feed(pcm, s.diary_vad_rms, max(s.command_silence_ms, HOLD_SILENCE_MS), s.command_max_ms):
+                if duration_ms(seg) >= BACKLOG_MIN_MS:
+                    self.backlog.append(seg)
             return
         wake_in = self._wake_pcm if real and self._wake_pcm and len(self._wake_pcm) == len(pcm) else pcm
         score = await self.wake.feed(wake_in)
@@ -939,8 +990,10 @@ class Satellite:
             return
         if self.list_hold_extend or self.list_hold_until <= 0:
             self.list_hold_until = time.monotonic() + self.list_hold_s
-        remain = self.list_hold_until - time.monotonic()
         self.list_hold_extend = False
+        if self._run_queued():
+            return
+        remain = self.list_hold_until - time.monotonic()
         if remain <= 0.3:
             await self._end_list_hold()
             return
@@ -987,7 +1040,10 @@ class Satellite:
             return
         s = self.hub.settings.get()
         wait_s = s.command_wait_s if self.command.wait_s is None else self.command.wait_s
-        res = self.command.feed(pcm, s.diary_vad_rms, s.command_silence_ms, s.command_max_ms, wait_s)
+        silence = s.command_silence_ms
+        if self.command.reason in ("list_hold", "carry"):
+            silence = max(silence, HOLD_SILENCE_MS)
+        res = self.command.feed(pcm, s.diary_vad_rms, silence, s.command_max_ms, wait_s)
         if res is None:
             return
         if res is CommandCapture.TIMEOUT:
@@ -1005,6 +1061,11 @@ class Satellite:
         if self.command is None:
             return
         silent, wake_pcm = self.command.silent, self.command.wake_pcm
+        # from this moment the mic feeds busy_seg: nothing said during the handling is lost
+        self.busy_seg.reset()
+        self.busy_seg.seed_noise(self.command.seg)
+        self.backlog.clear()
+        self.busy = True
         self.command = None
         self._preroll = b""
         self.diary_seg.reset()
@@ -1056,6 +1117,10 @@ class Satellite:
         # the background level the board has been hearing: the command starts with it
         self.command.seg.seed_noise(self.diary_seg)
         self.diary_seg.reset()
+        if reason in ("list_hold", "follow_up", "carry"):
+            # a phrase begun while the last one was handled goes on in this one
+            self.command.seg.carry_from(self.busy_seg)
+        self.busy_seg.reset()
         if reason == "wake":
             if wake_pcm is None:
                 wake_pcm = b"".join(self.recent_audio)
@@ -1065,7 +1130,7 @@ class Satellite:
             # right away: the request itself must be heard without the TV
             self._spawn(self.hub.duck_tv())
             await self.set_state(ST_LISTENING)
-            if reason != "list_hold" and self.hub.settings.get().sound_wake:
+            if reason not in ("list_hold", "carry") and self.hub.settings.get().sound_wake:
                 # not awaited: the mic loop must keep running (mute_until covers the sound)
                 self._spawn(self.earcon("wake"))
 
@@ -1073,6 +1138,7 @@ class Satellite:
         hub = self.hub
         s = hub.settings.get()
         self.busy = True
+        self._queued_run = False
         try:
             if not silent:
                 await self.set_state(ST_THINKING)
@@ -1093,10 +1159,27 @@ class Satellite:
         hit = match_prefix(text, phrase_list(s.wake_phrases))
         if hit:
             text = hit[1]
-        self.busy = False
         await self.run_text(text, match, pcm, heard=raw)
 
     async def run_text(self, text: str, match: Any, pcm: bytes, heard: str = "") -> None:
+        # busy the whole time: the mic goes to busy_seg, and nothing said meanwhile is lost
+        self.busy = True
+        try:
+            await self._run_text(text, match, pcm, heard)
+        finally:
+            self.busy = False
+
+    def _run_queued(self) -> bool:
+        """The next phrase said while the last one was handled: handled now, in order."""
+        if not self.backlog:
+            return False
+        seg = self.backlog.pop(0)
+        self._queued_run = True     # the mic stays on busy_seg until run_command takes over
+        _LOGGER.info("%s: handling a phrase said meanwhile (%d ms, %d more)", self.id, duration_ms(seg), len(self.backlog))
+        self._spawn(self.run_command(seg))
+        return True
+
+    async def _run_text(self, text: str, match: Any, pcm: bytes, heard: str = "") -> None:
         hub = self.hub
         speaker = match.name if match.matched else None
         entry: dict[str, Any] = {
@@ -1184,8 +1267,23 @@ class Satellite:
             else:
                 self.list_hold_s = 0.0
                 self.list_hold_until = 0.0
+            # the person went on talking while this was handled
+            talking = bool(self.backlog or self.busy_seg.in_speech)
+            if talking and hub.speak_gen == gen and not result.hold_s and not result.expect_reply:
+                reopen = hub.assistant.reopen_list(self.id)
+                if reopen:
+                    # items were written: what follows is more of that list
+                    self.list_hold_s, self.list_hold_extend, self.list_hold_until = reopen, True, 0.0
             if hub.speak_gen != gen:
                 await self.go_idle()
+            elif talking and (self.list_hold_s or result.expect_reply):
+                # no answer read out over the person: the next phrase is already being said
+                _LOGGER.info("%s: went on talking (%d phrases waiting), answer not read: «%s»",
+                             self.id, len(self.backlog), result.speech)
+                if self.list_hold_s:
+                    await self._listen_hold()
+                elif not self._run_queued():
+                    await self.start_command("carry")
             elif result.speech and self.voice_out() is not None:
                 self.reply(result.speech, expect_reply=result.expect_reply)
             elif result.hold_s:

@@ -230,6 +230,7 @@ class NotesBook:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.items: list[dict[str, Any]] = []
+        self._last_added: tuple[str, str | None] | None = None
         try:
             if self.path.is_file():
                 data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -249,6 +250,11 @@ class NotesBook:
 
     def all(self) -> list[dict[str, Any]]:
         return sorted(self.items, key=lambda c: (KINDS.index(c["kind"]) if c["kind"] in KINDS else 9, c["name"].lower()))
+
+    def take_last_added(self) -> tuple[str, str | None] | None:
+        """(list id, who) the last command wrote items to; read once."""
+        last, self._last_added = self._last_added, None
+        return last
 
     def get(self, cid: str) -> dict[str, Any] | None:
         return next((c for c in self.items if c["id"] == cid), None)
@@ -410,6 +416,7 @@ class NotesBook:
         added, known = self.add_items(coll["id"], items, who)
         action = [{"service": "записано", "target": f"{self.title(coll)}: {'; '.join(added)}"}] if added else []
         if coll["kind"] == "list":
+            self._last_added = (coll["id"], who)
             parts = []
             if added:
                 parts.append(f"Добавлено в {self._to_title(coll)}: {', '.join(added)}.")

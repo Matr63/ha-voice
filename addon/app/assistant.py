@@ -89,6 +89,8 @@ SLOT_PLUGINS = 2
 PLUGIN_TIMEOUT_S = 600
 # how long a question back waits for its answer; later the phrase is a new command
 PENDING_TTL_S = 45
+# items were written and the person was still talking: that speech is more items
+REOPEN_LIST_S = 30
 # «а в зале?» right after «температура на кухне»
 FOLLOWUP_TTL_S = 120
 MAX_DIFF_LINES = 60
@@ -423,6 +425,10 @@ class _Conversation:
     # «Что поискать?»: the next phrase is the question for this plugin
     plugin_wait: str = ""
     plugin_wait_at: float = 0.0
+    # the list items were just written to: «…чай, кофе» + «и сливки» said meanwhile
+    last_list: str = ""
+    last_list_at: float = 0.0
+    last_list_who: str | None = None
 
 
 class Assistant:
@@ -1118,6 +1124,9 @@ class Assistant:
         pending = reply.pending
         if pending and pending.get("op") == "list_more" and speaker_id and not pending.get("speaker_id"):
             pending["speaker_id"] = speaker_id
+        added = self.notes.take_last_added()
+        if added:
+            conv.last_list, conv.last_list_at, conv.last_list_who = added[0], time.time(), added[1]
         conv.pending = pending
         conv.pending_until = time.time() + PENDING_TTL_S if pending else 0.0
         hold_s = None
@@ -1132,6 +1141,19 @@ class Assistant:
             hold_s=hold_s,
             extend=reply.extend,
         )
+
+    def reopen_list(self, conv_key: str) -> float:
+        """The person went on talking after items were written: what they said
+        meanwhile is more of that list. Returns how long to listen, 0: no such list."""
+        conv = self._convs.get(conv_key)
+        if conv is None or not conv.last_list or time.time() - conv.last_list_at > REOPEN_LIST_S:
+            return 0.0
+        if self.notes.get(conv.last_list) is None or (conv.pending and time.time() < conv.pending_until):
+            return 0.0
+        conv.pending = {"op": "list_more", "id": conv.last_list, "items": [], "open": False, "who": conv.last_list_who}
+        conv.pending_until = time.time() + PENDING_TTL_S
+        _note("notes", reopened=conv.last_list)
+        return float(HOLD_SETTLE_S)
 
     def _voices_known(self) -> bool:
         hub = self.hub
