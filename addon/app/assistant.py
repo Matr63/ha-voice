@@ -30,7 +30,9 @@ from memory import Memory
 from media_control import service_data, service_name, supports, twins, without_unnamed_twins
 from notes import HOLD_OPEN_S, HOLD_SETTLE_S, NOTES_RULES, NOTES_TOOLS, NotesBook, Reply, in_domain
 from plugins import PLUGIN_TOOL_NAMES
-from sensor_lookup import MAX_ANSWERS, WEATHER_ATTRS, asked_measure, asks_outside, find_sensors, spoken_value
+from sensor_lookup import (
+    MAX_ANSWERS, WEATHER_ATTRS, _same_word, asked_measure, asks_outside, find_sensors, spoken_value,
+)
 from settings import SettingsStore
 from tracing import note as _note, start as _start_trace
 
@@ -406,6 +408,14 @@ COPY_NUDGE = (
 )
 
 
+# a question about what was said earlier: the memory goes with it
+_ASKS_PAST_RE = re.compile(
+    r"говорил|сказал|ответил|спрашивал|рассказывал|советовал|называл|обсуждал|повтор|напомни|"
+    r"раньше|до этого|в прошлый раз|только что|недавно|сегодня утром|про что мы|о ч[её]м мы|что я (?:просил|спрашивал)",
+    re.IGNORECASE,
+)
+
+
 # «повтори», «что ты сказала»: the old answer is the right one
 _REPEAT_RE = re.compile(r"повтор|сказал|говорил|ответил", re.IGNORECASE)
 
@@ -644,8 +654,13 @@ class Assistant:
             self.memory.save()
         return done
 
-    def _memory_block(self, conv: _Conversation, keep: int) -> str:
-        """What was said lately and is not in the talk the model already has."""
+    def _memory_block(self, conv: _Conversation, keep: int, text: str = "") -> str:
+        """What was said lately and is not in the talk the model already has.
+        With a command it only gets in the way: a small model copies the old answers
+        («свет на кухне» -> the dimmer it was asked about an hour ago)."""
+        mode = self.settings.get().memory_mode
+        if mode == "off" or (mode == "past" and not _ASKS_PAST_RE.search(text)):
+            return ""
         in_talk = [m.get("_text", "") for m in conv.messages[:keep] if m.get("role") == "user"]
         block = self.memory.block(skip=in_talk)
         if block:
@@ -1466,7 +1481,7 @@ class Assistant:
         # the promise and the nudge, for one request only: kept out of the history
         extra: list[dict[str, Any]] = []
         # the memory goes with this request only: the history keeps the phrase as it was said
-        memo = self._memory_block(conv, keep)
+        memo = self._memory_block(conv, keep, text)
         for step in range(MAX_TOOL_ROUNDS):
             self._stage("LLM думает" if step == 0 else f"LLM думает (шаг {step + 1})")
             talk = list(conv.messages)
@@ -1573,7 +1588,7 @@ class Assistant:
                     return result
                 self._stage(f"выполняю {args.get('domain', '')}.{args.get('service', '')}" if name == "call_service" else f"смотрю {name}")
                 tools_ran = True
-                output = await self._tool(name, args, result)
+                output = await self._tool(name, args, result, phrase=text)
                 _note("tool", name=name, args=args, output=output)
                 if name == "get_state" and isinstance(output, dict) and "state" in output:
                     reads.append(output)
@@ -1643,7 +1658,45 @@ class Assistant:
                 return eid
         return list(dict.fromkeys(able))
 
-    async def _tool(self, name: str, args: dict[str, Any], result: AssistantResult) -> Any:
+    def _named_areas(self, phrase: str, rows: list[dict[str, Any]]) -> set[str]:
+        """Rooms the phrase names: «на кухне» -> {"Кухня"}; by the area name or its hints."""
+        words = [w for w in re.findall(r"[а-яa-z0-9]+", (phrase or "").lower().replace("ё", "е")) if len(w) >= 3]
+        if not words:
+            return set()
+        hints = self.room_hints()
+        named: set[str] = set()
+        for area in {r.get("area") or "" for r in rows} - {""}:
+            own = re.findall(r"[а-яa-z0-9]+", area.lower().replace("ё", "е"))
+            extra = [w for w in re.findall(r"[а-яa-z0-9]+", hints.get(area, "").lower().replace("ё", "е")) if len(w) >= 4]
+            if any(_same_word(w, a) for w in words for a in own + extra if len(a) >= 3):
+                named.add(area)
+        return named
+
+    async def _wrong_room(self, targets: list[str], phrase: str, catalog: dict[str, Any]) -> dict[str, Any] | None:
+        """The phrase names a room and the device is in another one: «свет на кухне» -> a dimmer in the boiler room."""
+        rows = [r for r in await self._all_rows() if self._exposed(r, catalog)]
+        named = self._named_areas(phrase, rows)
+        if not named:
+            return None
+        by_id = {r["entity_id"]: r for r in rows}
+        for eid in targets:
+            row = by_id.get(eid)
+            area = (row or {}).get("area") or ""
+            if not area or area in named:
+                continue
+            rooms = ", ".join(sorted(named))
+            there = [
+                f"{r['entity_id']} — {r['name']}" for r in rows
+                if (r.get("area") or "") in named and r["entity_id"].split(".", 1)[0] in ACTION_DOMAINS
+            ]
+            return {
+                "error": f"{eid} ({row['name']}) стоит в комнате «{area}», а просили {rooms}; ничего не сделано. "
+                "Выбери устройство из этой комнаты или скажи, что такого там нет",
+                f"устройства в {rooms}": there[:20],
+            }
+        return None
+
+    async def _tool(self, name: str, args: dict[str, Any], result: AssistantResult, phrase: str = "") -> Any:
         plugin = self.plugins.owner(name) if self.plugins is not None else None
         if plugin is not None:
             return await plugin.call_tool(name, args)
@@ -1705,6 +1758,9 @@ class Assistant:
                             "Вызови call_service снова с точным entity_id из справочника или скажи, что такого устройства нет",
                             **await self._similar_ids(eid, self._catalog()),
                         }
+                wrong = await self._wrong_room(targets, phrase, self._catalog())
+                if wrong is not None:
+                    return wrong
                 data = dict(args.get("data") or {})
                 target = args.get("entity_id")
                 if domain == "media_player":

@@ -119,6 +119,19 @@ def _brief(value: Any) -> Any:
     return value if len(text) <= TRACE_CHARS else text[:TRACE_CHARS] + "…"
 
 
+def apply_time_zone(name: str | None) -> bool:
+    """The add-on runs in UTC unless told: the time zone of Home Assistant is taken for it."""
+    if not name or os.environ.get("TZ") == name or not hasattr(time, "tzset"):
+        return False
+    if not Path("/usr/share/zoneinfo", name).exists():
+        _LOGGER.warning("Time zone %s not found in the image", name)
+        return False
+    os.environ["TZ"] = name
+    time.tzset()
+    _LOGGER.info("Time zone: %s", name)
+    return True
+
+
 class HaClient:
     def __init__(self, settings: SettingsStore) -> None:
         self.settings = settings
@@ -206,6 +219,7 @@ class HaClient:
             }
         try:
             cfg = await self.request("GET", "/config")
+            apply_time_zone(cfg.get("time_zone"))
             return {"ok": True, "version": cfg.get("version"), "location": cfg.get("location_name")}
         except HaError as err:
             return {"ok": False, "error": str(err)}

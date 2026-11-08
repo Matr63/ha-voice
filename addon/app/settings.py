@@ -39,6 +39,7 @@ ENUMS: dict[str, tuple[str, ...]] = {
     "assistant_backend": ("ha", "openai", "off"),
     "tv_duck": ("volume", "mute", "pause", "off"),
     "mic_channel": ("auto", "left", "right", "mix"),
+    "memory_mode": ("past", "always", "off"),
 }
 
 # Never sent back to the UI in clear text.
@@ -168,6 +169,9 @@ class Settings:
     room_hints: str = "{}"
     # «температура в зале» is answered from the sensor found by rooms and hints, without the LLM
     direct_reads: bool = True
+    # the recent talk («Память») in the request to the model: past = only for a question
+    # about what was said («что ты говорила»), always = with every phrase, off = never
+    memory_mode: str = "past"
     stop_phrases: str = "стоп, остановись, прекрати"
     # local model run by the add-on (llama.cpp); empty = none
     llm_local_model: str = ""

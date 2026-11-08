@@ -91,6 +91,8 @@ async def amain() -> None:
         },
     )
     await start_api(ctx, os.environ.get("API_HOST", "0.0.0.0"), api_port)
+    # local time for the model, the memory and the log: the time zone of Home Assistant
+    await ha.ping()
     await llm.restore()
 
     await asyncio.gather(
